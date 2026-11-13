@@ -25,6 +25,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { api, errorText, type PortalState, type PortalUser, type TotpSetup } from "@/lib/api"
 
@@ -65,6 +66,79 @@ export function UserSheet({
   )
 }
 
+type Mode = "app" | "full" | "missing"
+
+/** Full Windows desktop vs Miracle only. The setting lives on the Windows
+ * account itself, so it is read from the host each time the panel opens. */
+function DesktopMode({ user }: { user: PortalUser }) {
+  const [mode, setMode] = useState<Mode | null>(null)
+  const [error, setError] = useState("")
+  const [busy, setBusy] = useState(false)
+  const path = `/api/admin/users/${user.id}/desktop`
+
+  useEffect(() => {
+    let live = true
+    setMode(null)
+    setError("")
+    api<{ mode: Mode }>("GET", path)
+      .then((r) => live && setMode(r.mode))
+      .catch((e) => live && setError(errorText(e)))
+    return () => {
+      live = false
+    }
+  }, [path, user.win_username])
+
+  const change = async (full: boolean) => {
+    setBusy(true)
+    try {
+      const r = await api<{ mode: Mode }>("PUT", path, { full })
+      setMode(r.mode)
+      toast.success(full ? "Full desktop turned on" : "Limited to Miracle", {
+        description: "Applies from their next session.",
+      })
+    } catch (e) {
+      toast.error(errorText(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  let description: string
+  if (error) description = error
+  else if (mode === null) description = "Checking the Windows account…"
+  else if (mode === "missing")
+    description = `There is no Windows account named ${user.win_username} on this computer, so this can't be set here.`
+  else if (mode === "full")
+    description = "On. Sessions get the normal Windows desktop, Start menu and all programs."
+  else
+    description =
+      "Off. Sessions show only Miracle; the desktop, Start menu, Run, command prompt, Task Manager and drive C: are blocked."
+
+  return (
+    <Field orientation="horizontal">
+      <FieldContent>
+        <FieldLabel htmlFor="full-desktop">Full desktop</FieldLabel>
+        <FieldDescription className={error ? "text-destructive" : undefined}>
+          {description}
+        </FieldDescription>
+        {(mode === "app" || mode === "full") && (
+          <FieldDescription>Changes apply from the next session; an open one keeps its mode.</FieldDescription>
+        )}
+      </FieldContent>
+      {mode === null && !error ? (
+        <Skeleton className="h-[1.15rem] w-8 rounded-full" />
+      ) : (
+        <Switch
+          id="full-desktop"
+          checked={mode === "full"}
+          disabled={busy || (mode !== "app" && mode !== "full")}
+          onCheckedChange={change}
+        />
+      )}
+    </Field>
+  )
+}
+
 function UserDetails({
   user,
   data,
@@ -78,7 +152,6 @@ function UserDetails({
   onClose: () => void
   onSecret: (secret: SecretToShow) => void
 }) {
-  const isMe = user.id === data.me.id
   const base = `/api/admin/users/${user.id}`
   const [busy, setBusy] = useState(false)
   const [password, setPassword] = useState("")
@@ -124,12 +197,10 @@ function UserDetails({
       <SheetHeader className="border-b">
         <SheetTitle className="flex items-center gap-2">
           {user.username}
-          {user.is_admin && <Badge>Admin</Badge>}
           {user.locked && <Badge variant="destructive">Locked</Badge>}
         </SheetTitle>
         <SheetDescription>
-          {user.is_admin ? "Administrator" : "User"}
-          {isMe && " · this is you"}
+          Signs in as Windows account {user.win_username}
         </SheetDescription>
       </SheetHeader>
 
@@ -157,6 +228,9 @@ function UserDetails({
               </FieldGroup>
             )}
           </FieldSet>
+
+          <FieldSeparator />
+          <DesktopMode user={user} />
 
           {(user.locked || user.failed_count > 0) && (
             <>
@@ -213,9 +287,8 @@ function UserDetails({
                 </Button>
               </div>
               <FieldDescription>
-                {isMe
-                  ? "Changes the password you sign in with."
-                  : "The user is signed out of the portal everywhere."}
+                The password they use on the portal’s sign-in page. Setting it signs them out
+                everywhere.
               </FieldDescription>
             </Field>
           </form>
@@ -301,7 +374,7 @@ function UserDetails({
         </FieldGroup>
       </div>
 
-      {!isMe && (
+      {(
         <SheetFooter className="border-t">
           <Button
             variant="destructive"

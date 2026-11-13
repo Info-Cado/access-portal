@@ -2,9 +2,9 @@
 name = "access-portal-admin"
 version = "0.1.0"
 edition = "2021"
-description = "Desktop admin app for access-portal: users, permissions and apps."
+description = "Access Portal: runs the portal on the host and manages its users and apps."
 
-# Not part of the portal crate: this app builds on its own.
+# Not part of the portal crate's build: this app builds on its own.
 [workspace]
 
 [lib]
@@ -15,7 +15,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-serde = { version = "1", features = ["derive"] }
+access-portal = { path = "../.." }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json", "cookies"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The portal decodes and encodes screen updates for every session; keep it fast
+# even in development builds (`npm run dev`).
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 2

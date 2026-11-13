@@ -1,7 +1,7 @@
 use anyhow::Context;
 
-/// All configuration comes from environment variables so nothing secret is baked
-/// into the binary. See `.env.example` for the full list.
+/// Configuration, read from environment variables. The app loads them from
+/// `portal.env` in its data folder first (see `lib.rs`); `.env.example` lists them all.
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
@@ -35,8 +35,6 @@ pub struct Config {
     pub lockout_secs: i64,
     pub cookie_secure: bool,
 
-    pub seed_admin_user: String,
-    pub seed_admin_pass: String,
 }
 
 fn var(key: &str, default: &str) -> String {
@@ -73,8 +71,6 @@ impl Config {
             max_failed: var("MAX_FAILED", "5").parse().unwrap_or(5),
             lockout_secs: var("LOCKOUT_SECS", "300").parse().unwrap_or(300),
             cookie_secure: var("COOKIE_SECURE", "false") == "true",
-            seed_admin_user: var("SEED_ADMIN_USER", "admin"),
-            seed_admin_pass: var("SEED_ADMIN_PASS", "changeme"),
         })
     }
 }

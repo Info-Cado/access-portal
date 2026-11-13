@@ -1,8 +1,6 @@
 import { useState } from "react"
 import {
   AppWindowIcon,
-  ChevronsUpDownIcon,
-  LogOutIcon,
   MonitorSmartphoneIcon,
   RefreshCwIcon,
   UsersIcon,
@@ -11,16 +9,7 @@ import { toast } from "sonner"
 
 import { AppsView } from "@/components/apps-view"
 import { UsersView } from "@/components/users-view"
-import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Button } from "@/components/ui/button"
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
 import { Separator } from "@/components/ui/separator"
 import {
   Sidebar,
@@ -39,6 +28,7 @@ import {
   SidebarRail,
   SidebarTrigger,
 } from "@/components/ui/sidebar"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { errorText, type PortalState } from "@/lib/api"
 
 type View = "users" | "apps"
@@ -47,13 +37,11 @@ export type ViewProps = { data: PortalState; reload: () => Promise<void> }
 
 export function AppShell({
   data,
-  server,
+  status,
   reload,
-  onSignOut,
-}: ViewProps & { server: string; onSignOut: () => void }) {
+}: ViewProps & { status: { address: string } }) {
   const [view, setView] = useState<View>("users")
   const [refreshing, setRefreshing] = useState(false)
-  const host = server.replace(/^https?:\/\//, "")
 
   const refresh = async () => {
     setRefreshing(true)
@@ -84,7 +72,7 @@ export function AppShell({
                 </div>
                 <div className="grid flex-1 text-left text-sm leading-tight">
                   <span className="truncate font-medium">Access Portal</span>
-                  <span className="truncate text-xs text-muted-foreground">{host}</span>
+                  <span className="truncate text-xs text-muted-foreground">Admin on this computer</span>
                 </div>
               </SidebarMenuButton>
             </SidebarMenuItem>
@@ -117,32 +105,24 @@ export function AppShell({
         <SidebarFooter>
           <SidebarMenu>
             <SidebarMenuItem>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <SidebarMenuButton size="lg">
-                    <Avatar className="size-8 rounded-lg">
-                      <AvatarFallback className="rounded-lg">
-                        {data.me.username.slice(0, 2).toUpperCase()}
-                      </AvatarFallback>
-                    </Avatar>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <SidebarMenuButton size="lg" className="cursor-default hover:bg-transparent active:bg-transparent">
+                    <span className="relative flex size-8 items-center justify-center">
+                      <span className="absolute size-2.5 animate-ping rounded-full bg-emerald-500/60" />
+                      <span className="size-2.5 rounded-full bg-emerald-500" />
+                    </span>
                     <div className="grid flex-1 text-left text-sm leading-tight">
-                      <span className="truncate font-medium">{data.me.username}</span>
-                      <span className="truncate text-xs text-muted-foreground">Administrator</span>
+                      <span className="truncate font-medium">Portal running</span>
+                      <span className="truncate text-xs text-muted-foreground">{status.address}</span>
                     </div>
-                    <ChevronsUpDownIcon className="ml-auto size-4" />
                   </SidebarMenuButton>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent side="top" align="start" className="min-w-52">
-                  <DropdownMenuLabel className="font-normal text-muted-foreground">
-                    Signed in to {host}
-                  </DropdownMenuLabel>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem onSelect={onSignOut}>
-                    <LogOutIcon />
-                    Sign out
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
+                </TooltipTrigger>
+                <TooltipContent side="right" className="max-w-64">
+                  Closing this window keeps the portal running in the notification area. Quit it from
+                  the tray icon to stop it.
+                </TooltipContent>
+              </Tooltip>
             </SidebarMenuItem>
           </SidebarMenu>
         </SidebarFooter>

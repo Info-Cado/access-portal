@@ -4,8 +4,11 @@ A self-hosted remote access portal, in Rust. It's the login + management layer
 you put in front of a **Windows RDP** host so that each person signs in, sees
 only the apps they're allowed to use, and opens them in a browser.
 
-The portal is a single program. It contains its own browser RDP client, so
-nothing else (no Guacamole, no Docker) has to be installed alongside it.
+Everything is one Windows app, **Access Portal** (`admin-app/`), installed on
+the RDP host. It runs the portal server for remote users and is the admin panel.
+Closing its window hides it to the notification area and the portal keeps
+running; it starts with Windows. The portal contains its own browser RDP
+client, so nothing else has to be installed alongside it.
 
 It does **not** include anything that unlocks extra sessions on Windows
 Home/Pro. Running several users against one Windows machine needs the right
@@ -16,7 +19,9 @@ Windows licensing (see the end of this file).
 - **Login** with Argon2-hashed passwords.
 - **Two-step verification** (TOTP) per user, optional.
 - **Lockout** after too many failed attempts.
-- **Per-user app permissions** — admins pick which apps each user can open.
+- **Per-user app permissions** — the admin picks which apps each user can open.
+- **Admin panel on the host only** — users, apps and permissions are managed in
+  the app on the host; there is no admin page on the network.
 - **Browser launch** — the user opens their app without ever knowing the Windows
   password; it stays on the server.
 - **Straight in** — a user with exactly one app lands in it right after login.
@@ -119,78 +124,70 @@ clipboard content other than text.
 
 ## Prerequisites
 
-- **Rust** (stable). Install from https://rustup.rs.
-- A **Windows RDP** host reachable from the portal, with NLA enabled, the apps
-  installed and a Windows account per user.
+- A **Windows RDP** host with NLA enabled, the apps installed and a Windows
+  account per user. Access Portal is installed on that same machine.
+- To build: **Rust** (stable, https://rustup.rs), **Node.js**, and the WebView2
+  runtime that ships with Windows 11.
 
-## Run it
-
-```sh
-# 1. Configure
-cp .env.example .env
-#   - set PORTAL_SECRET to a long random string
-
-# 2. Load env vars, then run
-#    bash:
-set -a; . ./.env; set +a
-cargo run
-
-#    PowerShell:
-#    Get-Content .env | ForEach-Object { if ($_ -match '^\s*([^#=]+)=(.*)$') { Set-Item "env:$($matches[1].Trim())" $matches[2] } }
-#    cargo run
-```
-
-On first run it creates `portal.db`, seeds an admin (`SEED_ADMIN_USER` /
-`SEED_ADMIN_PASS`), and a sample "Desktop" app pointing at `127.0.0.1:3389`.
-Open http://127.0.0.1:8088, sign in, go to **Admin**, and change the admin's
-details.
-
-## Adding an app
-
-In **Admin → Add app**, enter a name, a URL key, the RDP host's address
-(`127.0.0.1` when the portal runs on the RDP host itself) and port (`3389`).
-Give each portal user their Windows login under **Admin → Users → Save Windows
-login**, then tick the app for them.
-
-An app is an RDP connection to a host as the user's Windows account. To make an
-account open one program instead of a desktop, set that up on the Windows side
-(for example by replacing the account's shell with a launcher).
-
-## Desktop admin app (`admin-app/`)
-
-A small Tauri app for administrators. It signs in to a portal with an admin
-account and manages it from a desktop window:
-
-- create and delete users, make someone an administrator;
-- tick which apps each user can open (saved as you tick);
-- set a user's portal password (signs them out everywhere);
-- set the Windows login a user's sessions run as;
-- turn two-step verification on, off, or reset it (the setup key is shown once);
-- unlock an account locked after too many wrong passwords;
-- add and delete apps.
-
-It talks to the portal's JSON admin API (`/api/...`, in `src/api.rs`), which
-enforces the same rules as the admin web page: an administrator's session is
-required for everything. The app can manage any portal it can reach, so point it
-at `http://127.0.0.1:8088` on the host itself or at the portal's HTTPS address
-from elsewhere. It does not create Windows accounts on the RDP host.
-
-The window's page is React with shadcn/ui components (Tailwind), built by Vite;
-add more components with `npx shadcn@latest add <name>`.
-
-Build it (needs Rust, Node.js and, on Windows, the WebView2 runtime that ships
-with Windows 11):
+## Build and install
 
 ```sh
 cd admin-app
 npm install
-npm run build      # installer under src-tauri/target/release/bundle/nsis/
-npm run dev        # or: run it straight from source
+npm run build      # installer: src-tauri/target/release/bundle/nsis/Access Portal_<version>_x64-setup.exe
+npm run dev        # or run it straight from source
 ```
+
+Install it on the RDP host and open it. It must run as a Windows
+**administrator** for the "Full desktop" switch (it changes other Windows
+accounts).
+
+## Where things live
+
+Everything the portal keeps is in `C:\ProgramData\AccessPortal`:
+
+| | |
+|---|---|
+| `portal.env` | settings, created on first start with a fresh `PORTAL_SECRET` (the variables are listed in `.env.example`) |
+| `portal.db` | users, apps, permissions, sign-in sessions |
+| `files\` | one transfer folder per user |
+| `portal.log` | the server's log |
+
+Restart the app (tray icon → Quit, then open it) after changing `portal.env`.
+
+## Using it
+
+The window has two screens:
+
+- **Users** — create a user (portal username and password, the Windows account
+  their sessions run as, the apps they may open, optional two-step
+  verification). Click a user to change any of that, unlock them after too many
+  wrong passwords, or delete them.
+- **Apps** — an app is an RDP connection (host and port, `127.0.0.1:3389` for
+  this machine) opened as the user's Windows account; its key is used in the
+  link. Add or delete apps here.
+
+Each user also has a **Full desktop** switch (`src/host.rs`). It changes the
+user's Windows account on this machine: off, the account's shell is the Miracle
+launcher and Run, the command prompt, PowerShell, Task Manager, the registry
+editor, Control Panel and drive C: are blocked; on, exactly those settings are
+removed and sessions get the normal desktop. Windows administrator accounts are
+never limited. A change applies from the user's next session. The app does not
+create Windows accounts.
+
+The admin calls (`src/api.rs`) are never served on the network: the app makes
+them in-process (`Portal::admin` in `src/lib.rs`).
+
+Remote users open the portal's address (`BIND_ADDR`, `127.0.0.1:8088` by
+default) through an HTTPS front end such as `tailscale serve` or a reverse
+proxy, sign in, and open their app.
+
+The window's page is React with shadcn/ui components (Tailwind), built by Vite;
+add more components with `npx shadcn@latest add <name>`.
 
 ## Files
 
-`FILES_DIR` (default `./files`) holds one folder per portal user. That folder is
+`FILES_DIR` (default `files\\` in the data folder) holds one folder per portal user. That folder is
 
 - what the Files panel in the session page lists, uploads to and downloads from;
 - what the session sees as `\\tsclient\P` (also under Network → tsclient).
@@ -214,6 +211,7 @@ overwritten; a second `report.pdf` becomes `report (1).pdf`.
   machine.
 - Files in `FILES_DIR` are readable by whoever can read that folder on the portal
   host. Each portal user can only reach their own folder through the portal.
+- Anyone who can use the host's desktop can open the admin panel; lock the host.
 - This is an MVP. Before production: add CSRF tokens on state-changing forms, rate
   limiting at the proxy, audit logging, and session cleanup for expired rows.
 
@@ -227,8 +225,8 @@ get around per-user Windows licensing.
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | startup, DB pool, migrations, server |
-| `src/config.rs` | env configuration |
+| `src/lib.rs` | `start`: settings, database, migrations, server; in-process admin calls |
+| `src/config.rs` | settings |
 | `src/models.rs` | `User`, `App` |
 | `src/db.rs` | all SQL |
 | `src/auth.rs` | hashing, tokens, at-rest crypto, TOTP |
@@ -238,6 +236,7 @@ get around per-user Windows licensing.
 | `src/transport.rs` | link to the browser: WebRTC data channel, or WebSocket fallback |
 | `src/session.html` | the browser page for a session |
 | `src/web.rs` | router, auth extractors, pages, handlers, file transfer endpoints |
-| `src/api.rs` | JSON admin API used by the desktop admin app |
-| `admin-app/` | desktop admin app (Tauri): `src-tauri/` native side, `src/` the window's page (React + shadcn/ui) |
+| `src/api.rs` | admin API, called in-process by the app |
+| `src/host.rs` | Full desktop / Miracle-only switch for a Windows account |
+| `admin-app/` | the Access Portal app (Tauri): `src-tauri/` starts the portal, tray icon; `src/` the window's page (React + shadcn/ui) |
 | `migrations/` | SQLite schema |

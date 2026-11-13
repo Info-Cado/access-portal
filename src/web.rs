@@ -32,14 +32,6 @@ pub fn router(state: AppState) -> Router {
         .route("/files", get(files_list))
         .route("/files/upload", post(files_upload).layer(DefaultBodyLimit::disable()))
         .route("/files/dl/:name", get(files_download))
-        .route("/admin", get(admin_page))
-        .route("/admin/users", post(admin_create_user))
-        .route("/admin/users/:id/delete", post(admin_delete_user))
-        .route("/admin/users/:id/apps", post(admin_set_apps))
-        .route("/admin/users/:id/windows", post(admin_set_windows_login))
-        .route("/admin/apps", post(admin_create_app))
-        .route("/admin/apps/:id/delete", post(admin_delete_app))
-        .merge(crate::api::router())
         .with_state(state)
 }
 
@@ -62,26 +54,6 @@ impl FromRequestParts<AppState> for CurrentUser {
             }
         }
         Err(Redirect::to("/login"))
-    }
-}
-
-/// A logged-in admin. Non-admins get 403; anonymous users go to login.
-pub struct AdminUser(pub User);
-
-#[async_trait]
-impl FromRequestParts<AppState> for AdminUser {
-    type Rejection = Response;
-
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Response> {
-        let CurrentUser(user) = CurrentUser::from_request_parts(parts, state)
-            .await
-            .map_err(|r| r.into_response())?;
-        if user.is_admin() {
-            Ok(AdminUser(user))
-        } else {
-            Err((StatusCode::FORBIDDEN, Html("<h1>403 — admins only</h1>".to_string()))
-                .into_response())
-        }
     }
 }
 
@@ -172,7 +144,7 @@ async fn dashboard(
 
     let mut list = String::new();
     if apps.is_empty() {
-        list.push_str("<p class=\"muted\">No apps assigned yet. Ask an administrator.</p>");
+        list.push_str("<p class=\"muted\">No apps assigned yet. Ask your administrator.</p>");
     }
     for app in &apps {
         list.push_str(&format!(
@@ -183,18 +155,11 @@ async fn dashboard(
         ));
     }
 
-    let admin_link = if user.is_admin() {
-        " &nbsp;·&nbsp; <a href=\"/admin\">Admin</a>"
-    } else {
-        ""
-    };
-
     let body = format!(
         "<div class=\"top\"><h1>Your apps</h1>\
          <form method=\"post\" action=\"/logout\"><button class=\"btn sec\">Log out</button></form></div>\
-         <p class=\"muted\">Signed in as {}{}</p>{}",
+         <p class=\"muted\">Signed in as {}</p>{}",
         esc(&user.username),
-        admin_link,
         list
     );
     Ok(page("Your apps", &body).into_response())
@@ -683,262 +648,4 @@ async fn files_download(
         .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
         .map_err(|e| anyhow::anyhow!("building download response: {e}"))?;
     Ok(response)
-}
-
-// ---------------------------------------------------------------------------
-// Admin
-// ---------------------------------------------------------------------------
-
-async fn admin_page(
-    State(state): State<AppState>,
-    AdminUser(_admin): AdminUser,
-) -> Result<Html<String>, AppError> {
-    let users = db::list_users(&state.pool).await?;
-    let apps = db::list_apps(&state.pool).await?;
-
-    // Users table
-    let mut users_rows = String::new();
-    for u in &users {
-        let assigned = db::apps_for_user(&state.pool, u.id).await?;
-        let assigned_names = if assigned.is_empty() {
-            "<span class=\"muted\">none</span>".to_string()
-        } else {
-            assigned
-                .iter()
-                .map(|a| esc(&a.name))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-
-        // per-user app assignment form (checkboxes)
-        let mut checks = String::new();
-        for a in &apps {
-            let on = assigned.iter().any(|x| x.id == a.id);
-            checks.push_str(&format!(
-                "<label style=\"display:inline-flex;align-items:center;gap:6px;width:auto;margin:4px 10px 4px 0\">\
-                 <input type=\"checkbox\" name=\"app_ids\" value=\"{}\" {} style=\"width:auto\"> {}</label>",
-                a.id,
-                if on { "checked" } else { "" },
-                esc(&a.name)
-            ));
-        }
-
-        users_rows.push_str(&format!(
-            "<tr><td>{}{}<div class=\"muted\">Windows: {}</div></td><td>{}</td><td>\
-             <form method=\"post\" action=\"/admin/users/{}/apps\">{}\
-             <div style=\"margin-top:8px\"><button class=\"btn sec\">Save apps</button></div></form>\
-             <form method=\"post\" action=\"/admin/users/{}/windows\" style=\"margin-top:12px\">\
-             <div class=\"row\"><div><input name=\"win_username\" value=\"{}\" placeholder=\"Windows username\"></div>\
-             <div><input name=\"win_password\" type=\"password\" autocomplete=\"new-password\" placeholder=\"New Windows password\"></div></div>\
-             <div style=\"margin-top:8px\"><button class=\"btn sec\">Save Windows login</button></div></form></td>\
-             <td><form method=\"post\" action=\"/admin/users/{}/delete\" onsubmit=\"return confirm('Delete user?')\">\
-             <button class=\"btn danger\">Delete</button></form></td></tr>",
-            esc(&u.username),
-            if u.is_admin() { " <span class=\"muted\">(admin)</span>" } else { "" },
-            esc(&u.win_username),
-            assigned_names,
-            u.id,
-            checks,
-            u.id,
-            esc(&u.win_username),
-            u.id,
-        ));
-    }
-
-    // Apps table
-    let mut apps_rows = String::new();
-    for a in &apps {
-        apps_rows.push_str(&format!(
-            "<tr><td>{}</td><td><code>{}</code></td><td>{}:{}</td>\
-             <td><form method=\"post\" action=\"/admin/apps/{}/delete\" onsubmit=\"return confirm('Delete app?')\">\
-             <button class=\"btn danger\">Delete</button></form></td></tr>",
-            esc(&a.name),
-            esc(&a.key),
-            esc(&a.hostname),
-            esc(&a.port),
-            a.id,
-        ));
-    }
-
-    let body = format!(
-        "<div class=\"top\"><h1>Admin</h1><a href=\"/\">← Back</a></div>\
-\
-         <div class=\"card\"><h2>Add user</h2>\
-         <form method=\"post\" action=\"/admin/users\">\
-         <div class=\"row\"><div><label>Portal username</label><input name=\"username\"></div>\
-         <div><label>Portal password</label><input name=\"password\" type=\"password\"></div></div>\
-         <div class=\"row\"><div><label>Windows username</label><input name=\"win_username\"></div>\
-         <div><label>Windows password</label><input name=\"win_password\" type=\"password\" placeholder=\"blank = generate random\"></div></div>\
-         <label style=\"display:inline-flex;gap:6px;width:auto;margin-top:12px\"><input type=\"checkbox\" name=\"is_admin\" value=\"1\" style=\"width:auto\"> Administrator</label>\
-         <label style=\"display:inline-flex;gap:6px;width:auto;margin-left:16px\"><input type=\"checkbox\" name=\"enable_totp\" value=\"1\" style=\"width:auto\"> Enable 2FA</label>\
-         <div style=\"margin-top:16px\"><button class=\"btn\">Create user</button></div></form></div>\
-\
-         <div class=\"card\"><h2>Users</h2><table><tr><th>User</th><th>Apps</th><th>Assign</th><th></th></tr>{}</table></div>\
-\
-         <div class=\"card\"><h2>Add app</h2>\
-         <form method=\"post\" action=\"/admin/apps\">\
-         <div class=\"row\"><div><label>Name</label><input name=\"name\"></div>\
-         <div><label>URL key</label><input name=\"key\" placeholder=\"excel\"></div></div>\
-         <div class=\"row\"><div><label>RDP host</label><input name=\"hostname\" placeholder=\"127.0.0.1\"></div>\
-         <div><label>Port (blank = 3389)</label><input name=\"port\"></div></div>\
-         <div style=\"margin-top:16px\"><button class=\"btn\">Create app</button></div></form></div>\
-\
-         <div class=\"card\"><h2>Apps</h2><table><tr><th>Name</th><th>Key</th><th>Host</th><th></th></tr>{}</table></div>",
-        users_rows, apps_rows
-    );
-
-    Ok(page("Admin", &body))
-}
-
-#[derive(Deserialize)]
-struct NewUserInput {
-    username: String,
-    password: String,
-    win_username: String,
-    win_password: Option<String>,
-    is_admin: Option<String>,
-    enable_totp: Option<String>,
-}
-
-async fn admin_create_user(
-    State(state): State<AppState>,
-    AdminUser(_admin): AdminUser,
-    Form(input): Form<NewUserInput>,
-) -> Result<Response, AppError> {
-    if input.username.trim().is_empty() || input.password.is_empty() {
-        return Ok(page("Error", "<div class=\"err\">Username and password are required.</div><p><a href=\"/admin\">Back</a></p>").into_response());
-    }
-    let win_password = match input.win_password {
-        Some(p) if !p.is_empty() => p,
-        _ => auth::random_windows_password(),
-    };
-
-    let (_id, totp_secret) = db::create_user(
-        &state.pool,
-        &state.config,
-        input.username.trim(),
-        &input.password,
-        input.win_username.trim(),
-        &win_password,
-        input.is_admin.as_deref() == Some("1"),
-        input.enable_totp.as_deref() == Some("1"),
-    )
-    .await?;
-
-    // If 2FA was enabled, show the provisioning URL once.
-    if let Some(secret) = totp_secret {
-        let uri = auth::totp_provisioning_uri(&secret, input.username.trim())
-            .unwrap_or_default();
-        let body = format!(
-            "<h1>User created</h1>\
-             <div class=\"ok\">Save this now — it is shown only once.</div>\
-             <div class=\"card\"><p>Add this to the user's authenticator app:</p>\
-             <p><strong>Secret:</strong> <code>{}</code></p>\
-             <p class=\"muted\">otpauth URL:</p><p><code>{}</code></p></div>\
-             <p><a class=\"btn\" href=\"/admin\">Back to admin</a></p>",
-            esc(&secret),
-            esc(&uri),
-        );
-        return Ok(page("User created", &body).into_response());
-    }
-
-    Ok(Redirect::to("/admin").into_response())
-}
-
-async fn admin_delete_user(
-    State(state): State<AppState>,
-    AdminUser(admin): AdminUser,
-    Path(id): Path<i64>,
-) -> Result<Response, AppError> {
-    if id == admin.id {
-        return Ok(page(
-            "Error",
-            "<div class=\"err\">You can't delete your own account.</div><p><a href=\"/admin\">Back</a></p>",
-        )
-        .into_response());
-    }
-    db::delete_user(&state.pool, id).await?;
-    Ok(Redirect::to("/admin").into_response())
-}
-
-#[derive(Deserialize)]
-struct SetAppsInput {
-    #[serde(default)]
-    app_ids: Vec<i64>,
-}
-
-async fn admin_set_apps(
-    State(state): State<AppState>,
-    AdminUser(_admin): AdminUser,
-    Path(id): Path<i64>,
-    Form(input): Form<SetAppsInput>,
-) -> Result<Response, AppError> {
-    db::set_user_apps(&state.pool, id, &input.app_ids).await?;
-    Ok(Redirect::to("/admin").into_response())
-}
-
-#[derive(Deserialize)]
-struct WindowsLoginInput {
-    win_username: String,
-    win_password: String,
-}
-
-async fn admin_set_windows_login(
-    State(state): State<AppState>,
-    AdminUser(_admin): AdminUser,
-    Path(id): Path<i64>,
-    Form(input): Form<WindowsLoginInput>,
-) -> Result<Response, AppError> {
-    if input.win_username.trim().is_empty() || input.win_password.is_empty() {
-        return Ok(page("Error", "<div class=\"err\">Windows username and password are both required.</div><p><a href=\"/admin\">Back</a></p>").into_response());
-    }
-    db::set_windows_login(
-        &state.pool,
-        &state.config,
-        id,
-        input.win_username.trim(),
-        &input.win_password,
-    )
-    .await?;
-    Ok(Redirect::to("/admin").into_response())
-}
-
-#[derive(Deserialize)]
-struct NewAppInput {
-    name: String,
-    key: String,
-    hostname: String,
-    port: String,
-}
-
-async fn admin_create_app(
-    State(state): State<AppState>,
-    AdminUser(_admin): AdminUser,
-    Form(input): Form<NewAppInput>,
-) -> Result<Response, AppError> {
-    if input.name.trim().is_empty() || input.key.trim().is_empty() || input.hostname.trim().is_empty() {
-        return Ok(page("Error", "<div class=\"err\">Name, key and host are required.</div><p><a href=\"/admin\">Back</a></p>").into_response());
-    }
-    let port = match input.port.trim() {
-        "" => "3389",
-        p => p,
-    };
-    db::create_app(
-        &state.pool,
-        input.key.trim(),
-        input.name.trim(),
-        input.hostname.trim(),
-        port,
-    )
-    .await?;
-    Ok(Redirect::to("/admin").into_response())
-}
-
-async fn admin_delete_app(
-    State(state): State<AppState>,
-    AdminUser(_admin): AdminUser,
-    Path(id): Path<i64>,
-) -> Result<Response, AppError> {
-    db::delete_app(&state.pool, id).await?;
-    Ok(Redirect::to("/admin").into_response())
 }

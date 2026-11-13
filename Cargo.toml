@@ -1,14 +1,19 @@
-[package]
+﻿[package]
 name = "access-portal"
 version = "0.1.0"
 edition = "2021"
-description = "Self-hosted remote access portal: login + 2FA + per-user app permissions in front of a Windows RDP host, with a built-in browser RDP client."
+description = "Self-hosted remote access portal (library): login, 2FA and per-user app permissions in front of a Windows RDP host, with a built-in browser RDP client. Run by the Access Portal app in admin-app/."
+
+[lib]
+name = "access_portal"
+path = "src/lib.rs"
 
 [dependencies]
 axum = { version = "0.7.9", features = ["macros", "ws"] }
 axum-extra = { version = "0.9.6", features = ["cookie", "form"] }
 tokio = { version = "1.42.0", features = ["full"] }
 tower-http = { version = "0.6.2", features = ["trace"] }
+tower = { version = "0.5", features = ["util"] }
 async-trait = "0.1.83"
 
 serde = { version = "1.0.215", features = ["derive"] }
@@ -32,7 +37,6 @@ hex = "0.4.3"
 
 anyhow = "1.0.93"
 tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 png = "0.18.1"
 ironrdp-tls = { version = "0.3", features = ["native-tls"] }
 ironrdp-tokio = "0.12.0"
@@ -54,16 +58,6 @@ jpeg-encoder = "0.7.1"
 webrtc = "0.21.1"
 bytes = "1.12.1"
 openh264 = "0.9"
-
-# Dependencies do the heavy lifting (RDP decoding, PNG encoding); keep them
-# optimized even in dev builds so sessions stay responsive under `cargo run`.
-[profile.dev.package."*"]
-opt-level = 2
-
-# The portal's own screen-diffing loops run for every update; unoptimized they
-# add noticeable delay, so dev builds optimize this crate as well.
-[profile.dev]
-opt-level = 2
 
 [target."cfg(windows)".dependencies]
 ironrdp-rdpdr-native = "0.9.0"

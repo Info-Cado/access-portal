@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Access Portal Admin",
+  "productName": "Access Portal",
   "version": "0.1.0",
   "identifier": "com.accessportal.admin",
   "build": {
@@ -10,15 +10,16 @@
     "beforeBuildCommand": "npm run ui:build"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "label": "main",
-        "title": "Access Portal Admin",
+        "title": "Access Portal",
         "width": 1120,
         "height": 740,
         "minWidth": 720,
-        "minHeight": 520
+        "minHeight": 520,
+        "visible": false
       }
     ],
     "security": {

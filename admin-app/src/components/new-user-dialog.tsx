@@ -34,7 +34,6 @@ const blank = {
   winPass: "",
   appIds: [] as number[],
   totp: false,
-  admin: false,
 }
 
 export function NewUserDialog({
@@ -74,7 +73,6 @@ export function NewUserDialog({
         password: form.password,
         win_username: form.winUser,
         win_password: form.winPass,
-        is_admin: form.admin,
         enable_totp: form.totp,
         app_ids: form.appIds,
       })
@@ -194,13 +192,6 @@ export function NewUserDialog({
                 <FieldDescription>Ask for an authenticator code at every sign-in.</FieldDescription>
               </FieldContent>
               <Switch id="nu-totp" checked={form.totp} onCheckedChange={(totp) => set({ totp })} />
-            </Field>
-            <Field orientation="horizontal">
-              <FieldContent>
-                <FieldLabel htmlFor="nu-admin">Administrator</FieldLabel>
-                <FieldDescription>Can manage users and apps.</FieldDescription>
-              </FieldContent>
-              <Switch id="nu-admin" checked={form.admin} onCheckedChange={(admin) => set({ admin })} />
             </Field>
 
             {error && <FieldError>{error}</FieldError>}

@@ -1,5 +1,5 @@
-// Calls to the portal. Everything goes through the app's native side
-// (`request` in src-tauri), which holds the session cookie.
+// Calls to the portal running inside this app. They go through the app's
+// native side (`request` in src-tauri), in-process: no network, no sign-in.
 
 import { invoke } from "@tauri-apps/api/core"
 
@@ -24,56 +24,41 @@ export type PortalApp = {
 }
 
 export type PortalState = {
-  me: { id: number; username: string }
+  /** Where the portal accepts connections, e.g. 127.0.0.1:8088. */
+  listen: string
   users: PortalUser[]
   apps: PortalApp[]
 }
+
+export type ServerStatus =
+  | { running: true; address: string; data_dir: string }
+  | { running: false; error: string; data_dir: string }
 
 /** Authenticator setup details; the portal hands these out once. */
 export type TotpSetup = { secret: string; uri: string }
 
 export class ApiError extends Error {
   status: number
-  /** The portal wants a two-step verification code. */
-  needCode: boolean
 
-  constructor(message: string, status = 0, needCode = false) {
+  constructor(message: string, status = 0) {
     super(message)
     this.status = status
-    this.needCode = needCode
   }
 }
 
-let onSignedOut: (() => void) | undefined
-
-/** Called when the portal says the session is gone, so the app can show sign-in. */
-export function setSignedOutHandler(handler: () => void) {
-  onSignedOut = handler
-}
-
-/** Choose the portal to talk to. Resolves with the cleaned-up address. */
-export async function setServer(url: string): Promise<string> {
-  try {
-    return await invoke<string>("set_server", { url })
-  } catch (e) {
-    throw new ApiError(String(e))
-  }
+export function serverStatus(): Promise<ServerStatus> {
+  return invoke<ServerStatus>("status")
 }
 
 export async function api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
-  let res: { status: number; data: { error?: string; need_code?: boolean } }
+  let res: { status: number; data: { error?: string } }
   try {
     res = await invoke("request", { method, path, body: body ?? null })
   } catch (e) {
     throw new ApiError(String(e))
   }
   if (res.status >= 200 && res.status < 300) return res.data as T
-  if (res.status === 401 && path !== "/api/login") onSignedOut?.()
-  throw new ApiError(
-    res.data?.error ?? `The portal refused that (${res.status}).`,
-    res.status,
-    Boolean(res.data?.need_code),
-  )
+  throw new ApiError(res.data?.error ?? `The portal refused that (${res.status}).`, res.status)
 }
 
 export function errorText(e: unknown): string {

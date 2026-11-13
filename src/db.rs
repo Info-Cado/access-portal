@@ -315,36 +315,3 @@ pub async fn delete_pending(pool: &SqlitePool, token: &str) -> Result<()> {
         .await?;
     Ok(())
 }
-
-// ---- first-run seed ----
-
-pub async fn seed_admin(pool: &SqlitePool, config: &Config) -> Result<()> {
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
-        .fetch_one(pool)
-        .await?;
-    if count.0 > 0 {
-        return Ok(());
-    }
-
-    tracing::info!(
-        "seeding first admin '{}' (change the password after first login)",
-        config.seed_admin_user
-    );
-    let (admin_id, _) = create_user(
-        pool,
-        config,
-        &config.seed_admin_user,
-        &config.seed_admin_pass,
-        &config.seed_admin_user, // placeholder Windows account
-        &auth::random_windows_password(),
-        true,
-        false,
-    )
-    .await?;
-
-    // A sample app so the dashboard isn't empty on first run.
-    let app_id = create_app(pool, "desktop", "Desktop", "127.0.0.1", "3389").await?;
-    set_user_apps(pool, admin_id, &[app_id]).await?;
-
-    Ok(())
-}

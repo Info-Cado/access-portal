@@ -81,7 +81,6 @@ export function UsersView({ data, reload }: ViewProps) {
                     <TableCell>
                       <div className="flex items-center gap-2">
                         <span className="font-medium">{u.username}</span>
-                        {u.is_admin && <Badge>Admin</Badge>}
                         {u.totp && <Badge variant="secondary">2-step</Badge>}
                         {u.locked && <Badge variant="destructive">Locked</Badge>}
                       </div>
