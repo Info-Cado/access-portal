@@ -94,6 +94,38 @@ pub async fn set_windows_login(
     Ok(())
 }
 
+/// Set a new portal password; optionally end the user's open portal logins.
+pub async fn set_password(
+    pool: &SqlitePool,
+    user_id: i64,
+    password: &str,
+    end_sessions: bool,
+) -> Result<()> {
+    let hash = auth::hash_password(password)?;
+    sqlx::query("UPDATE users SET password_hash = ?, failed_count = 0, locked_until = NULL WHERE id = ?")
+        .bind(&hash)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    if end_sessions {
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(user_id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Turn two-step verification on (with this secret) or off (`None`).
+pub async fn set_totp_secret(pool: &SqlitePool, user_id: i64, secret: Option<&str>) -> Result<()> {
+    sqlx::query("UPDATE users SET totp_secret = ? WHERE id = ?")
+        .bind(secret)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<()> {
     sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(id)

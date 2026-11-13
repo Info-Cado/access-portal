@@ -1,0 +1,21 @@
+[package]
+name = "access-portal-admin"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop admin app for access-portal: users, permissions and apps."
+
+# Not part of the portal crate: this app builds on its own.
+[workspace]
+
+[lib]
+name = "access_portal_admin_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "cookies"] }

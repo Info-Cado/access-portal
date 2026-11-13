@@ -39,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/users/:id/windows", post(admin_set_windows_login))
         .route("/admin/apps", post(admin_create_app))
         .route("/admin/apps/:id/delete", post(admin_delete_app))
+        .merge(crate::api::router())
         .with_state(state)
 }
 
@@ -130,7 +131,7 @@ fn page(title: &str, body: &str) -> Html<String> {
     ))
 }
 
-fn session_cookie(state: &AppState, token: String) -> Cookie<'static> {
+pub(crate) fn session_cookie(state: &AppState, token: String) -> Cookie<'static> {
     Cookie::build(("session", token))
         .path("/")
         .http_only(true)

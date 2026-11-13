@@ -156,6 +156,35 @@ An app is an RDP connection to a host as the user's Windows account. To make an
 account open one program instead of a desktop, set that up on the Windows side
 (for example by replacing the account's shell with a launcher).
 
+## Desktop admin app (`admin-app/`)
+
+A small Tauri app for administrators. It signs in to a portal with an admin
+account and manages it from a desktop window:
+
+- create and delete users, make someone an administrator;
+- tick which apps each user can open (saved as you tick);
+- set a user's portal password (signs them out everywhere);
+- set the Windows login a user's sessions run as;
+- turn two-step verification on, off, or reset it (the setup key is shown once);
+- unlock an account locked after too many wrong passwords;
+- add and delete apps.
+
+It talks to the portal's JSON admin API (`/api/...`, in `src/api.rs`), which
+enforces the same rules as the admin web page: an administrator's session is
+required for everything. The app can manage any portal it can reach, so point it
+at `http://127.0.0.1:8088` on the host itself or at the portal's HTTPS address
+from elsewhere. It does not create Windows accounts on the RDP host.
+
+Build it (needs Rust, Node.js and, on Windows, the WebView2 runtime that ships
+with Windows 11):
+
+```sh
+cd admin-app
+npm install
+npm run build      # installer under src-tauri/target/release/bundle/nsis/
+npm run dev        # or: run it straight from source
+```
+
 ## Files
 
 `FILES_DIR` (default `./files`) holds one folder per portal user. That folder is
@@ -206,4 +235,6 @@ get around per-user Windows licensing.
 | `src/transport.rs` | link to the browser: WebRTC data channel, or WebSocket fallback |
 | `src/session.html` | the browser page for a session |
 | `src/web.rs` | router, auth extractors, pages, handlers, file transfer endpoints |
+| `src/api.rs` | JSON admin API used by the desktop admin app |
+| `admin-app/` | desktop admin app (Tauri): `src-tauri/` native side, `ui/` the window's page |
 | `migrations/` | SQLite schema |
