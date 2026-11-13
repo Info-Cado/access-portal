@@ -938,7 +938,25 @@ form{display:inline}
     else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
     canvas.focus();
   });
-  document.addEventListener("fullscreenchange", function () { $("fullBtn").textContent = fullscreenOn() ? "Exit full screen" : "Full screen"; });
+  // In full screen, keys the browser or this computer would otherwise take (the
+  // Windows key, Alt+Tab, Alt+F4, Esc, Ctrl+W/T/N…) go to the session instead.
+  // Holding Esc still leaves full screen. Chrome and Edge only; elsewhere the
+  // browser keeps those keys.
+  function lockKeys(on) {
+    var kbd = navigator.keyboard;
+    if (!kbd || !kbd.lock) return;
+    if (on) kbd.lock().catch(function () {}); else kbd.unlock();
+  }
+  function onFullscreen() {
+    var on = !!fullscreenOn();
+    $("fullBtn").textContent = on ? "Exit full screen" : "Full screen";
+    lockKeys(on);
+    if (on) say("Windows key, Alt+Tab and other shortcuts now go to the session. Hold Esc to leave full screen.");
+    // keys held across the switch would stay down on the host
+    send({ t: "rel" }); synced = false; held = 0;
+  }
+  document.addEventListener("fullscreenchange", onFullscreen);
+  document.addEventListener("webkitfullscreenchange", onFullscreen);
 
   // ---- printing: the session's "Portal printer" saves jobs as PDFs in the shared folder ----
   function printed(name, bytes) {
