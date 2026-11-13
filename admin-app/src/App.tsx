@@ -24,10 +24,11 @@ export default function App() {
         if (s.running) return reload()
       })
       .catch((e) => setError(errorText(e)))
-    // Keep the public link's state fresh (it comes up a few seconds after start).
+    // Keep the public link's state and who is connected fresh.
     const timer = setInterval(() => {
       serverStatus().then(setStatus).catch(() => {})
-    }, 3000)
+      if (document.visibilityState === "visible") reload().catch(() => {})
+    }, 5000)
     return () => clearInterval(timer)
   }, [reload])
 

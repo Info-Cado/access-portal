@@ -13,6 +13,7 @@ mod db;
 mod error;
 mod host;
 mod models;
+mod presence;
 mod rdp;
 mod tiles;
 mod transport;
@@ -39,6 +40,8 @@ pub struct AppState {
     pub config: Arc<config::Config>,
     /// Failed sign-ins per network address.
     pub limiter: Arc<web::LoginLimiter>,
+    /// Sessions open right now.
+    pub presence: Arc<presence::Presence>,
 }
 
 /// A running portal.
@@ -86,6 +89,7 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
         pool,
         config: Arc::new(config),
         limiter: Arc::new(web::LoginLimiter::new()),
+        presence: Arc::default(),
     };
 
     // Forget expired sign-ins once an hour.

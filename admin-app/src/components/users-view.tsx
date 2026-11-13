@@ -80,7 +80,18 @@ export function UsersView({ data, reload }: ViewProps) {
                   >
                     <TableCell>
                       <div className="flex items-center gap-2">
+                        {u.sessions.length > 0 && (
+                          <span className="relative flex size-2" title="Connected now">
+                            <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-500 opacity-60" />
+                            <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+                          </span>
+                        )}
                         <span className="font-medium">{u.username}</span>
+                        {u.sessions.length > 0 && (
+                          <Badge className="border-emerald-500/30 bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+                            Connected{u.sessions.length > 1 ? ` ×${u.sessions.length}` : ""}
+                          </Badge>
+                        )}
                         {u.totp && <Badge variant="secondary">2-step</Badge>}
                         {u.locked && <Badge variant="destructive">Locked</Badge>}
                       </div>

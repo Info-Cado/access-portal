@@ -27,7 +27,7 @@ import {
 } from "@/components/ui/sheet"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
-import { api, errorText, type PortalState, type PortalUser, type TotpSetup } from "@/lib/api"
+import { api, errorText, since, type PortalState, type PortalUser, type TotpSetup } from "@/lib/api"
 
 export function UserSheet({
   user,
@@ -255,6 +255,35 @@ function UserDetails({
             )}
           </FieldSet>
 
+          {user.sessions.length > 0 && (
+            <>
+              <FieldSeparator />
+              <FieldSet>
+                <FieldLegend variant="label" className="flex items-center gap-2">
+                  <span className="relative flex size-2">
+                    <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-500 opacity-60" />
+                    <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+                  </span>
+                  Connected now
+                </FieldLegend>
+                <div className="flex flex-col gap-2">
+                  {user.sessions.map((s, i) => (
+                    <div key={i} className="rounded-md border px-3 py-2 text-sm">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-medium">{s.app}</span>
+                        <span className="text-xs text-muted-foreground">for {since(s.since).replace(/^just now$/, "under a minute")}</span>
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        {s.device} · from {s.address === "local" ? "this computer" : s.address} ·{" "}
+                        {s.link === "direct" ? "direct link" : "through the portal"}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </FieldSet>
+            </>
+          )}
+
           <FieldSeparator />
           <DesktopMode user={user} onMode={setWinMode} />
 
@@ -414,7 +443,7 @@ function UserDetails({
                 action: "Delete user",
                 option:
                   winMode === "app" || winMode === "full"
-                    ? { label: `Also delete the Windows account ${user.win_username} and its files on this computer`, checked: true }
+                    ? { label: `Also delete the Windows account ${user.win_username} and its files on this computer`, checked: false }
                     : undefined,
                 run: async (alsoWindows) => {
                   await api("DELETE", alsoWindows ? `${base}?windows=1` : base)

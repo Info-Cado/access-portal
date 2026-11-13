@@ -454,8 +454,11 @@ async fn rdp_socket(
         Ok(target) => target,
         Err(status) => return Ok(status.into_response()),
     };
-    Ok(upgrade.on_upgrade(move |socket| {
-        rdp::run(target, Box::new(transport::WsTransport(socket)))
+    let connection = connection_info(&state, &user, &key, &headers, "relayed").await;
+    let presence = state.presence.clone();
+    Ok(upgrade.on_upgrade(move |socket| async move {
+        let _listed = presence.enter(connection);
+        rdp::run(target, Box::new(transport::WsTransport(socket))).await
     }))
 }
 
@@ -482,6 +485,8 @@ async fn rtc_offer(
         Err(status) => return Ok(status.into_response()),
     };
     let username = target.username.clone();
+    let connection = connection_info(&state, &user, &key, &headers, "direct").await;
+    let presence = state.presence.clone();
     let servers = vec![webrtc::peer_connection::RTCIceServer {
         urls: state.config.ice_urls.clone(),
         username: state.config.ice_username.clone(),
@@ -489,7 +494,10 @@ async fn rtc_offer(
         ..Default::default()
     }];
     let on_open: transport::OnOpen = Box::new(move |link| {
-        tokio::spawn(rdp::run(target, Box::new(link)));
+        tokio::spawn(async move {
+            let _listed = presence.enter(connection);
+            rdp::run(target, Box::new(link)).await
+        });
     });
     match transport::answer_offer(offer, servers, on_open).await {
         Ok(answer) => Ok(Json(answer).into_response()),
@@ -497,6 +505,30 @@ async fn rtc_offer(
             tracing::warn!("direct link setup failed for {username}: {e:#}");
             Ok(StatusCode::BAD_GATEWAY.into_response())
         }
+    }
+}
+
+/// What the admin panel shows about an open session.
+async fn connection_info(
+    state: &AppState,
+    user: &User,
+    key: &str,
+    headers: &HeaderMap,
+    link: &'static str,
+) -> crate::presence::Connection {
+    let app = db::app_by_key(&state.pool, key)
+        .await
+        .ok()
+        .flatten()
+        .map(|a| a.name)
+        .unwrap_or_else(|| key.to_string());
+    crate::presence::Connection {
+        user_id: user.id,
+        app,
+        since: db::now(),
+        address: client_address(headers),
+        device: crate::presence::device(headers),
+        link,
     }
 }
 

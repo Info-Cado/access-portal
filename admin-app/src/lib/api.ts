@@ -3,6 +3,16 @@
 
 import { invoke } from "@tauri-apps/api/core"
 
+/** A session open right now. */
+export type LiveSession = {
+  app: string
+  /** Unix seconds. */
+  since: number
+  address: string
+  device: string
+  link: "direct" | "relayed"
+}
+
 export type PortalUser = {
   id: number
   username: string
@@ -13,6 +23,7 @@ export type PortalUser = {
   failed_count: number
   created_at: number
   app_ids: number[]
+  sessions: LiveSession[]
 }
 
 export type PortalApp = {
@@ -66,6 +77,16 @@ export async function api<T = unknown>(method: string, path: string, body?: unkn
   }
   if (res.status >= 200 && res.status < 300) return res.data as T
   throw new ApiError(res.data?.error ?? `The portal refused that (${res.status}).`, res.status)
+}
+
+/** "just now", "4 min", "2 h 5 min" since a Unix time. */
+export function since(unix: number): string {
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - unix))
+  if (s < 60) return "just now"
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} min`
+  const h = Math.floor(m / 60)
+  return m % 60 ? `${h} h ${m % 60} min` : `${h} h`
 }
 
 export function errorText(e: unknown): string {

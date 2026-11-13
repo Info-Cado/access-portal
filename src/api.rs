@@ -96,6 +96,7 @@ async fn existing_user(state: &AppState, id: i64) -> Result<User, ApiError> {
 
 async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
     let now = db::now();
+    let open = state.presence.snapshot();
     let mut users = Vec::new();
     for u in db::list_users(&state.pool).await? {
         let app_ids: Vec<i64> = db::apps_for_user(&state.pool, u.id)
@@ -113,6 +114,7 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
             "failed_count": u.failed_count,
             "created_at": u.created_at,
             "app_ids": app_ids,
+            "sessions": open.iter().filter(|c| c.user_id == u.id).collect::<Vec<_>>(),
         }));
     }
     let apps: Vec<Value> = db::list_apps(&state.pool)
