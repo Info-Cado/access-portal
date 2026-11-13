@@ -116,6 +116,16 @@ pub async fn set_password(
     Ok(())
 }
 
+/// When and from where a user may sign in (JSON), or `None` for no limits.
+pub async fn set_access_rules(pool: &SqlitePool, user_id: i64, rules: Option<&str>) -> Result<()> {
+    sqlx::query("UPDATE users SET access_rules = ? WHERE id = ?")
+        .bind(rules)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Turn two-step verification on (with this secret) or off (`None`).
 pub async fn set_totp_secret(pool: &SqlitePool, user_id: i64, secret: Option<&str>) -> Result<()> {
     sqlx::query("UPDATE users SET totp_secret = ? WHERE id = ?")

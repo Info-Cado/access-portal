@@ -1,8 +1,9 @@
 import { useState } from "react"
-import { ChevronRightIcon, PlusIcon, SearchIcon, UserXIcon } from "lucide-react"
+import { ChevronRightIcon, MessageSquareTextIcon, PlusIcon, SearchIcon, UserXIcon } from "lucide-react"
 
 import type { ViewProps } from "@/components/app-shell"
 import { SecretDialog, type SecretToShow } from "@/components/dialogs"
+import { MessageDialog, type MessageTarget } from "@/components/message-dialog"
 import { NewUserDialog } from "@/components/new-user-dialog"
 import { UserSheet } from "@/components/user-sheet"
 import { Badge } from "@/components/ui/badge"
@@ -16,6 +17,8 @@ export function UsersView({ data, reload }: ViewProps) {
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [creating, setCreating] = useState(false)
   const [secret, setSecret] = useState<SecretToShow | null>(null)
+  const [messageTo, setMessageTo] = useState<MessageTarget | null>(null)
+  const connected = data.users.reduce((n, u) => n + u.sessions.length, 0)
 
   const q = query.trim().toLowerCase()
   const shown = data.users.filter(
@@ -37,7 +40,17 @@ export function UsersView({ data, reload }: ViewProps) {
             spellCheck={false}
           />
         </InputGroup>
-        <Button className="ml-auto" onClick={() => setCreating(true)}>
+        <Button
+          variant="outline"
+          className="ml-auto"
+          disabled={connected === 0}
+          title={connected === 0 ? "Nobody is connected right now" : undefined}
+          onClick={() => setMessageTo({ label: `everyone connected (${connected})` })}
+        >
+          <MessageSquareTextIcon />
+          Message everyone
+        </Button>
+        <Button onClick={() => setCreating(true)}>
           <PlusIcon />
           New user
         </Button>
@@ -136,6 +149,7 @@ export function UsersView({ data, reload }: ViewProps) {
         onSecret={setSecret}
       />
       <SecretDialog secret={secret} onClose={() => setSecret(null)} />
+      <MessageDialog target={messageTo} onClose={() => setMessageTo(null)} />
     </>
   )
 }

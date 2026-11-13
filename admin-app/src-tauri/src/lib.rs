@@ -26,6 +26,27 @@ enum Server {
     Failed(String),
 }
 
+/// The window shows nothing until the admin signs in, and locks again when it
+/// is closed to the tray. Wrong passwords slow down after a few tries.
+#[derive(Default)]
+struct AppLock(Mutex<LockState>);
+
+#[derive(Default)]
+struct LockState {
+    unlocked: bool,
+    failures: u32,
+    wait_until: Option<std::time::Instant>,
+}
+
+impl AppLock {
+    fn is_unlocked(&self) -> bool {
+        self.0.lock().unwrap().unlocked
+    }
+    fn lock(&self) {
+        self.0.lock().unwrap().unlocked = false;
+    }
+}
+
 /// Everything the portal keeps: settings, database, transfer folders, log.
 /// Machine-wide, so it doesn't depend on which Windows account opens the app.
 fn data_dir() -> PathBuf {
@@ -52,25 +73,81 @@ fn start_logging(dir: &std::path::Path) {
 
 /// Whether the portal is running, where, where its files are, and the public link.
 #[tauri::command]
-fn status(server: State<'_, Server>, tunnel: State<'_, Option<tunnel::Tunnel>>) -> Value {
+fn status(server: State<'_, Server>, tunnel: State<'_, Option<tunnel::Tunnel>>, lock: State<'_, AppLock>) -> Value {
     let dir = data_dir().display().to_string();
     let public = tunnel.inner().as_ref().map(|t| t.status().to_json()).unwrap_or(json!({ "state": "unavailable" }));
+    let locked = !lock.is_unlocked();
     match server.inner() {
-        Server::Running(p) => json!({ "running": true, "address": p.address, "data_dir": dir, "public": public }),
-        Server::Failed(e) => json!({ "running": false, "error": e, "data_dir": dir, "public": public }),
+        Server::Running(p) => json!({ "running": true, "address": p.address, "data_dir": dir, "public": public, "locked": locked }),
+        Server::Failed(e) => json!({ "running": false, "error": e, "data_dir": dir, "public": public, "locked": locked }),
     }
+}
+
+/// Sign in to the app.
+#[tauri::command]
+async fn unlock(server: State<'_, Server>, lock: State<'_, AppLock>, username: String, password: String) -> Result<Value, String> {
+    let portal = match server.inner() {
+        Server::Running(p) => p,
+        Server::Failed(e) => return Err(format!("The portal is not running: {e}")),
+    };
+    if let Some(until) = lock.0.lock().unwrap().wait_until {
+        let now = std::time::Instant::now();
+        if until > now {
+            return Err(format!("Too many wrong passwords. Try again in {} s.", (until - now).as_secs() + 1));
+        }
+    }
+    let (status, data) = portal
+        .admin("POST", "/api/admin/auth/verify", Some(json!({ "username": username, "password": password })))
+        .await;
+    let mut state = lock.0.lock().unwrap();
+    if status == 200 {
+        *state = LockState { unlocked: true, failures: 0, wait_until: None };
+        return Ok(data);
+    }
+    state.failures += 1;
+    if state.failures >= 5 {
+        state.wait_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    }
+    Err(data.get("error").and_then(Value::as_str).unwrap_or("Wrong username or password.").to_string())
+}
+
+#[tauri::command]
+fn lock(lock: State<'_, AppLock>) {
+    lock.lock();
+}
+
+/// Save a file to the Downloads folder and show it in Explorer.
+#[tauri::command]
+fn save_download(lock: State<'_, AppLock>, name: String, contents: String) -> Result<String, String> {
+    if !lock.is_unlocked() {
+        return Err("The app is locked.".into());
+    }
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c })
+        .collect();
+    let dir = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Downloads");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(safe);
+    std::fs::write(&path, contents.as_bytes()).map_err(|e| format!("Couldn't save {}: {e}", path.display()))?;
+    let _ = tauri_plugin_opener::reveal_item_in_dir(&path);
+    Ok(path.display().to_string())
 }
 
 /// One admin call to the portal, in-process. Answers `{ status, data }`.
 #[tauri::command]
 async fn request(
     server: State<'_, Server>,
+    lock: State<'_, AppLock>,
     method: String,
     path: String,
     body: Option<Value>,
 ) -> Result<Value, String> {
-    if !path.starts_with("/api/admin/") {
+    if !path.starts_with("/api/admin/") || path.starts_with("/api/admin/auth/verify") {
         return Err("Only the portal's admin calls can be made.".into());
+    }
+    if !lock.is_unlocked() {
+        return Ok(json!({ "status": 423, "data": { "error": "The app is locked. Sign in again." } }));
     }
     let portal = match server.inner() {
         Server::Running(p) => p,
@@ -160,6 +237,7 @@ pub fn run() {
             };
             app.manage(server);
             app.manage(public);
+            app.manage(AppLock::default());
 
             // Start with Windows by default, once; after that the tray setting
             // rules. While it is on, re-register on every start so the entry
@@ -186,9 +264,11 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                // Whoever opens it next signs in again.
+                window.app_handle().state::<AppLock>().lock();
             }
         })
-        .invoke_handler(tauri::generate_handler![status, request])
+        .invoke_handler(tauri::generate_handler![status, request, unlock, lock, save_download])
         .build(tauri::generate_context!())
         .expect("starting Access Portal")
         .run(|app, event| {

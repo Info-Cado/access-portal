@@ -1,4 +1,4 @@
-﻿//! Built-in browser RDP client.
+//! Built-in browser RDP client.
 //!
 //! The portal itself is the RDP client: it connects to the host, signs in with
 //! the stored Windows credentials (NLA), decodes the screen, and streams changed
@@ -10,6 +10,10 @@
 //!   text    {"t":"size","w":..,"h":..}       session resolution
 //!   text    {"t":"cur", ...}                 pointer shape (png/default/hidden)
 //!   text    {"t":"closed","m":".."}          session ended
+//!   binary  [7][channels u8][rate u32][16-bit PCM]   sound
+//!   binary  [8][PNG]                         a picture copied in the session
+//!   text    {"t":"clipfiles","files":[..]}   files copied in the session
+//!   text    {"t":"idle","s":..}              disconnecting soon for inactivity
 //! Browser -> server: small JSON objects, see `ClientMsg`.
 
 use std::time::Duration;
@@ -23,8 +27,9 @@ use ironrdp_connector::{
 };
 use ironrdp_cliprdr::backend::CliprdrBackend;
 use ironrdp_cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
-    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags,
+    FileContentsFlags, FileContentsRequest, FileContentsResponse, FileDescriptor, FormatDataRequest,
+    FormatDataResponse, LockDataId,
 };
 use ironrdp_cliprdr::CliprdrClient;
 use ironrdp_core::{impl_as_any, WriteBuf};
@@ -43,6 +48,7 @@ use serde::Deserialize;
 use ironrdp_svc::{SvcProcessor, SvcProcessorMessages};
 use serde_json::json;
 
+use crate::activity::Actor;
 use crate::tiles::Tiles;
 use crate::transport::{Incoming, Transport};
 use crate::video::{packet_message, Video, VideoEvent};
@@ -70,15 +76,33 @@ pub struct Target {
     pub egfx: bool,
     /// Signalled when an administrator disconnects this session.
     pub kick: Option<std::sync::Arc<crate::presence::Kick>>,
+    /// Messages for the browser from the app (an administrator's message, ...).
+    pub notices: Option<crate::presence::Notices>,
+    /// Disconnect after this long without keyboard or mouse input.
+    pub idle: Option<Duration>,
+    /// The user's allowed hours: the session ends when they are over.
+    pub rules: Option<crate::access::AccessRules>,
+    /// Who is using the session, for the activity log.
+    pub actor: Option<crate::activity::Actor>,
+    /// Where files pasted from the browser wait for Windows to read them.
+    pub clip_dir: Option<std::path::PathBuf>,
 }
 
 /// What a session needs besides the connection itself.
 struct Extras {
     /// Finished print jobs, saved in the user's folder.
     printed: std::sync::mpsc::Receiver<crate::print::PrintedFile>,
+    /// Sound from the session.
+    sound: std::sync::mpsc::Receiver<crate::sound::Block>,
     kick: Option<std::sync::Arc<crate::presence::Kick>>,
+    notices: Option<crate::presence::Notices>,
     /// The Windows account, for signing it out on request.
     win_username: String,
+    idle: Option<Duration>,
+    rules: Option<crate::access::AccessRules>,
+    actor: Option<crate::activity::Actor>,
+    clip_dir: Option<std::path::PathBuf>,
+    files_dir: Option<std::path::PathBuf>,
 }
 
 /// Name of the redirected drive inside the session: `\\tsclient\P`.
@@ -96,6 +120,12 @@ const MAX_IN_FLIGHT: u32 = 4;
 
 /// Largest clipboard text carried in either direction.
 const MAX_CLIPBOARD_BYTES: usize = 2 * 1024 * 1024;
+/// Largest copied picture taken from the host (a 4K screenshot is ~33 MB as a bitmap).
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Copied files are read from the host in pieces of this size.
+const FILE_CHUNK: u32 = 256 * 1024;
+/// Largest file copied out of the session.
+const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Clamp a browser-reported viewport to something an RDP server accepts.
 pub fn sane_size(w: u32, h: u32) -> (u16, u16) {
@@ -143,6 +173,19 @@ enum ClientMsg {
     /// text typed on an on-screen keyboard, which reports characters, not keys
     #[serde(rename = "txt")]
     Text { s: String },
+    /// sound on or off for this browser
+    #[serde(rename = "snd")]
+    Sound { on: bool },
+    /// a picture copied on the user's computer, uploaded as PNG to the
+    /// clipboard folder `b` as `f`
+    #[serde(rename = "clipimg")]
+    ClipImage { b: String, f: String },
+    /// files copied on the user's computer, uploaded to clipboard folder `b`
+    #[serde(rename = "clipfiles")]
+    ClipFiles { b: String, f: Vec<String> },
+    /// save the files copied in the session to the user's folder
+    #[serde(rename = "fetch")]
+    Fetch,
 }
 
 /// What the clipboard channel tells the session loop. The channel calls its
@@ -151,12 +194,108 @@ enum ClientMsg {
 enum ClipEvent {
     /// The host wants to know what is on our clipboard.
     RequestFormatList,
-    /// Something was copied on the host; `true` if it offers text.
-    RemoteCopy(bool),
+    /// Something was copied on the host: text, a picture, files (the format
+    /// that lists them).
+    RemoteCopy { text: bool, image: bool, files: Option<ClipboardFormatId> },
     /// The host is pasting and asks for our data in this format.
     DataRequest(ClipboardFormatId),
-    /// Text fetched from the host's clipboard.
-    RemoteText(String),
+    /// The host's answer to our last paste request; `None` if it failed.
+    RemoteData(Option<Vec<u8>>),
+    /// The files copied on the host, and the lock that keeps them readable.
+    RemoteFiles(Vec<FileDescriptor>, Option<u32>),
+    /// The host is pasting our files and wants (part of) one.
+    FileRequest(FileContentsRequest),
+    /// Part of a host file we asked for; `None` if it failed.
+    FileData { stream_id: u32, data: Option<Vec<u8>> },
+}
+
+/// What is on the user's own clipboard, offered to the host.
+enum LocalClip {
+    Text(String),
+    /// A picture as a Windows bitmap (CF_DIB).
+    Image(Vec<u8>),
+    /// Files waiting in the clipboard folder.
+    Files(Vec<std::path::PathBuf>),
+}
+
+/// What our pending paste requests to the host were for, oldest first.
+#[derive(Clone, Copy)]
+enum Paste {
+    Text,
+    Image,
+}
+
+/// Copying files out of the session into the user's folder, one at a time.
+struct Fetch {
+    /// (index in the host's list, file name, size if known)
+    queue: std::collections::VecDeque<(i32, String, Option<u64>)>,
+    current: Option<FetchFile>,
+    data_id: Option<u32>,
+    next_stream: u32,
+    saved: Vec<String>,
+    last_progress: std::time::Instant,
+}
+
+struct FetchFile {
+    index: i32,
+    name: String,
+    size: Option<u64>,
+    stream_id: u32,
+    file: tokio::fs::File,
+    part: std::path::PathBuf,
+    got: u64,
+}
+
+fn utf16_text(data: &[u8]) -> String {
+    let units: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|u| *u != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Windows FILETIME (100 ns since 1601) from a file's modification time.
+fn filetime(meta: &std::fs::Metadata) -> Option<u64> {
+    let since = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(since.as_secs() * 10_000_000 + u64::from(since.subsec_nanos() / 100) + 116_444_736_000_000_000)
+}
+
+fn describe_files(paths: &[std::path::PathBuf]) -> Vec<FileDescriptor> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let meta = std::fs::metadata(p).ok()?;
+            let name = p.file_name()?.to_string_lossy().into_owned();
+            let mut d = FileDescriptor::new(name)
+                .with_attributes(ClipboardFileAttributes::NORMAL)
+                .with_file_size(meta.len());
+            if let Some(t) = filetime(&meta) {
+                d = d.with_last_write_time(t);
+            }
+            Some(d)
+        })
+        .collect()
+}
+
+/// A plain file name that can't point outside its folder.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', ':']) && name != "." && name != ".." && !name.starts_with('.')
+}
+
+/// A file name that is free in `dir`: "report.pdf", then "report (1).pdf", ...
+async fn free_name(dir: &std::path::Path, name: &str) -> String {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (name.to_string(), String::new()),
+    };
+    let mut candidate = name.to_string();
+    let mut n = 1;
+    while tokio::fs::try_exists(dir.join(&candidate)).await.unwrap_or(false) {
+        candidate = format!("{stem} ({n}){ext}");
+        n += 1;
+    }
+    candidate
 }
 
 #[derive(Debug)]
@@ -171,9 +310,13 @@ impl CliprdrBackend for ClipBackend {
         ".cliprdr"
     }
 
-    // Text only: no file streams, no locking.
+    // Text, pictures and files (streamed on request, with locking so a copy
+    // stays readable while it is being read).
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
         ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+            | ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
+            | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
     }
 
     fn on_ready(&mut self) {}
@@ -185,10 +328,16 @@ impl CliprdrBackend for ClipBackend {
     fn on_process_negotiated_capabilities(&mut self, _capabilities: ClipboardGeneralCapabilityFlags) {}
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
-        let has_text = available_formats
+        let has = |id: ClipboardFormatId| available_formats.iter().any(|f| f.id() == id);
+        let files = available_formats
             .iter()
-            .any(|f| f.id() == ClipboardFormatId::CF_UNICODETEXT);
-        let _ = self.tx.send(ClipEvent::RemoteCopy(has_text));
+            .find(|f| f.name().is_some_and(|n| n.value() == "FileGroupDescriptorW"))
+            .map(|f| f.id());
+        let _ = self.tx.send(ClipEvent::RemoteCopy {
+            text: has(ClipboardFormatId::CF_UNICODETEXT),
+            image: has(ClipboardFormatId::CF_DIB),
+            files,
+        });
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
@@ -196,16 +345,25 @@ impl CliprdrBackend for ClipBackend {
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
-        if response.is_error() || response.data().len() > MAX_CLIPBOARD_BYTES {
-            return;
-        }
-        if let Ok(text) = response.to_unicode_string() {
-            let _ = self.tx.send(ClipEvent::RemoteText(text));
-        }
+        let ok = !response.is_error() && response.data().len() <= MAX_CLIPBOARD_IMAGE_BYTES;
+        let _ = self.tx.send(ClipEvent::RemoteData(ok.then(|| response.data().to_vec())));
     }
 
-    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
-    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+    fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
+        let _ = self.tx.send(ClipEvent::RemoteFiles(files.to_vec(), clip_data_id));
+    }
+
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        let _ = self.tx.send(ClipEvent::FileRequest(request));
+    }
+
+    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+        let _ = self.tx.send(ClipEvent::FileData {
+            stream_id: response.stream_id(),
+            data: (!response.is_error()).then(|| response.data().to_vec()),
+        });
+    }
+
     fn on_lock(&mut self, _data_id: LockDataId) {}
     fn on_unlock(&mut self, _data_id: LockDataId) {}
 }
@@ -296,7 +454,7 @@ fn config(target: &Target) -> Config {
         hardware_id: None,
         request_data: None,
         autologon: false,
-        enable_audio_playback: false,
+        enable_audio_playback: true,
         enable_audio_capture: false,
         // With Windows' H.264 the full desktop experience costs little: show window
         // contents while dragging, animations, smooth fonts and composition.
@@ -316,9 +474,17 @@ fn config(target: &Target) -> Config {
     }
 }
 
+#[allow(clippy::type_complexity)]
 async fn connect(
     target: &Target,
-) -> anyhow::Result<(ConnectionResult, TlsFramed, std::sync::mpsc::Receiver<ClipEvent>, Option<crate::gfx::SharedRef>, Extras)> {
+) -> anyhow::Result<(
+    ConnectionResult,
+    TlsFramed,
+    std::sync::mpsc::Receiver<ClipEvent>,
+    Option<crate::gfx::SharedRef>,
+    std::sync::mpsc::Receiver<crate::print::PrintedFile>,
+    std::sync::mpsc::Receiver<crate::sound::Block>,
+)> {
     let addr = format!("{}:{}", target.host, target.port);
     let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr))
         .await
@@ -340,20 +506,16 @@ async fn connect(
         dvc = dvc.with_dynamic_channel(gfx);
         gfx_shared = Some(shared);
     }
+    let (sound_tx, sound_rx) = std::sync::mpsc::channel();
     let mut connector = ClientConnector::new(config(target), client_addr)
         .with_static_channel(dvc)
-        .with_static_channel(CliprdrClient::new(Box::new(ClipBackend { tx: clip_tx })));
+        .with_static_channel(CliprdrClient::new(Box::new(ClipBackend { tx: clip_tx })))
+        // Sound (Windows also only starts device redirection when this channel is there).
+        .with_static_channel(ironrdp_rdpsnd::client::Rdpsnd::new(Box::new(crate::sound::Backend::new(sound_tx))));
     #[cfg(windows)]
     if let Some(dir) = &target.files_dir {
         match drive_channel(dir, print_tx) {
-            Ok(rdpdr) => {
-                // Windows only starts device redirection when the audio channel
-                // is present too, so join it with a backend that plays nothing.
-                connector.attach_static_channel(ironrdp_rdpsnd::client::Rdpsnd::new(Box::new(
-                    ironrdp_rdpsnd::client::NoopRdpsndBackend,
-                )));
-                connector.attach_static_channel(rdpdr);
-            }
+            Ok(rdpdr) => connector.attach_static_channel(rdpdr),
             Err(e) => tracing::warn!("file sharing disabled for {}: {e:#}", target.username),
         }
     }
@@ -385,13 +547,29 @@ async fn connect(
     .map_err(|e| anyhow!("RDP sign-in failed: {e:#}"))?;
 
     let result = outcome.into_connected().map_err(|e| anyhow!("{e:#}"))?;
-    let extras = Extras { printed: print_rx, kick: target.kick.clone(), win_username: target.username.clone() };
-    Ok((result, framed, clip_rx, gfx_shared, extras))
+    Ok((result, framed, clip_rx, gfx_shared, print_rx, sound_rx))
 }
 
-/// Run one RDP session for one browser tab. Returns when either side closes.
-pub async fn run(target: Target, mut io: Box<dyn Transport>) {
-    let outcome = match connect(&target).await {
+/// Run one RDP session for one browser tab. Returns when either side closes,
+/// with what the user was told about why it ended.
+pub async fn run(mut target: Target, mut io: Box<dyn Transport>) -> String {
+    let connected = connect(&target).await;
+    let connected = connected.map(|(result, framed, clip_rx, gfx, printed, sound)| {
+        let extras = Extras {
+            printed,
+            sound,
+            kick: target.kick.clone(),
+            notices: target.notices.take(),
+            win_username: target.username.clone(),
+            idle: target.idle,
+            rules: target.rules.take(),
+            actor: target.actor.clone(),
+            clip_dir: target.clip_dir.clone(),
+            files_dir: target.files_dir.clone(),
+        };
+        (result, framed, clip_rx, gfx, extras)
+    });
+    let outcome = match connected {
         Ok((result, framed, clip_rx, gfx, extras)) => {
             session(result, framed, clip_rx, target.resizable, target.video_ok && gfx.is_none(), gfx, extras, io.as_mut()).await
         }
@@ -414,6 +592,7 @@ pub async fn run(target: Target, mut io: Box<dyn Transport>) {
     // reconnect instead of showing why the session ended.
     tokio::time::sleep(Duration::from_millis(600)).await;
     io.close().await;
+    message
 }
 
 fn png(width: u32, height: u32, color: png::ColorType, data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -500,6 +679,167 @@ async fn send_json(io: &mut dyn Transport, value: serde_json::Value) -> anyhow::
     io.send_text(value.to_string()).await
 }
 
+/// Answer the host reading (part of) one of the files the user pasted.
+async fn file_contents(paths: &[std::path::PathBuf], req: &FileContentsRequest) -> FileContentsResponse<'static> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+    let Some(path) = usize::try_from(req.index).ok().and_then(|i| paths.get(i)) else {
+        return FileContentsResponse::new_error(req.stream_id);
+    };
+    if req.flags.contains(FileContentsFlags::SIZE) {
+        return match tokio::fs::metadata(path).await {
+            Ok(meta) => FileContentsResponse::new_size_response(req.stream_id, meta.len()),
+            Err(_) => FileContentsResponse::new_error(req.stream_id),
+        };
+    }
+    let read = async {
+        let mut file = tokio::fs::File::open(path).await?;
+        file.seek(std::io::SeekFrom::Start(req.position)).await?;
+        let want = (req.requested_size as usize).min(8 * 1024 * 1024);
+        let mut buf = vec![0u8; want];
+        let mut got = 0;
+        while got < want {
+            let n = file.read(&mut buf[got..]).await?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        buf.truncate(got);
+        std::io::Result::Ok(buf)
+    };
+    match read.await {
+        Ok(data) => FileContentsResponse::new_data_response(req.stream_id, data),
+        Err(_) => FileContentsResponse::new_error(req.stream_id),
+    }
+}
+
+/// Where a file the browser put on the clipboard waits: `<clipboard>/<batch>/<name>`.
+fn clip_path(dir: &Option<std::path::PathBuf>, batch: &str, name: &str) -> Option<std::path::PathBuf> {
+    let dir = dir.as_ref()?;
+    let batch_ok = (8..=64).contains(&batch.len()) && batch.bytes().all(|b| b.is_ascii_hexdigit());
+    (batch_ok && plain_name(name)).then(|| dir.join(batch).join(name))
+}
+
+/// Remove clipboard batches older than an hour, except `keep`.
+fn prune_clipboard(dir: &Option<std::path::PathBuf>, keep: &str) {
+    let Some(dir) = dir else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > Duration::from_secs(3600));
+        if old && entry.file_name() != keep {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+enum ClipAction {
+    Event(ClipEvent),
+    RequestFile(FileContentsRequest),
+}
+
+enum FetchStep {
+    Ignore,
+    Progress { name: String, got: u64, size: u64 },
+    Saved { name: String, size: u64 },
+    Failed { name: String },
+}
+
+impl Fetch {
+    /// The next piece to ask the host for, opening the next file when needed.
+    async fn next_request(&mut self, dir: &std::path::Path) -> anyhow::Result<Option<FileContentsRequest>> {
+        loop {
+            if let Some(cur) = &self.current {
+                let (flags, position, requested_size) = match cur.size {
+                    None => (FileContentsFlags::SIZE, 0, 8),
+                    Some(total) => (FileContentsFlags::RANGE, cur.got, (total - cur.got).min(u64::from(FILE_CHUNK)) as u32),
+                };
+                return Ok(Some(FileContentsRequest {
+                    stream_id: cur.stream_id,
+                    index: cur.index,
+                    flags,
+                    position,
+                    requested_size,
+                    data_id: self.data_id,
+                }));
+            }
+            let Some((index, name, size)) = self.queue.pop_front() else { return Ok(None) };
+            self.next_stream = self.next_stream.wrapping_add(1);
+            let part = dir.join(format!(".clip-{}-{}.part", std::process::id(), self.next_stream));
+            let file = tokio::fs::File::create(&part).await.context("saving a copied file")?;
+            self.current = Some(FetchFile { index, name, size, stream_id: self.next_stream, file, part, got: 0 });
+            if size == Some(0) {
+                // Nothing to read: save it empty straight away.
+                let _ = self.finish(dir).await?;
+            }
+        }
+    }
+
+    async fn finish(&mut self, dir: &std::path::Path) -> anyhow::Result<FetchStep> {
+        use tokio::io::AsyncWriteExt as _;
+        let Some(mut cur) = self.current.take() else { return Ok(FetchStep::Ignore) };
+        cur.file.flush().await?;
+        drop(cur.file);
+        let name = free_name(dir, &cur.name).await;
+        tokio::fs::rename(&cur.part, dir.join(&name)).await.context("saving a copied file")?;
+        self.saved.push(name.clone());
+        Ok(FetchStep::Saved { name, size: cur.got })
+    }
+
+    async fn on_data(&mut self, dir: &std::path::Path, stream_id: u32, data: Option<Vec<u8>>) -> anyhow::Result<FetchStep> {
+        use tokio::io::AsyncWriteExt as _;
+        let Some(cur) = &mut self.current else { return Ok(FetchStep::Ignore) };
+        if cur.stream_id != stream_id {
+            return Ok(FetchStep::Ignore);
+        }
+        let Some(data) = data else {
+            let cur = self.current.take().unwrap();
+            drop(cur.file);
+            let _ = tokio::fs::remove_file(&cur.part).await;
+            return Ok(FetchStep::Failed { name: cur.name });
+        };
+        match cur.size {
+            None => {
+                let size = data.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+                if size > MAX_FILE_BYTES {
+                    let cur = self.current.take().unwrap();
+                    drop(cur.file);
+                    let _ = tokio::fs::remove_file(&cur.part).await;
+                    return Ok(FetchStep::Failed { name: cur.name });
+                }
+                cur.size = Some(size);
+                if size == 0 {
+                    return self.finish(dir).await;
+                }
+                Ok(FetchStep::Progress { name: cur.name.clone(), got: 0, size })
+            }
+            Some(size) => {
+                cur.file.write_all(&data).await.context("saving a copied file")?;
+                cur.got += data.len() as u64;
+                if data.is_empty() || cur.got >= size {
+                    self.finish(dir).await
+                } else {
+                    Ok(FetchStep::Progress { name: cur.name.clone(), got: cur.got, size })
+                }
+            }
+        }
+    }
+}
+
+fn size_text(n: u64) -> String {
+    match n {
+        n if n < 1024 => format!("{n} B"),
+        n if n < 1024 * 1024 => format!("{:.1} KB", n as f64 / 1024.0),
+        n if n < 1024 * 1024 * 1024 => format!("{:.1} MB", n as f64 / 1048576.0),
+        n => format!("{:.2} GB", n as f64 / 1073741824.0),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn session(
     result: ConnectionResult,
     mut framed: TlsFramed,
@@ -507,9 +847,21 @@ async fn session(
     resizable: bool,
     video_ok: bool,
     gfx: Option<crate::gfx::SharedRef>,
-    extras: Extras,
+    mut extras: Extras,
     io: &mut dyn Transport,
 ) -> anyhow::Result<String> {
+    let mut notices = extras.notices.take();
+    let mut sound_on = true;
+    // Clipboard: what the user copied on their computer, what we asked the host
+    // for, the host's copied files, and a copy of them in progress.
+    let mut local_clip: Option<LocalClip> = None;
+    let mut pending_paste: std::collections::VecDeque<Paste> = std::collections::VecDeque::new();
+    let mut remote_files: Option<(Vec<FileDescriptor>, Option<u32>)> = None;
+    let mut fetch: Option<Fetch> = None;
+    // Inactivity and allowed hours.
+    let mut last_input = std::time::Instant::now();
+    let mut idle_warned = false;
+    let mut slow_checks_at = std::time::Instant::now();
     let kicked = async {
         match &extras.kick {
             Some(k) => k.wait().await,
@@ -572,9 +924,8 @@ async fn session(
     let mut redraw_at: Option<std::time::Instant> = None;
     let (mut host_ms, mut portal_ms): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
     let mut last_cursor = String::new();
-    // Text copied on the user's own computer, offered to the host on request.
-    let mut local_clip: Option<String> = None;
     let text_format = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+    let image_format = [ClipboardFormat::new(ClipboardFormatId::CF_DIB)];
     // Housekeeping only (shared-drive replies, and a safety net for pending tiles):
     // screen changes are sent from the `flush_at` branch as they happen.
     let mut ticker = tokio::time::interval(Duration::from_millis(50));
@@ -644,34 +995,164 @@ async fn session(
             host_ms.clear();
             portal_ms.clear();
         }
+        // Sound that arrived since the last turn.
+        while let Ok(block) = extras.sound.try_recv() {
+            if sound_on {
+                let mut msg = Vec::with_capacity(6 + block.pcm.len());
+                msg.push(7);
+                msg.push(block.channels);
+                msg.extend_from_slice(&block.rate.to_le_bytes());
+                msg.extend_from_slice(&block.pcm);
+                io.send_binary(msg).await?;
+            }
+        }
         // Print jobs finished since the last turn: offer them in the browser.
         while let Ok(job) = extras.printed.try_recv() {
+            if let Some(actor) = &extras.actor {
+                actor.spawn("print", format!("{} ({})", job.name, size_text(job.size as u64)));
+            }
             send_json(io, json!({"t": "print", "name": job.name, "size": job.size})).await?;
         }
         // Clipboard events queued while the last PDU was processed.
         while let Ok(event) = clip_rx.try_recv() {
-            if let ClipEvent::RemoteText(text) = event {
-                send_json(io, json!({"t": "clip", "s": text.replace("\r\n", "\n")})).await?;
-                continue;
-            }
+            tracing::debug!("clipboard: {}", match &event {
+                ClipEvent::RequestFormatList => "host asks for our formats".to_string(),
+                ClipEvent::RemoteCopy { text, image, files } => format!("host copied: text={text} image={image} files={files:?}"),
+                ClipEvent::DataRequest(f) => format!("host pastes our format {f:?}"),
+                ClipEvent::RemoteData(d) => format!("host data: {:?} bytes", d.as_ref().map(Vec::len)),
+                ClipEvent::RemoteFiles(f, id) => format!("host file list: {} files, lock {id:?}", f.len()),
+                ClipEvent::FileRequest(r) => format!("host reads our file {} ({:?} at {} len {})", r.index, r.flags, r.position, r.requested_size),
+                ClipEvent::FileData { stream_id, data } => format!("host file data on {stream_id}: {:?} bytes", data.as_ref().map(Vec::len)),
+            });
+            // Events that only need the browser (or a file read) first.
+            let action = match event {
+                ClipEvent::RemoteData(data) => {
+                    match (pending_paste.pop_front(), data) {
+                        (Some(Paste::Text), Some(data)) => {
+                            let text = utf16_text(&data);
+                            if text.len() <= MAX_CLIPBOARD_BYTES {
+                                send_json(io, json!({"t": "clip", "s": text.replace("\r\n", "\n")})).await?;
+                            }
+                        }
+                        (Some(Paste::Image), Some(data)) => match crate::clipimage::dib_to_png(&data) {
+                            Ok(png) => {
+                                let mut msg = Vec::with_capacity(1 + png.len());
+                                msg.push(8);
+                                msg.extend_from_slice(&png);
+                                io.send_binary(msg).await?;
+                            }
+                            Err(e) => tracing::debug!("copied picture not passed on: {e:#}"),
+                        },
+                        _ => {}
+                    }
+                    continue;
+                }
+                ClipEvent::RemoteFiles(files, data_id) => {
+                    let list: Vec<_> = files
+                        .iter()
+                        .filter(|f| !f.attributes.is_some_and(|a| a.contains(ClipboardFileAttributes::DIRECTORY)))
+                        .take(500)
+                        .map(|f| json!({"name": f.name, "size": f.file_size}))
+                        .collect();
+                    remote_files = Some((files, data_id));
+                    if !list.is_empty() {
+                        send_json(io, json!({"t": "clipfiles", "files": list})).await?;
+                    }
+                    continue;
+                }
+                ClipEvent::FileData { stream_id, data } => {
+                    let (Some(f), Some(dir)) = (fetch.as_mut(), extras.files_dir.as_deref()) else { continue };
+                    match f.on_data(dir, stream_id, data).await? {
+                        FetchStep::Ignore => continue,
+                        FetchStep::Progress { name, got, size } => {
+                            if f.last_progress.elapsed() >= Duration::from_millis(300) {
+                                f.last_progress = std::time::Instant::now();
+                                send_json(io, json!({"t": "fetching", "name": name, "got": got, "size": size})).await?;
+                            }
+                        }
+                        FetchStep::Saved { name, size } => {
+                            if let Some(actor) = &extras.actor {
+                                actor.spawn("clipboard", format!("Copied {name} ({}) out of the session", size_text(size)));
+                            }
+                        }
+                        FetchStep::Failed { name } => {
+                            send_json(io, json!({"t": "fetchfail", "name": name})).await?;
+                        }
+                    }
+                    match f.next_request(dir).await? {
+                        Some(request) => ClipAction::RequestFile(request),
+                        None => {
+                            let saved = std::mem::take(&mut f.saved);
+                            fetch = None;
+                            send_json(io, json!({"t": "fetched", "names": saved})).await?;
+                            continue;
+                        }
+                    }
+                }
+                ClipEvent::FileRequest(req) => {
+                    let response = match &local_clip {
+                        Some(LocalClip::Files(paths)) => file_contents(paths, &req).await,
+                        _ => FileContentsResponse::new_error(req.stream_id),
+                    };
+                    let Some(clip) = stage.get_svc_processor_mut::<CliprdrClient>() else { continue };
+                    let messages = clip.submit_file_contents(response).map_err(|e| anyhow!("clipboard error: {e:#}"))?;
+                    let frame = svc_frame(&stage, messages)?;
+                    if !frame.is_empty() {
+                        framed.write_all(&frame).await.context("writing to the host")?;
+                    }
+                    continue;
+                }
+                other => ClipAction::Event(other),
+            };
             let Some(clip) = stage.get_svc_processor_mut::<CliprdrClient>() else {
                 continue;
             };
-            let messages = match event {
-                ClipEvent::RequestFormatList => {
-                    clip.initiate_copy(if local_clip.is_some() { &text_format[..] } else { &[] })
+            let event = match action {
+                // The next piece of a file being copied out of the session.
+                ClipAction::RequestFile(request) => {
+                    let messages = clip.request_file_contents(request).map_err(|e| anyhow!("clipboard error: {e:#}"))?;
+                    let frame = svc_frame(&stage, messages)?;
+                    if !frame.is_empty() {
+                        framed.write_all(&frame).await.context("writing to the host")?;
+                    }
+                    continue;
                 }
-                ClipEvent::RemoteCopy(true) => clip.initiate_paste(ClipboardFormatId::CF_UNICODETEXT),
+                ClipAction::Event(event) => event,
+            };
+            let messages = match event {
+                ClipEvent::RequestFormatList => match &local_clip {
+                    Some(LocalClip::Text(_)) => clip.initiate_copy(&text_format),
+                    Some(LocalClip::Image(_)) => clip.initiate_copy(&image_format),
+                    Some(LocalClip::Files(paths)) => clip.initiate_file_copy(describe_files(paths)),
+                    None => clip.initiate_copy(&[]),
+                },
+                ClipEvent::RemoteCopy { text, image, files } => {
+                    remote_files = None;
+                    if text {
+                        pending_paste.push_back(Paste::Text);
+                        clip.initiate_paste(ClipboardFormatId::CF_UNICODETEXT)
+                    } else if image {
+                        pending_paste.push_back(Paste::Image);
+                        clip.initiate_paste(ClipboardFormatId::CF_DIB)
+                    } else if let Some(format) = files {
+                        clip.initiate_paste(format)
+                    } else {
+                        continue;
+                    }
+                }
                 ClipEvent::DataRequest(format) => {
                     let response = match &local_clip {
-                        Some(text) if format == ClipboardFormatId::CF_UNICODETEXT => {
+                        Some(LocalClip::Text(text)) if format == ClipboardFormatId::CF_UNICODETEXT => {
                             FormatDataResponse::new_unicode_string(text)
+                        }
+                        Some(LocalClip::Image(dib)) if format == ClipboardFormatId::CF_DIB => {
+                            FormatDataResponse::new_data(dib.clone())
                         }
                         _ => FormatDataResponse::new_error(),
                     };
                     clip.submit_format_data(response)
                 }
-                ClipEvent::RemoteCopy(false) | ClipEvent::RemoteText(_) => continue,
+                _ => continue,
             }
             .map_err(|e| anyhow!("clipboard error: {e:#}"))?;
             let frame = svc_frame(&stage, messages)?;
@@ -684,6 +1165,19 @@ async fn session(
             biased;
             reason = &mut kicked => {
                 return Ok(reason);
+            }
+            // A message from the app for this browser.
+            note = async {
+                match notices.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match note {
+                    Some(note) => send_json(io, note).await?,
+                    None => notices = None,
+                }
+                continue;
             }
             // The browser first: input and frame acknowledgements are tiny, and
             // must never wait behind a stream of screen updates from the host
@@ -747,8 +1241,9 @@ async fn session(
                     Some(ClientMsg::Clip { s }) => {
                         // Windows clipboard text uses CRLF line endings.
                         let text = s.replace("\r\n", "\n").replace('\n', "\r\n");
-                        if text.len() <= MAX_CLIPBOARD_BYTES && local_clip.as_deref() != Some(text.as_str()) {
-                            local_clip = Some(text);
+                        let same = matches!(&local_clip, Some(LocalClip::Text(t)) if *t == text);
+                        if text.len() <= MAX_CLIPBOARD_BYTES && !same {
+                            local_clip = Some(LocalClip::Text(text));
                             if let Some(clip) = stage.get_svc_processor_mut::<CliprdrClient>() {
                                 if clip.is_ready() {
                                     let messages = clip
@@ -761,9 +1256,105 @@ async fn session(
                         }
                         continue;
                     }
+                    Some(ClientMsg::ClipImage { b, f }) => {
+                        tracing::debug!("clipboard: browser pasted a picture {b}/{f}");
+                        last_input = std::time::Instant::now();
+                        prune_clipboard(&extras.clip_dir, &b);
+                        let Some(path) = clip_path(&extras.clip_dir, &b, &f) else { continue };
+                        let dib = match tokio::fs::read(&path).await {
+                            Ok(png) => crate::clipimage::png_to_dib(&png),
+                            Err(e) => Err(e.into()),
+                        };
+                        match dib {
+                            Ok(dib) => {
+                                local_clip = Some(LocalClip::Image(dib));
+                                if let Some(clip) = stage.get_svc_processor_mut::<CliprdrClient>() {
+                                    if clip.is_ready() {
+                                        let messages = clip
+                                            .initiate_copy(&image_format)
+                                            .map_err(|e| anyhow!("clipboard error: {e:#}"))?;
+                                        let frame = svc_frame(&stage, messages)?;
+                                        framed.write_all(&frame).await.context("writing to the host")?;
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::debug!("pasted picture not usable: {e:#}"),
+                        }
+                        continue;
+                    }
+                    Some(ClientMsg::ClipFiles { b, f }) => {
+                        tracing::debug!("clipboard: browser pasted files {b}/{f:?}");
+                        last_input = std::time::Instant::now();
+                        prune_clipboard(&extras.clip_dir, &b);
+                        let paths: Vec<_> = f
+                            .iter()
+                            .take(500)
+                            .filter_map(|name| clip_path(&extras.clip_dir, &b, name))
+                            .filter(|p| p.is_file())
+                            .collect();
+                        if paths.is_empty() {
+                            continue;
+                        }
+                        if let Some(actor) = &extras.actor {
+                            let names: Vec<_> = paths.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy()).collect();
+                            actor.spawn("clipboard", format!("Pasted {} into the session", names.join(", ")));
+                        }
+                        let files = describe_files(&paths);
+                        local_clip = Some(LocalClip::Files(paths));
+                        if let Some(clip) = stage.get_svc_processor_mut::<CliprdrClient>() {
+                            if clip.is_ready() {
+                                let messages = clip
+                                    .initiate_file_copy(files)
+                                    .map_err(|e| anyhow!("clipboard error: {e:#}"))?;
+                                let frame = svc_frame(&stage, messages)?;
+                                framed.write_all(&frame).await.context("writing to the host")?;
+                            }
+                        }
+                        continue;
+                    }
+                    Some(ClientMsg::Fetch) => {
+                        let (Some((files, data_id)), Some(dir), None) = (&remote_files, extras.files_dir.as_deref(), &fetch) else {
+                            continue;
+                        };
+                        let queue = files
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, f)| !f.attributes.is_some_and(|a| a.contains(ClipboardFileAttributes::DIRECTORY)))
+                            .take(500)
+                            .map(|(i, f)| {
+                                let name = crate::web::safe_file_name(&f.name).unwrap_or_else(|| "file".to_owned());
+                                (i as i32, name, f.file_size)
+                            })
+                            .collect();
+                        let mut job = Fetch {
+                            queue,
+                            current: None,
+                            data_id: *data_id,
+                            next_stream: 0x4150_0000,
+                            saved: Vec::new(),
+                            last_progress: std::time::Instant::now(),
+                        };
+                        let request = job.next_request(dir).await?;
+                        fetch = Some(job);
+                        if let (Some(request), Some(clip)) = (request, stage.get_svc_processor_mut::<CliprdrClient>()) {
+                            let messages = clip
+                                .request_file_contents(request)
+                                .map_err(|e| anyhow!("clipboard error: {e:#}"))?;
+                            let frame = svc_frame(&stage, messages)?;
+                            framed.write_all(&frame).await.context("writing to the host")?;
+                        }
+                        continue;
+                    }
+                    Some(ClientMsg::Sound { on }) => {
+                        sound_on = on;
+                        continue;
+                    }
                     Some(other) => {
                         if matches!(other, ClientMsg::Move { .. }) {
                             moves_in += 1;
+                        }
+                        if !matches!(other, ClientMsg::Sync { .. } | ClientMsg::ReleaseAll) {
+                            last_input = std::time::Instant::now();
                         }
                         gfx_input_at.get_or_insert_with(std::time::Instant::now);
                         input_events(&mut input, other, image.width(), image.height())
@@ -797,6 +1388,49 @@ async fn session(
                 if last_keepalive.elapsed() >= KEEPALIVE {
                     io.keepalive().await?;
                     last_keepalive = std::time::Instant::now();
+                }
+                // Nobody at the keyboard: warn a minute ahead, then disconnect.
+                if let Some(limit) = extras.idle {
+                    let quiet = last_input.elapsed();
+                    if quiet >= limit {
+                        return Ok(format!(
+                            "Disconnected after {} without activity. Your apps are still running.",
+                            crate::activity::duration(limit.as_secs() as i64)
+                        ));
+                    }
+                    let warn_at = limit.saturating_sub(Duration::from_secs(60));
+                    if !idle_warned && quiet >= warn_at {
+                        idle_warned = true;
+                        send_json(io, json!({"t": "idle", "s": (limit - quiet).as_secs()})).await?;
+                    } else if idle_warned && quiet < warn_at {
+                        idle_warned = false;
+                    }
+                }
+                if slow_checks_at.elapsed() >= Duration::from_secs(15) {
+                    slow_checks_at = std::time::Instant::now();
+                    // The user's allowed hours are over (read fresh: the admin may
+                    // have changed them while the session is open).
+                    let rules = match &extras.actor {
+                        Some(Actor { pool, user_id: Some(id), .. }) => {
+                            crate::db::user_by_id(pool, *id).await.ok().flatten().map(|u| u.rules())
+                        }
+                        _ => extras.rules.clone(),
+                    };
+                    if let Some(rules) = rules {
+                        if let Err(why) = rules.check_time(crate::clock::now()) {
+                            return Ok(format!("Your time is up. {why} Your apps are still running."));
+                        }
+                    }
+                    // Release clipboard locks the host no longer needs.
+                    if let Some(clip) = stage.get_svc_processor_mut::<CliprdrClient>() {
+                        if clip.is_ready() {
+                            let messages = clip.drive_timeouts().map_err(|e| anyhow!("clipboard error: {e:#}"))?;
+                            let frame = svc_frame(&stage, messages)?;
+                            if !frame.is_empty() {
+                                framed.write_all(&frame).await.context("writing to the host")?;
+                            }
+                        }
+                    }
                 }
                 // File operations on the shared drive finish on worker threads;
                 // collect their replies for the host.
@@ -1013,9 +1647,15 @@ fn input_events(db: &mut Database, msg: ClientMsg, width: u16, height: u16) -> V
         }
         ClientMsg::ReleaseAll => return db.release_all().into_iter().collect(),
         // Handled by the session loop, not as input.
-        ClientMsg::Resize { .. } | ClientMsg::Clip { .. } | ClientMsg::Ack { .. } | ClientMsg::FrameAck { .. } | ClientMsg::SignOut => {
-            return Vec::new()
-        }
+        ClientMsg::Resize { .. }
+        | ClientMsg::Clip { .. }
+        | ClientMsg::Ack { .. }
+        | ClientMsg::FrameAck { .. }
+        | ClientMsg::SignOut
+        | ClientMsg::Sound { .. }
+        | ClientMsg::ClipImage { .. }
+        | ClientMsg::ClipFiles { .. }
+        | ClientMsg::Fetch => return Vec::new(),
     };
     db.apply(ops).into_iter().collect()
 }

@@ -16,9 +16,10 @@ use futures_util::StreamExt as _;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt as _;
 
+use crate::activity::Actor;
 use crate::error::AppError;
 use crate::models::User;
-use crate::{auth, db, rdp, transport, AppState};
+use crate::{access, activity, auth, db, rdp, settings, transport, AppState};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -98,6 +99,22 @@ fn client_address(headers: &HeaderMap) -> String {
         .filter(|v| !v.is_empty())
         .unwrap_or("local")
         .to_string()
+}
+
+/// The country Cloudflare places the browser in (two letters), if it said.
+fn client_country(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("cf-ipcountry")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_uppercase())
+        .filter(|v| v.len() == 2 && v != "XX")
+}
+
+/// Whether `user` may use the portal now, from where this request came from.
+fn allowed(user: &User, headers: &HeaderMap) -> Result<(), String> {
+    let address = client_address(headers);
+    let country = client_country(headers);
+    user.rules().check(&access::Origin { address: &address, country: country.as_deref() })
 }
 
 /// True when the browser reached the portal over HTTPS through a front end.
@@ -275,11 +292,15 @@ async fn login_submit(
     let Some(user) = user else {
         // Same message whether or not the user exists.
         state.limiter.failed(&address);
+        let typed: String = input.username.trim().chars().take(64).collect();
+        activity::log(&state.pool, None, &typed, "signin_failed", "Unknown username", &address).await;
         return Ok(login_page(Some("Invalid username or password.")).into_response());
     };
+    let actor = Actor::new(&state.pool, &user, &address);
 
     if let Some(until) = user.locked_until {
         if until > db::now() {
+            actor.log("signin_failed", "Account locked after too many attempts").await;
             return Ok(login_page(Some(
                 "Account temporarily locked after too many attempts. Try again later.",
             ))
@@ -290,10 +311,16 @@ async fn login_submit(
     if !auth::verify_password(&input.password, &user.password_hash) {
         state.limiter.failed(&address);
         db::note_failed_login(&state.pool, &state.config, user.id).await?;
+        actor.log("signin_failed", "Wrong password").await;
         return Ok(login_page(Some("Invalid username or password.")).into_response());
     }
 
     db::reset_failed_login(&state.pool, user.id).await?;
+
+    if let Err(why) = allowed(&user, &headers) {
+        actor.log("signin_denied", &why).await;
+        return Ok(login_page(Some(&why)).into_response());
+    }
 
     if user.totp_enabled() {
         let token = db::create_pending(&state.pool, user.id).await?;
@@ -302,6 +329,7 @@ async fn login_submit(
     }
 
     let token = db::create_session(&state.pool, &state.config, user.id).await?;
+    actor.log("signin", "Signed in").await;
     let jar = jar.add(cookie(&state, &headers, "session", token));
     Ok((jar, Redirect::to("/")).into_response())
 }
@@ -364,14 +392,17 @@ async fn totp_submit(
         return Ok(Redirect::to("/login").into_response());
     };
 
+    let actor = Actor::new(&state.pool, &user, &address);
     let secret = user.totp_secret.clone().unwrap_or_default();
     if !auth::verify_totp(&secret, &input.code) {
         state.limiter.failed(&address);
+        actor.log("signin_failed", "Wrong two-step code").await;
         return Ok(totp_page(Some("Incorrect code. Try again.")).into_response());
     }
 
     db::delete_pending(&state.pool, &token).await?;
     let session = db::create_session(&state.pool, &state.config, user.id).await?;
+    actor.log("signin", "Signed in (with two-step code)").await;
     let jar = jar
         .remove(removal_cookie("pending"))
         .add(cookie(&state, &headers, "session", session));
@@ -381,8 +412,12 @@ async fn totp_submit(
 async fn logout(
     State(state): State<AppState>,
     jar: CookieJar,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     if let Some(token) = jar.get("session").map(|c| c.value().to_string()) {
+        if let Ok(Some(user)) = db::user_by_session(&state.pool, &token).await {
+            Actor::new(&state.pool, &user, &client_address(&headers)).log("signout", "Signed out of the portal").await;
+        }
         db::delete_session(&state.pool, &token).await?;
     }
     let jar = jar.remove(removal_cookie("session"));
@@ -397,7 +432,16 @@ async fn connect(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(key): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    if let Err(why) = allowed(&user, &headers) {
+        let body = format!(
+            "<h1>Not available right now</h1><div class=\"err\">{}</div>\
+             <form method=\"post\" action=\"/logout\"><button class=\"btn sec\">Sign out</button></form>",
+            esc(&why)
+        );
+        return Ok((StatusCode::FORBIDDEN, page("Not available", &body)).into_response());
+    }
     let Some(app) = db::app_by_key(&state.pool, &key).await? else {
         return Ok((StatusCode::NOT_FOUND, Html("<h1>Unknown app</h1>".to_string()))
             .into_response());
@@ -450,18 +494,54 @@ async fn rdp_socket(
         return Ok(StatusCode::FORBIDDEN.into_response());
     }
 
-    let target = match session_target(&state, &user, &key, &viewport).await? {
+    if let Err(why) = allowed(&user, &headers) {
+        // Say why on the page instead of failing silently.
+        return Ok(upgrade.on_upgrade(move |mut socket| async move {
+            use axum::extract::ws::Message;
+            let _ = socket.send(Message::Text(serde_json::json!({"t": "closed", "m": why}).to_string())).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }));
+    }
+    let target = match session_target(&state, &user, &key, &viewport, &headers).await? {
         Ok(target) => target,
         Err(status) => return Ok(status.into_response()),
     };
     let connection = connection_info(&state, &user, &key, &headers, "relayed").await;
     let presence = state.presence.clone();
     Ok(upgrade.on_upgrade(move |socket| async move {
-        let listed = presence.enter(connection);
-        let mut target = target;
-        target.kick = Some(listed.kick.clone());
-        rdp::run(target, Box::new(transport::WsTransport(socket))).await
+        let listed = presence.enter(connection.clone());
+        run_logged(target, listed, connection, Box::new(transport::WsTransport(socket))).await;
     }))
+}
+
+/// Run a session with its presence entry, and note its start and end in the
+/// activity log.
+async fn run_logged(
+    mut target: rdp::Target,
+    mut listed: crate::presence::Guard,
+    connection: crate::presence::Connection,
+    io: Box<dyn transport::Transport>,
+) {
+    target.kick = Some(listed.kick.clone());
+    target.notices = listed.notices.take();
+    let actor = target.actor.clone();
+    if let Some(a) = &actor {
+        a.log("session_start", &format!("Opened {} on {} ({})", connection.app, connection.device, connection.link)).await;
+    }
+    let started = db::now();
+    let reason = rdp::run(target, io).await;
+    if let Some(a) = &actor {
+        let why = match reason.as_str() {
+            "browser closed" => "the browser was closed".to_string(),
+            other => other.trim_end_matches('.').to_string(),
+        };
+        a.log(
+            "session_end",
+            &format!("Closed {} after {}: {why}", connection.app, activity::duration(db::now() - started)),
+        )
+        .await;
+    }
+    drop(listed);
 }
 
 /// Signalling for the direct (peer-to-peer) link: the browser posts its WebRTC
@@ -479,10 +559,11 @@ async fn rtc_offer(
     if !state.config.p2p {
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
-    if !same_origin(&headers) {
+    if !same_origin(&headers) || allowed(&user, &headers).is_err() {
+        // A refused direct link falls back to the WebSocket, which says why.
         return Ok(StatusCode::FORBIDDEN.into_response());
     }
-    let target = match session_target(&state, &user, &key, &viewport).await? {
+    let target = match session_target(&state, &user, &key, &viewport, &headers).await? {
         Ok(target) => target,
         Err(status) => return Ok(status.into_response()),
     };
@@ -497,10 +578,8 @@ async fn rtc_offer(
     }];
     let on_open: transport::OnOpen = Box::new(move |link| {
         tokio::spawn(async move {
-            let listed = presence.enter(connection);
-            let mut target = target;
-            target.kick = Some(listed.kick.clone());
-            rdp::run(target, Box::new(link)).await
+            let listed = presence.enter(connection.clone());
+            run_logged(target, listed, connection, Box::new(link)).await;
         });
     });
     match transport::answer_offer(offer, servers, on_open).await {
@@ -560,6 +639,7 @@ async fn session_target(
     user: &User,
     key: &str,
     viewport: &ViewportQuery,
+    headers: &HeaderMap,
 ) -> Result<Result<rdp::Target, StatusCode>, AppError> {
     let Some(app) = db::app_by_key(&state.pool, key).await? else {
         return Ok(Err(StatusCode::NOT_FOUND));
@@ -592,6 +672,14 @@ async fn session_target(
         // The browser advertises it can decode Windows' H.264 (High profile) with ?vd=2.
         egfx: state.config.egfx && viewport.vd == Some(2),
         kick: None,
+        notices: None,
+        idle: match settings::sessions(&state.pool).await.idle_minutes {
+            0 => None,
+            m => Some(std::time::Duration::from_secs(u64::from(m) * 60)),
+        },
+        rules: Some(user.rules()).filter(|r| r.from.is_some() || r.days.is_some()),
+        actor: Some(Actor::new(&state.pool, user, &client_address(headers))),
+        clip_dir: clipboard_dir(state, user).await.ok(),
     };
     Ok(Ok(target))
 }
@@ -615,7 +703,7 @@ fn same_origin(headers: &HeaderMap) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Reduce an untrusted name to a single safe Windows file name, or `None`.
-fn safe_file_name(name: &str) -> Option<String> {
+pub(crate) fn safe_file_name(name: &str) -> Option<String> {
     let last = name.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = last
         .chars()
@@ -643,6 +731,16 @@ async fn user_files_dir(state: &AppState, user: &User) -> anyhow::Result<std::pa
     let name = safe_file_name(&user.username)
         .ok_or_else(|| anyhow::anyhow!("username cannot be used as a folder name"))?;
     let dir = state.config.files_dir.join(name);
+    tokio::fs::create_dir_all(&dir).await?;
+    Ok(dir)
+}
+
+/// Where files and pictures the user pastes into a session wait for Windows to
+/// read them. Outside the user's folder, so they don't show up in it.
+async fn clipboard_dir(state: &AppState, user: &User) -> anyhow::Result<std::path::PathBuf> {
+    let name = safe_file_name(&user.username)
+        .ok_or_else(|| anyhow::anyhow!("username cannot be used as a folder name"))?;
+    let dir = state.config.files_dir.join(".clipboard").join(name);
     tokio::fs::create_dir_all(&dir).await?;
     Ok(dir)
 }
@@ -695,6 +793,9 @@ struct UploadQuery {
     /// 1 on the file's last chunk.
     #[serde(default)]
     last: Option<u8>,
+    /// A clipboard batch id: the file is being pasted into a session, so it goes
+    /// to the clipboard folder instead of the user's folder.
+    clip: Option<String>,
 }
 
 /// Largest single chunk accepted. Kept well under the 100 MB request limit of
@@ -710,6 +811,7 @@ async fn files_upload(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
     Query(query): Query<UploadQuery>,
+    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
     let Some(name) = safe_file_name(&query.name) else {
@@ -722,7 +824,15 @@ async fn files_upload(
         None => auth::random_token(),
     };
     let last = single || query.last == Some(1);
-    let dir = user_files_dir(&state, &user).await?;
+    let dir = match &query.clip {
+        None => user_files_dir(&state, &user).await?,
+        Some(batch) if (8..=64).contains(&batch.len()) && batch.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            let dir = clipboard_dir(&state, &user).await?.join(batch);
+            tokio::fs::create_dir_all(&dir).await?;
+            dir
+        }
+        Some(_) => return Ok((StatusCode::BAD_REQUEST, "Bad clipboard id.").into_response()),
+    };
     let partial = dir.join(format!(".upload-{id}"));
 
     // A chunk must continue exactly where the file got to.
@@ -773,6 +883,11 @@ async fn files_upload(
         n += 1;
     }
     tokio::fs::rename(&partial, dir.join(&final_name)).await?;
+    if query.clip.is_none() {
+        Actor::new(&state.pool, &user, &client_address(&headers))
+            .log("upload", &format!("Uploaded {final_name} ({})", size_text(total)))
+            .await;
+    }
     Ok(Json(serde_json::json!({"name": final_name, "size": total})).into_response())
 }
 
@@ -782,11 +897,21 @@ struct DownloadQuery {
     inline: Option<u8>,
 }
 
+fn size_text(n: u64) -> String {
+    match n {
+        n if n < 1024 => format!("{n} B"),
+        n if n < 1024 * 1024 => format!("{:.1} KB", n as f64 / 1024.0),
+        n if n < 1024 * 1024 * 1024 => format!("{:.1} MB", n as f64 / 1048576.0),
+        n => format!("{:.2} GB", n as f64 / 1073741824.0),
+    }
+}
+
 async fn files_download(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(name): Path<String>,
     Query(query): Query<DownloadQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     // Only a plain file name that survives sanitising unchanged is accepted,
     // so nothing outside the user's folder can be named.
@@ -812,6 +937,8 @@ async fn files_download(
         })
         .collect();
     let show_pdf = query.inline == Some(1) && name.to_ascii_lowercase().ends_with(".pdf");
+    Actor::new(&state.pool, &user, &client_address(&headers))
+        .spawn("download", format!("{} {name} ({})", if show_pdf { "Opened" } else { "Downloaded" }, size_text(meta.len())));
     let response = Response::builder()
         .header(header::CONTENT_TYPE, if show_pdf { "application/pdf" } else { "application/octet-stream" })
         .header(header::CONTENT_LENGTH, meta.len())

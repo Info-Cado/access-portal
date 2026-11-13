@@ -1,13 +1,19 @@
 import { useState } from "react"
 import {
   AppWindowIcon,
+  HistoryIcon,
+  LockIcon,
   MonitorSmartphoneIcon,
   RefreshCwIcon,
+  SettingsIcon,
+  TriangleAlertIcon,
   UsersIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 
+import { ActivityView } from "@/components/activity-view"
 import { AppsView } from "@/components/apps-view"
+import { SettingsView } from "@/components/settings-view"
 import { UsersView } from "@/components/users-view"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
@@ -31,15 +37,18 @@ import {
 import { PublicLinkFooter } from "@/components/public-link"
 import { errorText, type PortalState, type PublicLink } from "@/lib/api"
 
-type View = "users" | "apps"
+type View = "users" | "apps" | "activity" | "settings"
 
 export type ViewProps = { data: PortalState; reload: () => Promise<void> }
+
+const TITLES: Record<View, string> = { users: "Users", apps: "Apps", activity: "Activity", settings: "Settings" }
 
 export function AppShell({
   data,
   status,
   reload,
-}: ViewProps & { status: { address: string; public: PublicLink } }) {
+  onLock,
+}: ViewProps & { status: { address: string; public: PublicLink }; onLock: () => void }) {
   const [view, setView] = useState<View>("users")
   const [refreshing, setRefreshing] = useState(false)
 
@@ -55,9 +64,12 @@ export function AppShell({
     }
   }
 
-  const nav = [
-    { id: "users" as const, label: "Users", icon: UsersIcon, count: data.users.length },
-    { id: "apps" as const, label: "Apps", icon: AppWindowIcon, count: data.apps.length },
+  const connected = data.users.reduce((n, u) => n + u.sessions.length, 0)
+  const nav: { id: View; label: string; icon: typeof UsersIcon; count?: number | string }[] = [
+    { id: "users", label: "Users", icon: UsersIcon, count: connected ? `${connected} on` : data.users.length },
+    { id: "apps", label: "Apps", icon: AppWindowIcon, count: data.apps.length },
+    { id: "activity", label: "Activity", icon: HistoryIcon },
+    { id: "settings", label: "Settings", icon: SettingsIcon },
   ]
 
   return (
@@ -94,7 +106,7 @@ export function AppShell({
                       <item.icon />
                       <span>{item.label}</span>
                     </SidebarMenuButton>
-                    <SidebarMenuBadge>{item.count}</SidebarMenuBadge>
+                    {item.count !== undefined && <SidebarMenuBadge>{item.count}</SidebarMenuBadge>}
                   </SidebarMenuItem>
                 ))}
               </SidebarMenu>
@@ -112,7 +124,7 @@ export function AppShell({
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />
           <Separator orientation="vertical" className="mr-2 data-vertical:h-4 data-vertical:self-center" />
-          <h1 className="text-base font-medium">{view === "users" ? "Users" : "Apps"}</h1>
+          <h1 className="text-base font-medium">{TITLES[view]}</h1>
           <Button
             variant="ghost"
             size="sm"
@@ -123,13 +135,27 @@ export function AppShell({
             <RefreshCwIcon className={refreshing ? "animate-spin" : undefined} />
             Refresh
           </Button>
+          <Button variant="ghost" size="sm" onClick={onLock} title="Lock the app (the portal keeps running)">
+            <LockIcon />
+            Lock
+          </Button>
         </header>
         <div className="flex flex-1 flex-col gap-4 p-4 lg:p-6">
-          {view === "users" ? (
-            <UsersView data={data} reload={reload} />
-          ) : (
-            <AppsView data={data} reload={reload} />
+          {data.admin.default_password && view !== "settings" && (
+            <div className="flex items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
+              <TriangleAlertIcon className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <span className="flex-1">
+                The app still uses the default sign-in (admin / admin). Anyone at this computer could open it.
+              </span>
+              <Button size="sm" variant="outline" onClick={() => setView("settings")}>
+                Change it
+              </Button>
+            </div>
           )}
+          {view === "users" && <UsersView data={data} reload={reload} />}
+          {view === "apps" && <AppsView data={data} reload={reload} />}
+          {view === "activity" && <ActivityView data={data} reload={reload} />}
+          {view === "settings" && <SettingsView data={data} reload={reload} />}
         </div>
       </SidebarInset>
     </SidebarProvider>

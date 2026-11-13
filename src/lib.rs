@@ -6,8 +6,12 @@
 //! listener; the app reaches them in-process through [`Portal::admin`], so the
 //! admin panel only exists on the host.
 
+mod access;
+mod activity;
 mod api;
 mod auth;
+mod clipimage;
+mod clock;
 mod config;
 mod db;
 mod gfx;
@@ -17,6 +21,8 @@ mod models;
 mod presence;
 mod print;
 mod rdp;
+mod settings;
+mod sound;
 mod tiles;
 mod transport;
 mod video;
@@ -97,7 +103,7 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
         presence: Arc::default(),
     };
 
-    // Forget expired sign-ins once an hour.
+    // Forget expired sign-ins and old activity once an hour.
     let pool = state.pool.clone();
     tokio::spawn(async move {
         let mut hourly = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
@@ -106,6 +112,23 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
             if let Err(e) = db::delete_expired(&pool).await {
                 tracing::warn!("clearing expired sign-ins: {e:#}");
             }
+            if let Err(e) = activity::delete_old(&pool).await {
+                tracing::warn!("clearing old activity: {e:#}");
+            }
+        }
+    });
+
+    // Windows' screen-viewing rule follows the app's setting.
+    let ask = settings::sessions(&state.pool).await.shadow_consent;
+    tokio::task::spawn_blocking(move || host::set_shadow_policy(ask));
+
+    // Sign out Windows sessions left disconnected too long (if chosen).
+    let watcher = state.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+        loop {
+            every.tick().await;
+            sign_out_disconnected(&watcher).await;
         }
     });
 
@@ -125,6 +148,40 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
         address,
         data_dir: data_dir.to_path_buf(),
     })
+}
+
+/// Sign out the Windows sessions of portal users that have been disconnected
+/// longer than the app's setting allows. Never touches administrator accounts
+/// or accounts that aren't a portal user's.
+async fn sign_out_disconnected(state: &AppState) {
+    let hours = settings::sessions(&state.pool).await.signout_hours;
+    if hours == 0 {
+        return;
+    }
+    let Ok(users) = db::list_users(&state.pool).await else { return };
+    let sessions = tokio::task::spawn_blocking(host::windows_sessions_blocking).await.unwrap_or_default();
+    let limit = u64::from(hours) * 3600;
+    let mut ids = Vec::new();
+    for s in sessions {
+        if s.state != host::WTS_DISCONNECTED || s.admin || s.disconnected_secs < limit {
+            continue;
+        }
+        let Some(user) = users.iter().find(|u| u.win_username.eq_ignore_ascii_case(&s.user)) else { continue };
+        ids.push(s.id);
+        activity::log(
+            &state.pool,
+            Some(user.id),
+            &user.username,
+            "auto_signout",
+            &format!("Signed out of Windows after {} disconnected", activity::duration(s.disconnected_secs as i64)),
+            "this computer",
+        )
+        .await;
+    }
+    if !ids.is_empty() {
+        let n = tokio::task::spawn_blocking(move || host::log_off_blocking(&ids)).await.unwrap_or(0);
+        tracing::info!("signed out {n} Windows session(s) left disconnected over {hours} h");
+    }
 }
 
 impl Portal {

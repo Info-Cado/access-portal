@@ -49,9 +49,20 @@ impl Kick {
 pub const DISCONNECTED: &str = "Your administrator disconnected this session. Your apps are still running.";
 pub const SIGNED_OUT: &str = "Your administrator signed you out. Your apps were closed.";
 
+/// Something to show in the user's browser while the session runs (a JSON
+/// message for the session page).
+pub type Notice = serde_json::Value;
+pub type Notices = tokio::sync::mpsc::UnboundedReceiver<Notice>;
+
+struct Entry {
+    connection: Connection,
+    kick: Arc<Kick>,
+    notices: tokio::sync::mpsc::UnboundedSender<Notice>,
+}
+
 #[derive(Default)]
 pub struct Presence {
-    open: Mutex<HashMap<u64, (Connection, Arc<Kick>)>>,
+    open: Mutex<HashMap<u64, Entry>>,
     next: AtomicU64,
 }
 
@@ -61,6 +72,8 @@ pub struct Guard {
     id: u64,
     /// Signalled when an administrator disconnects this connection.
     pub kick: Arc<Kick>,
+    /// Messages for the browser; taken by the session.
+    pub notices: Option<Notices>,
 }
 
 impl Drop for Guard {
@@ -74,22 +87,27 @@ impl Presence {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         connection.id = id;
         let kick = Arc::new(Kick::default());
-        self.open.lock().unwrap().insert(id, (connection, kick.clone()));
-        Guard { presence: self.clone(), id, kick }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.open.lock().unwrap().insert(id, Entry { connection, kick: kick.clone(), notices: tx });
+        Guard { presence: self.clone(), id, kick, notices: Some(rx) }
     }
 
     /// Open connections, oldest first.
     pub fn snapshot(&self) -> Vec<Connection> {
-        let mut all: Vec<Connection> = self.open.lock().unwrap().values().map(|(c, _)| c.clone()).collect();
+        let mut all: Vec<Connection> = self.open.lock().unwrap().values().map(|e| e.connection.clone()).collect();
         all.sort_by_key(|c| c.since);
         all
+    }
+
+    pub fn get(&self, id: u64) -> Option<Connection> {
+        self.open.lock().unwrap().get(&id).map(|e| e.connection.clone())
     }
 
     /// Disconnect one connection. False if it is already gone.
     pub fn kick(&self, id: u64, reason: &str) -> bool {
         match self.open.lock().unwrap().get(&id) {
-            Some((_, k)) => {
-                k.kick(reason);
+            Some(e) => {
+                e.kick.kick(reason);
                 true
             }
             None => false,
@@ -98,13 +116,22 @@ impl Presence {
 
     /// Disconnect every connection of a portal user; returns how many.
     pub fn kick_user(&self, user_id: i64, reason: &str) -> usize {
+        self.each(|c| c.user_id == user_id, |e| e.kick.kick(reason))
+    }
+
+    /// Show something in the browsers of the matching connections; returns how many.
+    pub fn notify(&self, matches: impl Fn(&Connection) -> bool, notice: &Notice) -> usize {
+        self.each(matches, |e| {
+            let _ = e.notices.send(notice.clone());
+        })
+    }
+
+    fn each(&self, matches: impl Fn(&Connection) -> bool, action: impl Fn(&Entry)) -> usize {
         let open = self.open.lock().unwrap();
         let mut n = 0;
-        for (c, k) in open.values() {
-            if c.user_id == user_id {
-                k.kick(reason);
-                n += 1;
-            }
+        for e in open.values().filter(|e| matches(&e.connection)) {
+            action(e);
+            n += 1;
         }
         n
     }

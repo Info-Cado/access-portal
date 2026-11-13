@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::models::User;
-use crate::{auth, db, host, AppState};
+use crate::{access, activity, auth, db, host, settings, AppState};
 
 /// The admin routes. Not for the network listener: see the module notes.
 pub fn router() -> Router<AppState> {
@@ -32,7 +32,14 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/users/:id/desktop", get(desktop_mode).put(set_desktop_mode))
         .route("/api/admin/users/:id/windows-account", post(create_windows_account))
         .route("/api/admin/users/:id/sign-out", post(sign_out_user))
+        .route("/api/admin/users/:id/access", put(set_access))
         .route("/api/admin/connections/:id/disconnect", post(disconnect))
+        .route("/api/admin/connections/:id/shadow", post(shadow))
+        .route("/api/admin/message", post(message))
+        .route("/api/admin/activity", get(activity_list))
+        .route("/api/admin/settings/sessions", put(set_session_settings))
+        .route("/api/admin/auth/verify", post(verify_admin))
+        .route("/api/admin/auth", put(change_admin))
         .route("/api/admin/apps", post(create_app))
         .route("/api/admin/apps/:id", delete(delete_app))
 }
@@ -117,6 +124,8 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
             "created_at": u.created_at,
             "app_ids": app_ids,
             "sessions": open.iter().filter(|c| c.user_id == u.id).collect::<Vec<_>>(),
+            "access": u.rules(),
+            "access_text": access_text(&u.rules()),
         }));
     }
     let apps: Vec<Value> = db::list_apps(&state.pool)
@@ -124,11 +133,36 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
         .into_iter()
         .map(|a| json!({ "id": a.id, "key": a.key, "name": a.name, "hostname": a.hostname, "port": a.port }))
         .collect();
+    let (admin_name, default_password) = settings::admin_account(&state.pool).await?;
     Ok(Json(json!({
         "listen": state.config.bind_addr,
         "users": users,
         "apps": apps,
+        "settings": settings::sessions(&state.pool).await,
+        "admin": { "username": admin_name, "default_password": default_password },
     })))
+}
+
+/// "Any time, from anywhere", or a short summary of the rules.
+fn access_text(rules: &access::AccessRules) -> String {
+    if rules.is_open() {
+        return "Any time, from anywhere".into();
+    }
+    let mut parts = Vec::new();
+    if rules.days.is_some() || rules.from.is_some() {
+        let mut when = rules.describe_time();
+        if let Some(first) = when.get(..1) {
+            when = first.to_uppercase() + &when[1..];
+        }
+        parts.push(when);
+    }
+    if !rules.ips.is_empty() {
+        parts.push(format!("from {}", rules.ips.join(", ")));
+    }
+    if !rules.countries.is_empty() {
+        parts.push(format!("in {}", rules.countries.join(", ")));
+    }
+    parts.join(" · ")
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +240,10 @@ async fn create_user(
     )
     .await?;
     db::set_user_apps(&state.pool, id, &input.app_ids).await?;
+    if let Some(user) = db::user_by_id(&state.pool, id).await? {
+        let how = if input.create_windows_account { " with a new Windows account" } else { "" };
+        activity::admin(&state.pool, Some(&user), &format!("Created the user{how}")).await;
+    }
 
     Ok(Json(json!({
         "id": id,
@@ -231,6 +269,8 @@ async fn delete_user(
         host::delete_account(&user.win_username).await.map_err(host_error)?;
     }
     db::delete_user(&state.pool, id).await?;
+    let windows = if options.windows == Some(1) { " and their Windows account" } else { "" };
+    activity::admin(&state.pool, Some(&user), &format!("Deleted the user{windows}")).await;
     Ok(Json(json!({})))
 }
 
@@ -308,8 +348,9 @@ async fn set_password(
     if input.password.is_empty() {
         return Err(bad("The new password can't be empty."));
     }
-    existing_user(&state, id).await?;
+    let user = existing_user(&state, id).await?;
     db::set_password(&state.pool, id, &input.password, true).await?;
+    activity::admin(&state.pool, Some(&user), "Changed the portal password").await;
     Ok(Json(json!({})))
 }
 
@@ -393,10 +434,202 @@ async fn set_desktop_mode(
 /// Disconnect one open session. The user's apps keep running in Windows and the
 /// user can connect again.
 async fn disconnect(State(state): State<AppState>, _: Admin, Path(id): Path<u64>) -> ApiResult {
+    let connection = state.presence.get(id);
     if !state.presence.kick(id, crate::presence::DISCONNECTED) {
         return Err(fail(StatusCode::NOT_FOUND, "That session already ended."));
     }
+    if let Some(c) = connection {
+        let user = db::user_by_id(&state.pool, c.user_id).await?;
+        activity::admin(&state.pool, user.as_ref(), &format!("Disconnected their {} session", c.app)).await;
+    }
     Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+struct ShadowRequest {
+    /// Use the keyboard and mouse too, not just watch.
+    #[serde(default)]
+    control: bool,
+}
+
+/// Open Windows' viewer for the Windows session behind an open portal session,
+/// on this computer's screen. The user's browser is told.
+async fn shadow(
+    State(state): State<AppState>,
+    _: Admin,
+    Path(id): Path<u64>,
+    Json(input): Json<ShadowRequest>,
+) -> ApiResult {
+    let connection = state
+        .presence
+        .get(id)
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That session already ended."))?;
+    let user = existing_user(&state, connection.user_id).await?;
+    let sessions = tokio::task::spawn_blocking(host::windows_sessions_blocking).await.unwrap_or_default();
+    let mut theirs: Vec<_> = sessions
+        .into_iter()
+        .filter(|s| s.user.eq_ignore_ascii_case(&user.win_username))
+        .collect();
+    theirs.sort_by_key(|s| s.state != host::WTS_ACTIVE);
+    let Some(session) = theirs.first() else {
+        return Err(fail(StatusCode::CONFLICT, &format!("{} has no Windows session open right now.", user.win_username)));
+    };
+    let ask = settings::sessions(&state.pool).await.shadow_consent;
+    host::shadow(session.id, input.control, ask).map_err(host_error)?;
+    let (verb, what) = if input.control { ("is controlling", "Took control of") } else { ("is viewing", "Viewed") };
+    let note = if ask {
+        json!({"t": "note", "text": "Your administrator asked to see your screen. Windows will ask you to allow it."})
+    } else {
+        json!({"t": "note", "text": format!("Your administrator {verb} your screen.")})
+    };
+    state.presence.notify(|c| c.user_id == user.id, &note);
+    activity::admin(&state.pool, Some(&user), &format!("{what} their screen")).await;
+    Ok(Json(json!({ "session": session.id, "asked": ask })))
+}
+
+#[derive(Deserialize)]
+struct MessageRequest {
+    text: String,
+    /// Only this user's sessions; everyone connected when neither is given.
+    user_id: Option<i64>,
+    /// Only this session.
+    connection_id: Option<u64>,
+}
+
+/// Show a message in users' browsers, on top of their session.
+async fn message(State(state): State<AppState>, _: Admin, Json(input): Json<MessageRequest>) -> ApiResult {
+    let text = input.text.trim();
+    if text.is_empty() {
+        return Err(bad("Write a message first."));
+    }
+    if text.chars().count() > 2000 {
+        return Err(bad("Keep the message under 2,000 characters."));
+    }
+    let note = json!({"t": "msg", "text": text, "at": db::now()});
+    let sent = state.presence.notify(
+        |c| match (input.connection_id, input.user_id) {
+            (Some(id), _) => c.id == id,
+            (None, Some(user)) => c.user_id == user,
+            (None, None) => true,
+        },
+        &note,
+    );
+    if sent == 0 {
+        return Err(fail(StatusCode::CONFLICT, "Nobody is connected to receive it."));
+    }
+    let user = match input.user_id {
+        Some(id) => db::user_by_id(&state.pool, id).await?,
+        None => None,
+    };
+    let to = if user.is_some() { String::new() } else { format!(" to everyone connected ({sent})") };
+    activity::admin(&state.pool, user.as_ref(), &format!("Sent a message{to}: {text}")).await;
+    Ok(Json(json!({ "sent": sent })))
+}
+
+#[derive(Deserialize)]
+struct AccessInput {
+    rules: access::AccessRules,
+}
+
+async fn set_access(
+    State(state): State<AppState>,
+    _: Admin,
+    Path(id): Path<i64>,
+    Json(input): Json<AccessInput>,
+) -> ApiResult {
+    let user = existing_user(&state, id).await?;
+    let rules = input.rules.normalized().map_err(|e| bad(&e))?;
+    let stored = if rules.is_open() { None } else { Some(serde_json::to_string(&rules).map_err(anyhow::Error::from)?) };
+    db::set_access_rules(&state.pool, id, stored.as_deref()).await?;
+    let text = access_text(&rules);
+    activity::admin(&state.pool, Some(&user), &format!("Set when and where they can sign in: {text}")).await;
+    Ok(Json(json!({ "access": rules, "access_text": text })))
+}
+
+#[derive(Deserialize)]
+struct ActivityQuery {
+    user: Option<i64>,
+    before: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn activity_list(
+    State(state): State<AppState>,
+    _: Admin,
+    axum::extract::Query(q): axum::extract::Query<ActivityQuery>,
+) -> ApiResult {
+    let entries = activity::list(&state.pool, q.user, q.before, q.limit.unwrap_or(200)).await?;
+    Ok(Json(json!({ "entries": entries })))
+}
+
+async fn set_session_settings(
+    State(state): State<AppState>,
+    _: Admin,
+    Json(input): Json<settings::Sessions>,
+) -> ApiResult {
+    if input.idle_minutes > 24 * 60 || input.signout_hours > 24 * 30 {
+        return Err(bad("That's longer than the portal allows."));
+    }
+    let before = settings::sessions(&state.pool).await;
+    settings::set_sessions(&state.pool, &input).await?;
+    if before.shadow_consent != input.shadow_consent {
+        let ask = input.shadow_consent;
+        tokio::task::spawn_blocking(move || host::set_shadow_policy(ask)).await.ok();
+    }
+    activity::admin(
+        &state.pool,
+        None,
+        &format!(
+            "Session settings: disconnect idle sessions {}, sign out disconnected Windows sessions {}, {} before viewing a screen",
+            if input.idle_minutes == 0 { "never".into() } else { format!("after {}", activity::duration(i64::from(input.idle_minutes) * 60)) },
+            if input.signout_hours == 0 { "never".into() } else { format!("after {}", activity::duration(i64::from(input.signout_hours) * 3600)) },
+            if input.shadow_consent { "ask" } else { "don't ask" },
+        ),
+    )
+    .await;
+    Ok(Json(json!({ "settings": input })))
+}
+
+#[derive(Deserialize)]
+struct AdminLogin {
+    username: String,
+    password: String,
+}
+
+/// Check the app's own sign-in (the app's native side asks before unlocking).
+async fn verify_admin(State(state): State<AppState>, _: Admin, Json(input): Json<AdminLogin>) -> ApiResult {
+    if !settings::check_admin(&state.pool, &input.username, &input.password).await? {
+        return Err(fail(StatusCode::UNAUTHORIZED, "Wrong username or password."));
+    }
+    let (_, default_password) = settings::admin_account(&state.pool).await?;
+    Ok(Json(json!({ "ok": true, "default_password": default_password })))
+}
+
+#[derive(Deserialize)]
+struct AdminChange {
+    current_password: String,
+    username: String,
+    password: String,
+}
+
+async fn change_admin(State(state): State<AppState>, _: Admin, Json(input): Json<AdminChange>) -> ApiResult {
+    let (name, _) = settings::admin_account(&state.pool).await?;
+    if !settings::check_admin(&state.pool, &name, &input.current_password).await? {
+        return Err(fail(StatusCode::UNAUTHORIZED, "The current password is wrong."));
+    }
+    let username = input.username.trim();
+    if username.is_empty() || username.chars().count() > 64 {
+        return Err(bad("Choose a username (up to 64 characters)."));
+    }
+    if input.password.chars().count() < 8 {
+        return Err(bad("Use at least 8 characters for the new password."));
+    }
+    if input.password.eq_ignore_ascii_case(settings::DEFAULT_ADMIN.1) {
+        return Err(bad("Choose a password other than the default one."));
+    }
+    settings::set_admin(&state.pool, username, &input.password).await?;
+    activity::admin(&state.pool, None, "Changed the app's admin sign-in").await;
+    Ok(Json(json!({ "username": username })))
 }
 
 /// Sign a user out completely: disconnect their sessions, end their portal
@@ -405,6 +638,7 @@ async fn sign_out_user(State(state): State<AppState>, _: Admin, Path(id): Path<i
     let user = existing_user(&state, id).await?;
     let disconnected = state.presence.kick_user(id, crate::presence::SIGNED_OUT);
     db::delete_sessions_for_user(&state.pool, id).await?;
+    activity::admin(&state.pool, Some(&user), "Signed them out of Windows").await;
     // Give the sessions a moment to close before Windows signs the account out.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let win = user.win_username.clone();

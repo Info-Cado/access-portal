@@ -12,9 +12,14 @@ pub struct User {
     pub failed_count: i64,
     pub locked_until: Option<i64>,
     pub created_at: i64,
+    /// When and from where the user may sign in (JSON, see `access.rs`).
+    pub access_rules: Option<String>,
 }
 
 impl User {
+    pub fn rules(&self) -> crate::access::AccessRules {
+        crate::access::AccessRules::parse(self.access_rules.as_deref())
+    }
     pub fn is_admin(&self) -> bool {
         self.is_admin != 0
     }

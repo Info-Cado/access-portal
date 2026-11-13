@@ -15,6 +15,17 @@ export type LiveSession = {
   link: "direct" | "relayed"
 }
 
+/** When and from where a user may sign in; empty means any time, anywhere. */
+export type AccessRules = {
+  /** 0 = Sunday … 6 = Saturday; absent = every day. */
+  days?: number[]
+  /** "HH:MM" */
+  from?: string
+  to?: string
+  ips?: string[]
+  countries?: string[]
+}
+
 export type PortalUser = {
   id: number
   username: string
@@ -26,6 +37,29 @@ export type PortalUser = {
   created_at: number
   app_ids: number[]
   sessions: LiveSession[]
+  access: AccessRules
+  /** "Any time, from anywhere", "On Mon–Fri, 09:00–18:00 · in IN", … */
+  access_text: string
+}
+
+export type SessionSettings = {
+  /** Disconnect idle browser sessions after this many minutes; 0 = never. */
+  idle_minutes: number
+  /** Sign out Windows sessions left disconnected this many hours; 0 = never. */
+  signout_hours: number
+  /** Ask the user before viewing or controlling their screen. */
+  shadow_consent: boolean
+}
+
+export type ActivityEntry = {
+  id: number
+  /** Unix seconds. */
+  at: number
+  user_id: number | null
+  username: string
+  kind: string
+  detail: string
+  address: string
 }
 
 export type PortalApp = {
@@ -41,6 +75,8 @@ export type PortalState = {
   listen: string
   users: PortalUser[]
   apps: PortalApp[]
+  settings: SessionSettings
+  admin: { username: string; default_password: boolean }
 }
 
 /** The public link (a Cloudflare Tunnel to name.<domain>). */
@@ -51,8 +87,8 @@ export type PublicLink = {
 }
 
 export type ServerStatus =
-  | { running: true; address: string; data_dir: string; public: PublicLink }
-  | { running: false; error: string; data_dir: string; public: PublicLink }
+  | { running: true; address: string; data_dir: string; public: PublicLink; locked: boolean }
+  | { running: false; error: string; data_dir: string; public: PublicLink; locked: boolean }
 
 /** Authenticator setup details; the portal hands these out once. */
 export type TotpSetup = { secret: string; uri: string }
@@ -78,7 +114,27 @@ export async function api<T = unknown>(method: string, path: string, body?: unkn
     throw new ApiError(String(e))
   }
   if (res.status >= 200 && res.status < 300) return res.data as T
+  // The app locked itself (closed to the tray, or idle): show the sign-in again.
+  if (res.status === 423) window.dispatchEvent(new Event("portal-locked"))
   throw new ApiError(res.data?.error ?? `The portal refused that (${res.status}).`, res.status)
+}
+
+/** Sign in to the app. */
+export async function unlock(username: string, password: string): Promise<{ default_password: boolean }> {
+  try {
+    return await invoke("unlock", { username, password })
+  } catch (e) {
+    throw new ApiError(String(e))
+  }
+}
+
+export function lockApp(): Promise<void> {
+  return invoke("lock")
+}
+
+/** Save text as a file in Downloads and show it in Explorer; returns the path. */
+export function saveDownload(name: string, contents: string): Promise<string> {
+  return invoke("save_download", { name, contents })
 }
 
 /** "just now", "4 min", "2 h 5 min" since a Unix time. */

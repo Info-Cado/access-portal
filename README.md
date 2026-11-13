@@ -146,13 +146,12 @@ Channels used on the RDP connection:
 | Channel | Purpose |
 |---|---|
 | display control | resize the session with the browser window (only with `SESSION_SIZE=auto`) |
-| clipboard | text, both directions |
+| clipboard | text, pictures and files, both directions |
 | drive redirection | the per-user transfer folder, as `\\tsclient\P` (Windows portal hosts only) |
 | printer redirection | "Portal printer" in every print dialog (`src/print.rs`) |
-| audio | joined silently; Windows only starts drive redirection when it is present |
+| audio | the session's sound, played in the browser (`src/sound.rs`) |
 
-Not supported yet: sound, copying files through the clipboard, and clipboard
-content other than text.
+Not supported yet: microphone, webcam, and several monitors.
 
 ## Prerequisites
 
@@ -182,8 +181,8 @@ administrators can open (it holds the key to the stored Windows passwords):
 | | |
 |---|---|
 | `portal.env` | settings, created on first start with a fresh `PORTAL_SECRET` (the variables are listed in `.env.example`) |
-| `portal.db` | users, apps, permissions, sign-in sessions |
-| `files\` | one transfer folder per user |
+| `portal.db` | users, apps, permissions, access rules, sign-in sessions, app settings, the activity log |
+| `files\` | one transfer folder per user (`files\.clipboard\` holds files being pasted into sessions) |
 | `portal.log` | the server's log |
 | `install-id`, `tunnel.json` | this install's public link (keep private: the tunnel token is in it) |
 
@@ -191,15 +190,34 @@ Restart the app (tray icon → Quit, then open it) after changing `portal.env`.
 
 ## Using it
 
-The window has two screens:
+The app asks for its own sign-in when it opens, after it is closed to the tray,
+after 15 minutes without use, and when **Lock** is clicked. It starts as
+**admin / admin**; a banner asks you to change it under **Settings → App
+sign-in**. The portal keeps serving users while the app is locked. (Forgot it?
+Delete the `admin_username` and `admin_password` rows of the `settings` table in
+`portal.db` to go back to admin / admin.)
+
+The window has four screens:
 
 - **Users** — create a user (portal username and password, the Windows account
   their sessions run as, the apps they may open, optional two-step
   verification). Click a user to change any of that, unlock them after too many
-  wrong passwords, or delete them.
+  wrong passwords, or delete them. **Message everyone** shows a message on top
+  of every open session.
 - **Apps** — an app is an RDP connection (host and port, `127.0.0.1:3389` for
   this machine) opened as the user's Windows account; its key is used in the
   link. Add or delete apps here.
+- **Activity** — sign-ins (and failed ones), sessions opened and closed (with
+  why), print jobs, uploads and downloads, clipboard file transfers, and every
+  admin action, newest first; filter by user, search, **Export CSV** (saved to
+  Downloads). Kept for 180 days (`src/activity.rs`).
+- **Settings** — for every user:
+  - *Disconnect idle sessions* after a time without keyboard or mouse input
+    (default 1 hour; a one-minute warning first; apps keep running);
+  - *Sign out disconnected Windows sessions* after a time (default never; apps
+    close; Windows administrator accounts are never signed out);
+  - *Ask before viewing a user's screen* (default on);
+  - the app's own sign-in.
 
 Each user also has a **Full desktop** switch (`src/host.rs`). It changes the
 user's Windows account on this machine: off, the account's shell is the Miracle
@@ -211,9 +229,21 @@ Windows account of their own by default (a standard account in the "Portal RDP
 Users" group); deleting a user leaves the Windows account unless you tick the
 box.
 
+**When and where they can sign in** (per user, `src/access.rs`): days of the
+week, a time window (this computer's clock; 22:00–06:00 works), network
+addresses or ranges (`203.0.113.0/24`) and countries (two-letter codes, from
+Cloudflare). Outside them, sign-in is refused with the reason, and an open
+session ends when its hours run out (its apps keep running). Someone signing in
+on this computer itself is never refused for their address or country.
+
 **Connected now** in a user's panel lists their open sessions (app, device,
 address, how long). For each one:
 
+- **View screen** / **Take control** opens Windows' own viewer (Remote Desktop
+  "shadowing") on this computer's screen; close its window to stop. The user is
+  told on their screen, and with *Ask before viewing* on, Windows asks them to
+  allow it first.
+- **Message** shows a message on top of that session until they click OK.
 - **Disconnect** ends that browser session. The user's Windows session and apps
   keep running, and the page tells them their administrator disconnected them
   (it does not reconnect by itself).
@@ -229,15 +259,34 @@ The buttons at the top right of a session:
   state.
 - **Full screen**.
 - **Menu** — *Disconnect* (leave the apps running and come back later),
-  *Sign out of Windows* (close the apps and end the Windows session) and
+  *Sign out of Windows* (close the apps and end the Windows session),
+  *Sound* on/off, *Printing* (print dialog straight away, or a notice) and
   *Sign out of the portal*.
+
+**Sound.** The session's sound plays in the browser (Windows sends 16-bit PCM,
+about 1.4 Mbit/s while something plays, nothing otherwise). Browsers start
+audio after the first click or key press on the page.
+
+**Copy and paste.** Text, pictures and files go both ways:
+
+- Copy on your computer, then Ctrl+V in the session: text is pasted directly; a
+  picture (a screenshot, "Copy image") or files copied in Explorer are uploaded
+  first and then pasted where the cursor is (files into a folder, pictures into
+  Paint, Word, a chat …).
+- Copy text or a picture in the session and it is on your computer's clipboard
+  too. Copy files in the session and the page offers **Save to this computer**:
+  they are copied into your Files folder and downloaded.
 
 **Printing.** Every session has a printer called **Portal printer**. Print to it
 from any app and the job is saved as a PDF in the user's transfer folder
-(`Printed <date time>.pdf`); the page shows a notice with **Open to print**
-(opens the PDF in a new tab, where the browser's print button sends it to the
-user's own printer) and **Download**. The host needs Windows' built-in
-"Microsoft Print To PDF" driver, which Windows 11 has.
+(`Printed <date time>.pdf`) and opens straight in the browser's print dialog,
+to print on the user's own printer (turn that off in the menu to get a notice
+with **Open to print** and **Download** instead). The host needs Windows'
+built-in "Microsoft Print To PDF" driver, which Windows 11 has.
+
+**Full screen** sends the Windows key, Alt+Tab and other shortcuts to the
+session (Chrome and Edge); hold Esc to leave. Ctrl+Alt+Del always stays on the
+user's computer.
 
 The admin calls (`src/api.rs`) are never served on the network: the app makes
 them in-process (`Portal::admin` in `src/lib.rs`).
@@ -316,9 +365,11 @@ overwritten; a second `report.pdf` becomes `report (1).pdf`.
   machine.
 - Files in `FILES_DIR` are readable by whoever can read that folder on the portal
   host. Each portal user can only reach their own folder through the portal.
-- Anyone who can use the host's desktop can open the admin panel; lock the host.
-- This is an MVP. Before production: add CSRF tokens on state-changing forms, rate
-  limiting at the proxy, audit logging, and session cleanup for expired rows.
+- The admin panel asks for its own sign-in; change the default (admin / admin).
+  A Windows administrator on the host can still read the database, so lock the
+  host too.
+- This is an MVP. Before production: add CSRF tokens on state-changing forms and
+  rate limiting at the proxy.
 
 ## Licensing reminder
 
@@ -343,9 +394,15 @@ get around per-user Windows licensing.
 | `src/session.html` | the browser page for a session |
 | `src/web.rs` | router, auth extractors, pages, handlers, file transfer endpoints |
 | `src/api.rs` | admin API, called in-process by the app |
-| `src/host.rs` | Windows accounts: create/delete, Full desktop / Miracle-only switch, sign-out; host tuning |
-| `src/presence.rs` | who is connected now; disconnecting a session from the app |
+| `src/host.rs` | Windows accounts: create/delete, Full desktop / Miracle-only switch, sign-out; Windows sessions (list, sign out, view); host tuning |
+| `src/presence.rs` | who is connected now; disconnecting a session or messaging it from the app |
 | `src/print.rs` | the "Portal printer": print jobs saved as PDFs in the user's folder |
+| `src/sound.rs` | the session's sound, passed to the browser |
+| `src/clipimage.rs` | copied pictures: Windows bitmaps to PNG and back |
+| `src/access.rs` | when and from where each user may sign in |
+| `src/activity.rs` | the activity log |
+| `src/settings.rs` | settings changed from the app (timeouts, screen viewing, the app's sign-in) |
+| `src/clock.rs` | this computer's local time |
 | `provision/` | the sign-up service (Cloudflare Worker) and its deploy script |
 | `admin-app/` | the Access Portal app (Tauri): `src-tauri/` starts the portal, tray icon; `src/` the window's page (React + shadcn/ui) |
 | `migrations/` | SQLite schema |

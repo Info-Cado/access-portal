@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react"
-import { Trash2Icon } from "lucide-react"
+import { EyeIcon, MessageSquareTextIcon, MousePointer2Icon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 
+import { AccessRulesEditor } from "@/components/access-rules"
 import { ConfirmDialog, type Confirmation, type SecretToShow } from "@/components/dialogs"
+import { MessageDialog, type MessageTarget } from "@/components/message-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -184,6 +186,24 @@ function UserDetails({
   const [winPass, setWinPass] = useState("")
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null)
   const [winMode, setWinMode] = useState<Mode | null>(null)
+  const [messageTo, setMessageTo] = useState<MessageTarget | null>(null)
+
+  /** Open Windows' viewer on their screen, on this computer. */
+  const shadow = async (connectionId: number, control: boolean) => {
+    setBusy(true)
+    try {
+      const r = await api<{ asked: boolean }>("POST", `/api/admin/connections/${connectionId}/shadow`, { control })
+      toast.success(control ? "Taking control" : "Opening their screen", {
+        description: r.asked
+          ? "Windows is asking them to allow it. A Remote Desktop window opens here once they do."
+          : "A Remote Desktop window opens on this computer. They're told on their screen. Close the window to stop.",
+      })
+    } catch (e) {
+      toast.error(errorText(e))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   /** Run one change, refresh the data, and say how it went. */
   const change = async (work: () => Promise<unknown>, done: string) => {
@@ -268,8 +288,8 @@ function UserDetails({
                 </FieldLegend>
                 <div className="flex flex-col gap-2">
                   {user.sessions.map((s) => (
-                    <div key={s.id} className="flex items-center gap-3 rounded-md border px-3 py-2 text-sm">
-                      <div className="min-w-0 flex-1">
+                    <div key={s.id} className="flex flex-col gap-2 rounded-md border px-3 py-2 text-sm">
+                      <div className="min-w-0">
                         <div className="flex items-center justify-between gap-2">
                           <span className="font-medium">{s.app}</span>
                           <span className="text-xs text-muted-foreground">for {since(s.since).replace(/^just now$/, "under a minute")}</span>
@@ -279,16 +299,36 @@ function UserDetails({
                           {s.link === "direct" ? "direct link" : "through the portal"}
                         </div>
                       </div>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={busy}
-                        onClick={() =>
-                          change(() => api("POST", `/api/admin/connections/${s.id}/disconnect`), "Disconnected")
-                        }
-                      >
-                        Disconnect
-                      </Button>
+                      <div className="flex flex-wrap gap-1.5">
+                        <Button variant="outline" size="sm" disabled={busy} onClick={() => shadow(s.id, false)}>
+                          <EyeIcon />
+                          View screen
+                        </Button>
+                        <Button variant="outline" size="sm" disabled={busy} onClick={() => shadow(s.id, true)}>
+                          <MousePointer2Icon />
+                          Take control
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => setMessageTo({ label: `${user.username} (${s.app})`, connection_id: s.id })}
+                        >
+                          <MessageSquareTextIcon />
+                          Message
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="ml-auto"
+                          disabled={busy}
+                          onClick={() =>
+                            change(() => api("POST", `/api/admin/connections/${s.id}/disconnect`), "Disconnected")
+                          }
+                        >
+                          Disconnect
+                        </Button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -323,6 +363,9 @@ function UserDetails({
 
           <FieldSeparator />
           <DesktopMode user={user} onMode={setWinMode} />
+
+          <FieldSeparator />
+          <AccessRulesEditor user={user} reload={reload} />
 
           {(user.locked || user.failed_count > 0) && (
             <>
@@ -498,6 +541,7 @@ function UserDetails({
       )}
 
       <ConfirmDialog confirmation={confirmation} onClose={() => setConfirmation(null)} />
+      <MessageDialog target={messageTo} onClose={() => setMessageTo(null)} />
     </>
   )
 }

@@ -349,3 +349,171 @@ $n
         0
     }
 }
+
+/// Run a PowerShell script (hidden window) with some environment variables and
+/// return what it printed.
+#[cfg(windows)]
+fn powershell_blocking(script: &str, env: &[(&str, &str)]) -> anyhow::Result<String> {
+    use base64::Engine;
+    use std::os::windows::process::CommandExt;
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encoded])
+        .creation_flags(0x0800_0000);
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let out = command.output().context("starting PowerShell")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A Windows session on this computer.
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+pub struct WinSession {
+    pub id: u32,
+    pub user: String,
+    /// 0 active, 1 connected, 4 disconnected, ... (WTS_CONNECTSTATE_CLASS).
+    pub state: u32,
+    /// Seconds since the session was disconnected (0 if it isn't).
+    pub disconnected_secs: u64,
+    /// The account is a Windows administrator.
+    pub admin: bool,
+}
+
+pub const WTS_ACTIVE: u32 = 0;
+pub const WTS_DISCONNECTED: u32 = 4;
+
+#[cfg(windows)]
+const SESSIONS_SCRIPT: &str = r#"
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Collections.Generic;
+public static class ApSessions {
+  [StructLayout(LayoutKind.Sequential)] struct SESSION { public int SessionId; [MarshalAs(UnmanagedType.LPWStr)] public string Name; public int State; }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct INFO {
+    public int State; public int SessionId; public int InB; public int OutB; public int InF; public int OutF; public int InC; public int OutC;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string Station;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=17)] public string Domain;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=21)] public string User;
+    public long ConnectTime; public long DisconnectTime; public long LastInputTime; public long LogonTime; public long CurrentTime;
+  }
+  [DllImport("wtsapi32.dll")] static extern bool WTSEnumerateSessionsW(IntPtr h, int r, int v, out IntPtr p, out int c);
+  [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformationW(IntPtr h, int id, int cls, out IntPtr buf, out int len);
+  [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr p);
+  [DllImport("wtsapi32.dll")] public static extern bool WTSLogoffSession(IntPtr h, int id, bool wait);
+  public static List<object[]> List() {
+    var r = new List<object[]>(); IntPtr p; int c;
+    if (!WTSEnumerateSessionsW(IntPtr.Zero, 0, 1, out p, out c)) return r;
+    int sz = Marshal.SizeOf(typeof(SESSION));
+    for (int i = 0; i < c; i++) {
+      var s = (SESSION)Marshal.PtrToStructure(new IntPtr(p.ToInt64() + i * sz), typeof(SESSION));
+      IntPtr b; int l;
+      if (!WTSQuerySessionInformationW(IntPtr.Zero, s.SessionId, 24, out b, out l)) continue;
+      var info = (INFO)Marshal.PtrToStructure(b, typeof(INFO));
+      WTSFreeMemory(b);
+      if (string.IsNullOrEmpty(info.User)) continue;
+      long disc = (s.State == 4 && info.DisconnectTime > 0) ? Math.Max(0, (info.CurrentTime - info.DisconnectTime) / 10000000) : 0;
+      r.Add(new object[] { s.SessionId, info.User, s.State, disc });
+    }
+    WTSFreeMemory(p); return r;
+  }
+}
+'@
+if ($env:AP_LOGOFF) {
+  $n = 0
+  foreach ($id in $env:AP_LOGOFF.Split(',')) { if ([ApSessions]::WTSLogoffSession([IntPtr]::Zero, [int]$id, $true)) { $n++ } }
+  $n; exit 0
+}
+$adminGroup = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+$admins = @(([ADSI]"WinNT://./$adminGroup,group").psbase.Invoke('Members') | ForEach-Object { $_.GetType().InvokeMember('Name', 'GetProperty', $null, $_, $null) })
+$list = @([ApSessions]::List() | ForEach-Object {
+  [pscustomobject]@{ id = $_[0]; user = $_[1]; state = $_[2]; disconnected_secs = $_[3]; admin = ($admins -contains $_[1]) }
+})
+ConvertTo-Json -InputObject $list -Compress
+"#;
+
+/// Every signed-in Windows session on this computer.
+pub fn windows_sessions_blocking() -> Vec<WinSession> {
+    #[cfg(windows)]
+    {
+        let out = match powershell_blocking(SESSIONS_SCRIPT, &[]) {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::warn!("listing Windows sessions: {e:#}");
+                return Vec::new();
+            }
+        };
+        let last = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("[]");
+        serde_json::from_str(last.trim()).unwrap_or_else(|e| {
+            tracing::warn!("listing Windows sessions: unexpected answer ({e}): {}", out.trim());
+            Vec::new()
+        })
+    }
+    #[cfg(not(windows))]
+    Vec::new()
+}
+
+/// Sign these Windows sessions out (their apps close).
+pub fn log_off_blocking(ids: &[u32]) -> usize {
+    #[cfg(windows)]
+    {
+        if ids.is_empty() {
+            return 0;
+        }
+        let list = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        powershell_blocking(SESSIONS_SCRIPT, &[("AP_LOGOFF", &list)])
+            .ok()
+            .and_then(|o| o.trim().lines().last().and_then(|l| l.trim().parse().ok()))
+            .unwrap_or(0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ids;
+        0
+    }
+}
+
+/// Open Windows' own viewer on a user's session, on this computer's screen:
+/// watch it, or (with `control`) use its keyboard and mouse too. With
+/// `ask`, the user is asked first and can refuse.
+pub fn shadow(session_id: u32, control: bool, ask: bool) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut command = std::process::Command::new("mstsc.exe");
+        command.arg(format!("/shadow:{session_id}"));
+        if control {
+            command.arg("/control");
+        }
+        if !ask {
+            command.arg("/noConsentPrompt");
+        }
+        command.spawn().context("starting Remote Desktop Connection")?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (session_id, control, ask);
+        bail!("Viewing a session needs Windows.")
+    }
+}
+
+/// Windows' rule for viewing sessions: with the user's permission (1), or
+/// without asking (2). Both allow control.
+pub fn set_shadow_policy(ask: bool) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let value = if ask { "1" } else { "2" };
+        let ok = std::process::Command::new("reg")
+            .args(["add", r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "/v", "Shadow", "/t", "REG_DWORD", "/d", value, "/f"])
+            .creation_flags(0x0800_0000)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            tracing::warn!("could not set the screen-viewing policy (needs administrator rights)");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = ask;
+}

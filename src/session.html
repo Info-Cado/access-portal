@@ -48,6 +48,14 @@ form{display:inline}
 #bar button.on{background:#2453d6;border-color:#2453d6}
 #kb{position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;border:0;padding:0;font-size:16px;z-index:1}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:26;background:#171c2e;border:1px solid #2a3149;border-radius:8px;padding:10px 16px;font-size:.9rem;max-width:80vw}
+#toast .acts button{color:#fff;background:#2453d6;border:0;border-radius:6px;padding:5px 12px;font-size:.85rem;cursor:pointer}
+#notice{position:fixed;inset:0;z-index:28;display:flex;align-items:center;justify-content:center;background:rgba(5,7,14,.55)}
+#notice.hidden,#idle.hidden{display:none}
+#notice .card{width:min(440px,calc(100vw - 32px));background:#171c2e;border:1px solid #2a3149;border-radius:12px;padding:18px 20px;box-shadow:0 16px 40px rgba(0,0,0,.5)}
+#notice h3{margin:0 0 4px;font-size:1rem}
+#notice .when{color:#9aa3ba;font-size:.78rem;margin-bottom:10px}
+#notice .text{white-space:pre-wrap;line-height:1.45;margin-bottom:16px;max-height:50vh;overflow:auto}
+#idle{position:fixed;top:40px;left:50%;transform:translateX(-50%);z-index:27;background:#3a2a0b;color:#ffd98a;border:1px solid #8a6514;border-radius:8px;padding:9px 16px;font-size:.9rem;max-width:90vw;text-align:center}
 </style>
 </head>
 <body>
@@ -60,6 +68,9 @@ form{display:inline}
 <div id="menu" class="hidden" role="menu">
   <button type="button" data-menu="disconnect">Disconnect<small>Leave your apps running and come back later</small></button>
   <button type="button" data-menu="signout" class="danger">Sign out of Windows<small>Closes your apps; save your work first</small></button>
+  <hr>
+  <button type="button" data-menu="sound">Sound<small id="soundState"></small></button>
+  <button type="button" data-menu="autoprint">Printing<small id="printState"></small></button>
   <hr>
   <button type="button" data-menu="logout">Log out of the portal</button>
 </div>
@@ -93,6 +104,8 @@ form{display:inline}
 </div>
 <div id="drop" class="hidden">Drop files to send them to the app</div>
 <div id="toast" class="hidden"></div>
+<div id="idle" class="hidden"></div>
+<div id="notice" class="hidden"><div class="card"><h3>Message from your administrator</h3><div class="when" id="noticeWhen"></div><div class="text" id="noticeText"></div><button class="btn" id="noticeOk" type="button">OK</button></div></div>
 <div id="overlay"><div class="box"><h2 id="title">Connecting…</h2><p id="detail"></p><div id="actions"></div></div></div>
 <script>
 (function () {
@@ -101,6 +114,43 @@ form{display:inline}
   var $ = function (id) { return document.getElementById(id); };
   var canvas = $("screen"), ctx = canvas.getContext("2d"), overlay = $("overlay");
   var gotFrame = false, closed = false, draw = Promise.resolve();
+
+  // ---- sound: 16-bit PCM blocks from the session, played back to back ----
+  // Browsers only start audio after the user has interacted with the page, so
+  // the player is created on the first click or key press.
+  var soundOn = pref("sound", true), autoPrint = pref("autoprint", true);
+  var actx = null, aNext = 0;
+  function audio() {
+    if (!actx) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      try { actx = new AC({ latencyHint: "interactive" }); } catch (e) { return null; }
+    }
+    if (actx.state === "suspended") actx.resume().catch(function () {});
+    return actx;
+  }
+  ["pointerdown", "keydown", "touchend"].forEach(function (t) { window.addEventListener(t, function () { if (soundOn) audio(); }, true); });
+  function sound(buf) {
+    window.__soundIn = (window.__soundIn || 0) + 1;   // for tests
+    if (!soundOn || !actx || actx.state !== "running") return;
+    var v = new DataView(buf), ch = v.getUint8(1), rate = v.getUint32(2, true);
+    var frames = Math.floor((buf.byteLength - 6) / (2 * ch));
+    if (frames <= 0 || ch < 1) return;
+    var pcm = new Int16Array(buf.slice(6, 6 + frames * 2 * ch));
+    var ab = actx.createBuffer(ch, frames, rate);
+    for (var c = 0; c < ch; c++) {
+      var out = ab.getChannelData(c);
+      for (var i = 0; i < frames; i++) out[i] = pcm[i * ch + c] / 32768;
+    }
+    var src = actx.createBufferSource();
+    src.buffer = ab; src.connect(actx.destination);
+    var now = actx.currentTime;
+    // Keep a small cushion; start over if we fell behind or drifted too far ahead.
+    if (aNext < now + 0.02 || aNext > now + 0.6) aNext = now + 0.08;
+    src.start(aNext);
+    aNext += ab.duration;
+    window.__sound = (window.__sound || 0) + 1;   // for tests
+  }
 
   // ---- layout: the session follows the window; until the host catches up the picture is scaled ----
   var zoom = 1, cur = { x: 0, y: 0 }, touchUi = false, barH = 0;
@@ -380,6 +430,20 @@ form{display:inline}
       vstop(m.b);
     } else if (m.t === "print") {
       printed(m.name, m.size);
+    } else if (m.t === "msg") {
+      adminMessage(m.text, m.at);
+    } else if (m.t === "note") {
+      say(m.text);
+    } else if (m.t === "idle") {
+      idleWarning(m.s);
+    } else if (m.t === "clipfiles") {
+      remoteFiles(m.files);
+    } else if (m.t === "fetching") {
+      say("Copying " + m.name + "… " + Math.floor(100 * m.got / Math.max(m.size, 1)) + "%", true);
+    } else if (m.t === "fetched") {
+      fetched(m.names || []);
+    } else if (m.t === "fetchfail") {
+      say("Couldn't copy " + m.name + " out of the session.");
     } else if (m.t === "closed") {
       showEnd("Session ended", m.m);
     }
@@ -400,6 +464,8 @@ form{display:inline}
   window.__cells = cellsOf;
   function onBinary(buf) {
     var kind = new DataView(buf).getUint8(0);
+    if (kind === 7) { sound(buf); return; }         // sound from the session
+    if (kind === 8) { remoteImage(buf); return; }   // a picture copied in the session
     if (kind === 5) { gvideo(buf); return; }        // Windows' H.264 picture
     if (kind === 6) { gpixels(buf); return; }       // pixels the portal decoded
     if (kind === 3) { videoPacket(buf); return; }   // one H.264 frame for a block
@@ -546,6 +612,7 @@ form{display:inline}
   }
 
   function showLink() {
+    if (!soundOn) send({ t: "snd", on: false });
     var b = document.getElementById("filesBtn"), d = document.getElementById("linkDot");
     b.title = (link.kind === "direct" ? "Connected directly (peer-to-peer)" : "Connected through the portal server") + ". Shared files and print jobs.";
     b.dataset.link = link.kind;
@@ -573,6 +640,7 @@ form{display:inline}
   // ---- clipboard (text) ----
   var lastClip = null;
   function remoteCopied(text) {
+    window.__lastClip = text;   // for tests
     lastClip = text;
     if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).catch(function () {});
   }
@@ -591,15 +659,92 @@ form{display:inline}
   }
   window.addEventListener("focus", syncClipboardIfAllowed);
   // Ctrl+V / Shift+Insert: let the browser raise its own paste event (no permission
-  // needed), hand the text to the host, then press the keys there.
+  // needed), hand what was copied to the host, then press the keys there.
+  // Text goes straight over; a picture or files are uploaded first (into a
+  // clipboard folder, not the Files folder) and then offered to Windows.
   var pasteCode = null;
+  function hex(n) { return Array.prototype.map.call(crypto.getRandomValues(new Uint8Array(n)), function (b) { return ("0" + b.toString(16)).slice(-2); }).join(""); }
   document.addEventListener("paste", function (e) {
     e.preventDefault();
-    localCopied((e.clipboardData || window.clipboardData).getData("text"));
+    var data = e.clipboardData || window.clipboardData;
     var code = pasteCode || "KeyV";
     pasteCode = null;
-    setTimeout(function () { send({ t: "k", c: code, d: true }); send({ t: "k", c: code, d: false }); }, 80);
+    var pressKeys = function () { send({ t: "k", c: code, d: true }); send({ t: "k", c: code, d: false }); };
+    var files = Array.prototype.slice.call((data && data.files) || []);
+    if (!files.length) {
+      localCopied(data.getData("text"));
+      setTimeout(pressKeys, 80);
+      return;
+    }
+    // A copied picture (a screenshot, "Copy image") arrives as one unnamed PNG.
+    var picture = files.length === 1 && files[0].type === "image/png" && /^image\.png$/i.test(files[0].name);
+    var batch = hex(12), names = [], total = 0;
+    files.forEach(function (f) { total += f.size; });
+    say(picture ? "Pasting the picture…" : "Pasting " + files.length + (files.length === 1 ? " file…" : " files…"), true);
+    var chain = Promise.resolve();
+    files.forEach(function (f) {
+      chain = chain.then(function () {
+        return sendFile(f, function () {}, "&clip=" + batch).then(function (r) { if (r && r.name) names.push(r.name); });
+      });
+    });
+    chain.then(function () {
+      if (!names.length) throw new Error("nothing uploaded");
+      if (picture) send({ t: "clipimg", b: batch, f: names[0] });
+      else send({ t: "clipfiles", b: batch, f: names });
+      setTimeout(pressKeys, picture ? 200 : 300);
+      toast.classList.add("hidden");
+    }).catch(function () { say("Couldn't paste that. Try again, or drop the files on the page."); });
   });
+
+  // A picture copied in the session: put it on this computer's clipboard too.
+  function remoteImage(buf) {
+    var blob = new Blob([new Uint8Array(buf, 1)], { type: "image/png" });
+    window.__lastImage = blob.size;   // for tests
+    lastClip = null;
+    var offer = function () {
+      var url = URL.createObjectURL(blob);
+      toast.innerHTML = "";
+      var title = document.createElement("div"); title.textContent = "A picture was copied in the session.";
+      var acts = document.createElement("div"); acts.className = "acts";
+      var dl = document.createElement("a"); dl.href = url; dl.setAttribute("download", "Picture.png"); dl.textContent = "Download it";
+      acts.appendChild(dl); toast.appendChild(title); toast.appendChild(acts);
+      toast.classList.remove("hidden");
+      clearTimeout(toastTimer); toastTimer = setTimeout(function () { toast.classList.add("hidden"); URL.revokeObjectURL(url); }, 15000);
+    };
+    if (navigator.clipboard && navigator.clipboard.write && window.ClipboardItem) {
+      navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
+        .then(function () { say("Picture copied. You can paste it on this computer too."); }, offer);
+    } else {
+      offer();
+    }
+  }
+
+  // Files copied in the session: offer to save them on this computer.
+  function remoteFiles(files) {
+    if (!files || !files.length) return;
+    var total = 0; files.forEach(function (f) { total += f.size || 0; });
+    toast.innerHTML = "";
+    var title = document.createElement("div");
+    title.textContent = (files.length === 1 ? files[0].name : files.length + " files") + " copied in the session (" + size(total) + ").";
+    var acts = document.createElement("div"); acts.className = "acts";
+    var save = document.createElement("button"); save.type = "button"; save.textContent = "Save to this computer";
+    save.addEventListener("click", function () { send({ t: "fetch" }); say("Copying…", true); });
+    acts.appendChild(save); toast.appendChild(title); toast.appendChild(acts);
+    toast.classList.remove("hidden");
+    clearTimeout(toastTimer); toastTimer = setTimeout(function () { toast.classList.add("hidden"); }, 15000);
+  }
+  function fetched(names) {
+    if (!names.length) { say("Nothing was copied."); return; }
+    names.forEach(function (name, i) {
+      setTimeout(function () {
+        var a = document.createElement("a");
+        a.href = "/files/dl/" + encodeURIComponent(name); a.setAttribute("download", name);
+        document.body.appendChild(a); a.click(); a.remove();
+      }, i * 400);
+    });
+    say((names.length === 1 ? names[0] + " was" : names.length + " files were") + " saved. They're also in Files.");
+    if (!panel.classList.contains("hidden")) refresh();
+  }
 
   // ---- mouse ----
   var pending = null, queued = false, held = 0;
@@ -867,15 +1012,15 @@ form{display:inline}
   // Files go up in chunks: every request stays well under proxy size limits, and
   // a chunk that fails is retried from where the server says it got to.
   var UPLOAD_CHUNK = 16 * 1024 * 1024;
-  function sendFile(f, progress) {
+  function sendFile(f, progress, extra) {
     var id = Array.prototype.map.call(crypto.getRandomValues(new Uint8Array(12)), function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
     var offset = 0, attempts = 0;
     function step() {
       var end = Math.min(offset + UPLOAD_CHUNK, f.size), last = end >= f.size;
-      var url = "/files/upload?name=" + encodeURIComponent(f.name) + "&id=" + id + "&offset=" + offset + (last ? "&last=1" : "");
+      var url = "/files/upload?name=" + encodeURIComponent(f.name) + "&id=" + id + "&offset=" + offset + (last ? "&last=1" : "") + (extra || "");
       return fetch(url, { method: "POST", body: f.slice(offset, end), credentials: "same-origin" })
         .then(function (r) {
-          if (r.ok) { attempts = 0; offset = end; progress(offset); return last ? null : step(); }
+          if (r.ok) { attempts = 0; offset = end; progress(offset); return last ? r.json() : step(); }
           if (r.status === 409) return r.json().then(function (j) { offset = j.have; return retry(); });
           throw new Error("upload refused: " + r.status);
         }, retry);
@@ -928,6 +1073,12 @@ form{display:inline}
       send({ t: "signout" });
     } else if (act === "logout") {
       closed = true; closeLink(); logout();
+    } else if (act === "sound") {
+      soundOn = !soundOn; setPref("sound", soundOn); showPrefs();
+      send({ t: "snd", on: soundOn });
+      if (soundOn) audio(); else aNext = 0;
+    } else if (act === "autoprint") {
+      autoPrint = !autoPrint; setPref("autoprint", autoPrint); showPrefs();
     }
   });
   function fullscreenOn() { return document.fullscreenElement || document.webkitFullscreenElement; }
@@ -959,10 +1110,29 @@ form{display:inline}
   document.addEventListener("webkitfullscreenchange", onFullscreen);
 
   // ---- printing: the session's "Portal printer" saves jobs as PDFs in the shared folder ----
+  // With "Printing" on (the default), the job opens straight in this browser's
+  // print dialog, to print on this computer's printer.
+  function printPdf(url) {
+    var f = document.createElement("iframe");
+    f.style.cssText = "position:fixed;left:-20px;top:-20px;width:10px;height:10px;opacity:0;border:0";
+    f.src = url;
+    f.addEventListener("load", function () {
+      // The PDF viewer needs a moment after loading before it can print.
+      setTimeout(function () {
+        try { f.contentWindow.focus(); f.contentWindow.print(); }
+        catch (e) { window.open(url, "_blank", "noopener"); }
+      }, 700);
+      setTimeout(function () { f.remove(); }, 10 * 60 * 1000);
+    });
+    document.body.appendChild(f);
+    window.__printed = (window.__printed || 0) + 1;   // for tests
+  }
   function printed(name, bytes) {
     var url = "/files/dl/" + encodeURIComponent(name);
+    var pdf = /\.pdf$/i.test(name);
+    if (autoPrint && pdf) printPdf(url + "?inline=1");
     toast.innerHTML = "";
-    var title = document.createElement("div"); title.textContent = "Printed: " + name + " (" + size(bytes) + ")";
+    var title = document.createElement("div"); title.textContent = (autoPrint && pdf ? "Printing: " : "Printed: ") + name + " (" + size(bytes) + ")";
     var acts = document.createElement("div"); acts.className = "acts";
     var open = document.createElement("a"); open.href = url + "?inline=1"; open.target = "_blank"; open.rel = "noopener"; open.textContent = /\.pdf$/i.test(name) ? "Open to print" : "Open";
     var dl = document.createElement("a"); dl.href = url; dl.className = "sec"; dl.setAttribute("download", name); dl.textContent = "Download";
@@ -972,6 +1142,48 @@ form{display:inline}
     clearTimeout(toastTimer); toastTimer = setTimeout(function () { toast.classList.add("hidden"); }, 20000);
     if (!panel.classList.contains("hidden")) refresh();
   }
+
+  // ---- preferences kept in this browser ----
+  function pref(name, fallback) {
+    try { var v = localStorage.getItem("portal." + name); return v === null ? fallback : v === "1"; } catch (e) { return fallback; }
+  }
+  function setPref(name, on) { try { localStorage.setItem("portal." + name, on ? "1" : "0"); } catch (e) {} }
+  function showPrefs() {
+    $("soundState").textContent = soundOn ? "On · click to mute" : "Off · click to turn on";
+    $("printState").textContent = autoPrint ? "Opens the print dialog right away" : "Shows a notice; you open the job yourself";
+  }
+  showPrefs();
+
+  // ---- admin messages ----
+  var notices = [];
+  function adminMessage(text, at) {
+    notices.push({ text: text, at: at });
+    if (notices.length === 1) showNotice();
+  }
+  function showNotice() {
+    var n = notices[0];
+    if (!n) { $("notice").classList.add("hidden"); canvas.focus(); return; }
+    $("noticeText").textContent = n.text;
+    $("noticeWhen").textContent = n.at ? new Date(n.at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+    $("notice").classList.remove("hidden");
+    $("noticeOk").focus();
+  }
+  $("noticeOk").addEventListener("click", function () { notices.shift(); showNotice(); });
+
+  // ---- inactivity warning ----
+  var idleTimer = null;
+  function idleWarning(secs) {
+    var el = $("idle"), left = secs;
+    clearInterval(idleTimer);
+    var tick = function () {
+      el.textContent = "No activity: you'll be disconnected in " + Math.max(0, left) + " s. Move the mouse or press a key to stay connected.";
+      left--;
+    };
+    tick(); el.classList.remove("hidden");
+    idleTimer = setInterval(tick, 1000);
+  }
+  function active() { if (idleTimer) { clearInterval(idleTimer); idleTimer = null; $("idle").classList.add("hidden"); } }
+  ["keydown", "pointerdown", "pointermove", "wheel", "touchstart"].forEach(function (t) { window.addEventListener(t, active, true); });
 
   $("filesBtn").addEventListener("click", function () { panel.classList.toggle("hidden"); if (!panel.classList.contains("hidden")) refresh(); });
   $("closePanel").addEventListener("click", function () { panel.classList.add("hidden"); canvas.focus(); });

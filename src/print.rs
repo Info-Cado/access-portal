@@ -79,22 +79,7 @@ impl Backend {
 fn chrono_like_stamp() -> String {
     #[cfg(windows)]
     {
-        #[repr(C)]
-        struct SystemTime {
-            year: u16,
-            month: u16,
-            day_of_week: u16,
-            day: u16,
-            hour: u16,
-            minute: u16,
-            second: u16,
-            milliseconds: u16,
-        }
-        extern "system" {
-            fn GetLocalTime(t: *mut SystemTime);
-        }
-        let mut t = SystemTime { year: 0, month: 0, day_of_week: 0, day: 0, hour: 0, minute: 0, second: 0, milliseconds: 0 };
-        unsafe { GetLocalTime(&mut t) };
+        let t = crate::clock::now();
         format!("{:04}-{:02}-{:02} {:02}-{:02}-{:02}", t.year, t.month, t.day, t.hour, t.minute, t.second)
     }
     #[cfg(not(windows))]
