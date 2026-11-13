@@ -1,4 +1,4 @@
-//! Built-in browser RDP client.
+﻿//! Built-in browser RDP client.
 //!
 //! The portal itself is the RDP client: it connects to the host, signs in with
 //! the stored Windows credentials (NLA), decodes the screen, and streams changed
@@ -66,6 +66,8 @@ pub struct Target {
     pub video_ok: bool,
     /// Folder shared with the session as a redirected drive (absolute path).
     pub files_dir: Option<std::path::PathBuf>,
+    /// Ask Windows for its graphics pipeline (H.264 from the host).
+    pub egfx: bool,
 }
 
 /// Name of the redirected drive inside the session: `\\tsclient\P`.
@@ -121,6 +123,9 @@ enum ClientMsg {
     /// the browser has drawn screen batch `n`
     #[serde(rename = "ack")]
     Ack { n: u32 },
+    /// the browser has drawn graphics-pipeline frame `id`
+    #[serde(rename = "fa")]
+    FrameAck { id: u32 },
     /// text typed on an on-screen keyboard, which reports characters, not keys
     #[serde(rename = "txt")]
     Text { s: String },
@@ -268,7 +273,13 @@ fn config(target: &Target) -> Config {
         autologon: false,
         enable_audio_playback: false,
         enable_audio_capture: false,
-        performance_flags: PerformanceFlags::default(),
+        // With Windows' H.264 the full desktop experience costs little: show window
+        // contents while dragging, animations, smooth fonts and composition.
+        performance_flags: if target.egfx {
+            PerformanceFlags::ENABLE_FONT_SMOOTHING | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION
+        } else {
+            PerformanceFlags::default()
+        },
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
         compression_type: None,
@@ -276,13 +287,13 @@ fn config(target: &Target) -> Config {
         enable_server_pointer: true,
         pointer_software_rendering: false,
         multitransport_flags: None,
-        support_dyn_vc_gfx_protocol: false,
+        support_dyn_vc_gfx_protocol: target.egfx,
     }
 }
 
 async fn connect(
     target: &Target,
-) -> anyhow::Result<(ConnectionResult, TlsFramed, std::sync::mpsc::Receiver<ClipEvent>)> {
+) -> anyhow::Result<(ConnectionResult, TlsFramed, std::sync::mpsc::Receiver<ClipEvent>, Option<crate::gfx::SharedRef>)> {
     let addr = format!("{}:{}", target.host, target.port);
     let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr))
         .await
@@ -294,11 +305,16 @@ async fn connect(
     let mut framed = MovableTokioFramed::new(tcp);
     let (clip_tx, clip_rx) = std::sync::mpsc::channel();
     #[allow(unused_mut)]
+    // Display control lets the session follow the browser window's size.
+    let mut dvc = DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+    let mut gfx_shared = None;
+    if target.egfx {
+        let (gfx, shared) = crate::gfx::channel();
+        dvc = dvc.with_dynamic_channel(gfx);
+        gfx_shared = Some(shared);
+    }
     let mut connector = ClientConnector::new(config(target), client_addr)
-        // Display control lets the session follow the browser window's size.
-        .with_static_channel(
-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
-        )
+        .with_static_channel(dvc)
         .with_static_channel(CliprdrClient::new(Box::new(ClipBackend { tx: clip_tx })));
     #[cfg(windows)]
     if let Some(dir) = &target.files_dir {
@@ -342,14 +358,14 @@ async fn connect(
     .map_err(|e| anyhow!("RDP sign-in failed: {e:#}"))?;
 
     let result = outcome.into_connected().map_err(|e| anyhow!("{e:#}"))?;
-    Ok((result, framed, clip_rx))
+    Ok((result, framed, clip_rx, gfx_shared))
 }
 
 /// Run one RDP session for one browser tab. Returns when either side closes.
 pub async fn run(target: Target, mut io: Box<dyn Transport>) {
     let outcome = match connect(&target).await {
-        Ok((result, framed, clip_rx)) => {
-            session(result, framed, clip_rx, target.resizable, target.video_ok, io.as_mut()).await
+        Ok((result, framed, clip_rx, gfx)) => {
+            session(result, framed, clip_rx, target.resizable, target.video_ok && gfx.is_none(), gfx, io.as_mut()).await
         }
         Err(e) => Err(e),
     };
@@ -381,6 +397,73 @@ fn png(width: u32, height: u32, color: png::ColorType, data: &[u8]) -> anyhow::R
     Ok(out)
 }
 
+/// Graphics-pipeline operations to the browser. Consecutive commands go as one
+/// JSON message; pictures and pixels as binary messages between them, so the
+/// browser sees everything in Windows' order.
+///
+/// Binary formats (little endian):
+///   H.264 picture: [5][surface u16][flags u8: 1 = draw, 2 = keyframe][rects u16]
+///                  [x, y, w, h u16 each rect][Annex B bytes]
+///   pixels:        [6][surface u16][x u16][y u16][w u16][h u16][PNG]
+async fn send_gfx_ops(io: &mut dyn Transport, ops: Vec<crate::gfx::Op>) -> anyhow::Result<()> {
+    use crate::gfx::Op;
+    let mut batch: Vec<serde_json::Value> = Vec::new();
+    for op in ops {
+        let json = match op {
+            Op::Reset { width, height } => json!({"o": "reset", "w": width, "h": height}),
+            Op::CreateSurface { id, width, height } => json!({"o": "cs", "id": id, "w": width, "h": height}),
+            Op::DeleteSurface { id } => json!({"o": "ds", "id": id}),
+            Op::MapSurface { id, x, y } => json!({"o": "ms", "id": id, "x": x, "y": y}),
+            Op::Fill { surface, rgb, rects } => json!({"o": "fill", "s": surface, "c": rgb, "r": rects}),
+            Op::Copy { from, to, rect, points } => json!({"o": "copy", "f": from, "s": to, "r": rect, "p": points}),
+            Op::ToCache { surface, slot, rect } => json!({"o": "tc", "s": surface, "slot": slot, "r": rect}),
+            Op::FromCache { slot, surface, points } => json!({"o": "fc", "s": surface, "slot": slot, "p": points}),
+            Op::Evict { slot } => json!({"o": "ev", "slot": slot}),
+            Op::EndFrame { id } => json!({"o": "ef", "id": id}),
+            Op::Video { surface, draw, key, rects, data } => {
+                if !batch.is_empty() {
+                    send_json(io, json!({"t": "g", "ops": std::mem::take(&mut batch)})).await?;
+                }
+                let mut msg = Vec::with_capacity(6 + rects.len() * 8 + data.len());
+                msg.push(5);
+                msg.extend_from_slice(&surface.to_le_bytes());
+                msg.push(u8::from(draw) | (u8::from(key) << 1));
+                msg.extend_from_slice(&(rects.len() as u16).to_le_bytes());
+                for (x, y, w, h) in rects {
+                    for v in [x, y, w, h] {
+                        msg.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                msg.extend_from_slice(&data);
+                io.send_binary(msg).await?;
+                continue;
+            }
+            Op::Pixels { surface, rect: (x, y, w, h), rgba } => {
+                if !batch.is_empty() {
+                    send_json(io, json!({"t": "g", "ops": std::mem::take(&mut batch)})).await?;
+                }
+                if w == 0 || h == 0 {
+                    continue;
+                }
+                let image = png(u32::from(w), u32::from(h), png::ColorType::Rgba, &rgba)?;
+                let mut msg = Vec::with_capacity(11 + image.len());
+                msg.push(6);
+                for v in [surface, x, y, w, h] {
+                    msg.extend_from_slice(&v.to_le_bytes());
+                }
+                msg.extend_from_slice(&image);
+                io.send_binary(msg).await?;
+                continue;
+            }
+        };
+        batch.push(json);
+    }
+    if !batch.is_empty() {
+        send_json(io, json!({"t": "g", "ops": batch})).await?;
+    }
+    Ok(())
+}
+
 async fn send_json(io: &mut dyn Transport, value: serde_json::Value) -> anyhow::Result<()> {
     io.send_text(value.to_string()).await
 }
@@ -391,6 +474,7 @@ async fn session(
     clip_rx: std::sync::mpsc::Receiver<ClipEvent>,
     resizable: bool,
     video_ok: bool,
+    gfx: Option<crate::gfx::SharedRef>,
     io: &mut dyn Transport,
 ) -> anyhow::Result<String> {
     let ConnectionResult {
@@ -426,6 +510,16 @@ async fn session(
     let mut tiles = Tiles::new(image.width(), image.height(), image.data().len());
     tracing::debug!("session start: video_ok={video_ok}");
     let mut video = Video::new(image.width(), image.height(), video_ok);
+    // Graphics pipeline: frames Windows sent so far, acknowledged as the browser draws them.
+    let mut gfx_frames_drawn: u32 = 0;
+    // Diagnostics: when each frame's end reached the browser, and per-second counts.
+    let mut gfx_sent_at: std::collections::HashMap<u32, std::time::Instant> = std::collections::HashMap::new();
+    let (mut gfx_in, mut gfx_acked, mut gfx_ack_ms, mut gfx_bytes) = (0u32, 0u32, 0f64, 0usize);
+    let mut moves_in = 0u32;
+    // Input -> the next frame from Windows (how fast the host reacts, plus the portal).
+    let mut gfx_input_at: Option<std::time::Instant> = None;
+    let mut gfx_react: Vec<f64> = Vec::new();
+    let mut gfx_report_at = std::time::Instant::now();
     // Screen batches sent, and the last one the browser reported drawing.
     let (mut sent_seq, mut acked_seq) = (0u32, 0u32);
     // Something is waiting to be sent. The host draws one frame as a burst of
@@ -544,12 +638,9 @@ async fn session(
 
         let outputs = tokio::select! {
             biased;
-            pdu = framed.read_pdu() => {
-                let (action, payload) = pdu.context("connection to the host was lost")?;
-                stage
-                    .process(&mut image, action, &payload, None)
-                    .map_err(|e| anyhow!("RDP protocol error: {e:#}"))?
-            }
+            // The browser first: input and frame acknowledgements are tiny, and
+            // must never wait behind a stream of screen updates from the host
+            // (that adds input lag, and holds back acknowledgements Windows waits for).
             msg = io.recv() => {
                 let msg = match msg {
                     Incoming::Text(text) => serde_json::from_str::<ClientMsg>(&text).ok(),
@@ -561,6 +652,25 @@ async fn session(
                 };
                 let events = match msg {
                     None => continue,
+                    Some(ClientMsg::FrameAck { id }) => {
+                        if let Some(t) = gfx_sent_at.remove(&id) {
+                            gfx_acked += 1;
+                            gfx_ack_ms += t.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        let channel_id = gfx.as_ref().and_then(|g| g.lock().unwrap().channel_id);
+                        if let Some(channel_id) = channel_id {
+                            gfx_frames_drawn = gfx_frames_drawn.wrapping_add(1);
+                            let messages = ironrdp_dvc::encode_dvc_messages(
+                                channel_id,
+                                vec![crate::gfx::frame_ack(id, gfx_frames_drawn)],
+                                ironrdp_svc::ChannelFlags::empty(),
+                            )
+                            .map_err(|e| anyhow!("graphics acknowledgement: {e}"))?;
+                            let frame = svc_frame(&stage, SvcProcessorMessages::<DrdynvcClient>::new(messages))?;
+                            framed.write_all(&frame).await.context("writing to the host")?;
+                        }
+                        continue;
+                    }
                     Some(ClientMsg::Ack { n }) => {
                         if n <= sent_seq && n > acked_seq {
                             acked_seq = n;
@@ -599,7 +709,13 @@ async fn session(
                         }
                         continue;
                     }
-                    Some(other) => input_events(&mut input, other, image.width(), image.height()),
+                    Some(other) => {
+                        if matches!(other, ClientMsg::Move { .. }) {
+                            moves_in += 1;
+                        }
+                        gfx_input_at.get_or_insert_with(std::time::Instant::now);
+                        input_events(&mut input, other, image.width(), image.height())
+                    }
                 };
                 if events.is_empty() {
                     continue;
@@ -608,6 +724,15 @@ async fn session(
                 stage
                     .process_fastpath_input(&mut image, &events)
                     .map_err(|e| anyhow!("RDP input error: {e:#}"))?
+            }
+            pdu = framed.read_pdu() => {
+                let (action, payload) = pdu.context("connection to the host was lost")?;
+                // When the frame arrived: Windows measures the link's bandwidth from
+                // these, and without them it is told nothing arrived and throttles.
+                let received_at = framed.last_read_at();
+                stage
+                    .process(&mut image, action, &payload, received_at)
+                    .map_err(|e| anyhow!("RDP protocol error: {e:#}"))?
             }
             // Reached only when neither the host nor the browser has anything
             // waiting (the branches above are tried first).
@@ -732,6 +857,41 @@ async fn session(
                 _ => {}
             }
         }
+
+        // Graphics pipeline: pass what Windows sent on to the browser, in order.
+        if let Some(shared) = &gfx {
+            let ops = std::mem::take(&mut shared.lock().unwrap().ops);
+            if !ops.is_empty() {
+                for op in &ops {
+                    match op {
+                        crate::gfx::Op::EndFrame { id } => {
+                            gfx_in += 1;
+                            if let Some(t) = gfx_input_at.take() {
+                                gfx_react.push(t.elapsed().as_secs_f64() * 1000.0);
+                            }
+                            gfx_sent_at.insert(*id, std::time::Instant::now());
+                        }
+                        crate::gfx::Op::Video { data, .. } => gfx_bytes += data.len(),
+                        _ => {}
+                    }
+                }
+                send_gfx_ops(io, ops).await?;
+            }
+            if gfx_report_at.elapsed() >= Duration::from_secs(1) {
+                if gfx_in > 0 {
+                    gfx_react.sort_by(f64::total_cmp);
+                    tracing::debug!(
+                        "graphics: {gfx_in} frames from Windows, {gfx_acked} drawn, browser draw+ack {:.1} ms avg, {} KB video, {moves_in} mouse moves in, input -> next frame median {:.0} ms",
+                        if gfx_acked > 0 { gfx_ack_ms / f64::from(gfx_acked) } else { 0.0 },
+                        gfx_bytes / 1024,
+                        gfx_react.get(gfx_react.len() / 2).copied().unwrap_or(0.0)
+                    );
+                    gfx_react.clear();
+                }
+                (gfx_in, gfx_acked, gfx_ack_ms, gfx_bytes, moves_in) = (0, 0, 0.0, 0, 0);
+                gfx_report_at = std::time::Instant::now();
+            }
+        }
     }
 }
 
@@ -801,7 +961,9 @@ fn input_events(db: &mut Database, msg: ClientMsg, width: u16, height: u16) -> V
         }
         ClientMsg::ReleaseAll => return db.release_all().into_iter().collect(),
         // Handled by the session loop, not as input.
-        ClientMsg::Resize { .. } | ClientMsg::Clip { .. } | ClientMsg::Ack { .. } => return Vec::new(),
+        ClientMsg::Resize { .. } | ClientMsg::Clip { .. } | ClientMsg::Ack { .. } | ClientMsg::FrameAck { .. } => {
+            return Vec::new()
+        }
     };
     db.apply(ops).into_iter().collect()
 }

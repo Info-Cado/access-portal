@@ -582,8 +582,10 @@ async fn session_target(
         show_errors: user.is_admin(),
         resizable: state.config.session_size.is_none(),
         // The browser advertises H.264 decode support with ?vd=1.
-        video_ok: state.config.video && viewport.vd == Some(1),
+        video_ok: state.config.video && matches!(viewport.vd, Some(1 | 2)),
         files_dir: user_files_dir(state, user).await.ok(),
+        // The browser advertises it can decode Windows' H.264 (High profile) with ?vd=2.
+        egfx: state.config.egfx && viewport.vd == Some(2),
     };
     Ok(Ok(target))
 }

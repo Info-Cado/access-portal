@@ -246,3 +246,46 @@ catch {
   Finish @{ ok = $false; error = $_.Exception.Message }
 }
 "#;
+
+/// Remote Desktop settings the portal's sessions are tuned for, applied to this
+/// machine on start (needs administrator rights; skipped otherwise):
+///
+/// - encode Windows' H.264 on the graphics card when there is one;
+/// - render sessions on the graphics card instead of in software;
+/// - let sessions run at 60 frames a second (Windows' default is 30).
+///
+/// Already-open sessions keep their old setup until their user signs out; the
+/// frame rate applies once the Remote Desktop service restarts (a reboot).
+pub fn tune_remote_desktop() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let settings = [
+            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "AVCHardwareEncodePreferred", 1u32),
+            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "bEnumerateHWBeforeSW", 1),
+            (r"HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations", "DWMFRAMEINTERVAL", 15),
+        ];
+        for (key, name, value) in settings {
+            let current = std::process::Command::new("reg")
+                .args(["query", key, "/v", name])
+                .creation_flags(0x0800_0000)
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            if current.contains(&format!("0x{value:x}")) {
+                continue;
+            }
+            let ok = std::process::Command::new("reg")
+                .args(["add", key, "/v", name, "/t", "REG_DWORD", "/d", &value.to_string(), "/f"])
+                .creation_flags(0x0800_0000)
+                .status()
+                .is_ok_and(|s| s.success());
+            if ok {
+                tracing::info!("remote desktop tuned: {name} = {value}");
+            } else {
+                tracing::warn!("could not set {name} (the portal needs administrator rights for this)");
+            }
+        }
+    }
+}

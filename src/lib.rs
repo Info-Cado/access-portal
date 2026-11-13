@@ -10,6 +10,7 @@ mod api;
 mod auth;
 mod config;
 mod db;
+mod gfx;
 mod error;
 mod host;
 mod models;
@@ -83,6 +84,9 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
         .run(&pool)
         .await
         .context("updating the database")?;
+
+    // Windows-side settings for smooth sessions (GPU encoding, 60 fps).
+    tokio::task::spawn_blocking(host::tune_remote_desktop);
 
     let address = config.bind_addr.clone();
     let state = AppState {

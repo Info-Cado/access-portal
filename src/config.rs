@@ -29,6 +29,8 @@ pub struct Config {
 
     /// Allow the H.264 motion path (still needs a browser that can decode it).
     pub video: bool,
+    /// Use Windows' graphics pipeline (H.264 from the host) for sessions.
+    pub egfx: bool,
 
     pub session_ttl_secs: i64,
     pub max_failed: i64,
@@ -67,6 +69,7 @@ impl Config {
                     .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
             },
             video: var("VIDEO", "on") != "off",
+            egfx: var("EGFX", "on") != "off",
             session_ttl_secs: var("SESSION_TTL_SECS", "28800").parse().unwrap_or(28800),
             max_failed: var("MAX_FAILED", "5").parse().unwrap_or(5),
             lockout_secs: var("LOCKOUT_SECS", "300").parse().unwrap_or(300),

@@ -46,7 +46,38 @@ host with the stored Windows credentials, decodes the screen, and streams what
 changed to the browser; mouse and keyboard travel back the same way. The page is
 `src/session.html`.
 
-### Screen updates (`src/tiles.rs`)
+### The screen: Windows' own H.264 (`src/gfx.rs`)
+
+Sessions use Windows' graphics pipeline (MS-RDPEGFX). Windows encodes the
+screen as H.264 on the host's graphics card (NVIDIA, Intel or AMD encoder) at up
+to 60 frames a second, and the portal passes it to the browser untouched; the
+browser decodes it with its own hardware decoder (WebCodecs). The portal only
+decodes the few lossless updates Windows sends (ClearCodec, planar) and passes
+fills, copies and cache commands through, so each browser applies exactly what
+Windows drew, in order.
+
+- Windows on this kind of host sends H.264 as AVC444: two 4:2:0 pictures per
+  frame in one stream. The browser decodes both and draws the main view, a full
+  4:2:0 picture of the screen.
+- Each picture is drawn once, clipped to the areas Windows says changed.
+- Frames are acknowledged to Windows only after the browser drew them, so a slow
+  link gets fewer frames rather than a growing delay.
+- The session loop serves the browser before the host, so input and
+  acknowledgements never queue behind screen data.
+
+Measured on the development laptop (RTX 3050 Ti, 1920x1080, dragging a window):
+50-57 frames a second, input to next frame from Windows about 11 ms, the browser
+decoding a picture in about 1 ms and drawing a frame in 2-3 ms, about 3-4 Mbit/s.
+
+On start the app sets the Windows side up for this: H.264 encoding and session
+rendering on the graphics card, and 60 frames a second (`tune_remote_desktop` in
+`src/host.rs`). Sessions already open keep their old setup until their user
+signs out, and the frame rate applies after a reboot.
+
+Browsers that cannot decode H.264 (`?vd=2` is not sent) get the older path
+below, and `EGFX=off` turns the pipeline off.
+
+### Screen updates without H.264 (`src/tiles.rs`)
 
 The screen is a grid of 256-pixel tiles. Only the part of a tile that really
 differs from what the browser already shows is sent:
@@ -275,7 +306,8 @@ get around per-user Windows licensing.
 | `src/auth.rs` | hashing, tokens, at-rest crypto, TOTP |
 | `src/rdp.rs` | built-in RDP client: connect, sign in, input, clipboard, resize, shared drive |
 | `src/tiles.rs` | turns still screen changes into small tile batches |
-| `src/video.rs` | H.264 motion blocks for areas that keep changing |
+| `src/gfx.rs` | Windows' graphics pipeline, passed through to the browser |
+| `src/video.rs` | H.264 motion blocks for the older path |
 | `src/transport.rs` | link to the browser: WebRTC data channel, or WebSocket fallback |
 | `src/session.html` | the browser page for a session |
 | `src/web.rs` | router, auth extractors, pages, handlers, file transfer endpoints |

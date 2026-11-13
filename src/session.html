@@ -191,8 +191,157 @@ form{display:inline}
     }
   }
 
+  // ---- Windows' graphics pipeline: its own H.264 and drawing commands, applied in order ----
+  // The portal passes Windows' operations through unchanged. Each runs after the
+  // previous one finished, so the canvas always matches what Windows drew.
+  var GCODEC = "avc1.640034";            // H.264 High; what Windows sends
+  var GHW = /[?&]gsw=1/.test(location.search) ? "prefer-software" : /[?&]ghw=1/.test(location.search) ? "prefer-hardware" : "no-preference";
+  var gq = Promise.resolve(), gts = 0;
+  var gsurf = {}, gcache = {}, gdec = {};
+  // Read-only counters for tests and diagnostics.
+  var gstats = { frames: 0, pictures: 0, drawn: 0, timeouts: 0, errors: 0, lastFrameAt: 0, decodeMs: 0, queueMs: 0, queued: 0, decoderQueue: 0, maxDecoderQueue: 0, ops: {} };
+  window.__gstats = gstats;
+  function gqueue(fn) {
+    gq = gq.then(fn).catch(function (e) { if (window.console) console.warn("gfx", e); });
+  }
+  function gsurface(id, w, h) {
+    var c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    return { w: w, h: h, canvas: c, ctx: c.getContext("2d", { alpha: false }), mapped: false, x: 0, y: 0, direct: false };
+  }
+  function gdecoder(sid) {
+    var d = gdec[sid];
+    if (d && d.dec.state !== "closed") return d;
+    d = { waiting: [], started: false, dec: null };
+    d.dec = new VideoDecoder({
+      output: function (frame) {
+        var w = d.waiting.shift(), s = gsurf[sid];
+        gstats.pictures++;
+        if (w) gstats.decodeMs += performance.now() - w.at;
+        if (w && w.draw) gstats.drawn++;
+        if (w && w.draw && s && w.rects.length) {
+          // One draw per picture, clipped to the changed rectangles: every drawImage
+          // of a video frame converts the whole picture, so drawing each rectangle
+          // separately would convert it dozens of times.
+          var c = s.ctx;
+          c.save();
+          c.beginPath();
+          for (var i = 0; i < w.rects.length; i++) {
+            var r = w.rects[i];
+            if (r[2] > 0 && r[3] > 0) c.rect(r[0], r[1], r[2], r[3]);
+          }
+          c.clip();
+          c.drawImage(frame, 0, 0);
+          c.restore();
+        }
+        frame.close();
+        if (w) w.done();
+      },
+      error: function (e) {
+        if (window.console) console.warn("gfx decoder", e);
+        gstats.errors++;
+        d.waiting.forEach(function (w) { w.done(); });
+        d.waiting = [];
+        if (gdec[sid] === d) delete gdec[sid];
+      }
+    });
+    d.dec.configure({ codec: GCODEC, optimizeForLatency: true, hardwareAcceleration: GHW });
+    gdec[sid] = d;
+    return d;
+  }
+  function gvideo(buf) {
+    var v = new DataView(buf), sid = v.getUint16(1, true), flags = v.getUint8(3), n = v.getUint16(4, true), off = 6, rects = [];
+    for (var i = 0; i < n; i++, off += 8) rects.push([v.getUint16(off, true), v.getUint16(off + 2, true), v.getUint16(off + 4, true), v.getUint16(off + 6, true)]);
+    var data = new Uint8Array(buf, off), key = (flags & 2) !== 0, draw = (flags & 1) !== 0, arrived = performance.now();
+    gqueue(function () {
+      gstats.queueMs += performance.now() - arrived; gstats.queued++;
+      var d = gdecoder(sid);
+      if (!d.started && !key) return;     // a decoder must begin at a keyframe
+      d.started = true;
+      // Decoders may hold a picture back until the next one arrives. Pictures that
+      // are not drawn (AVC444 auxiliary views) never hold the queue; a drawn one
+      // holds it briefly so later commands paint over it in the right order.
+      gstats.maxDecoderQueue = Math.max(gstats.maxDecoderQueue, d.dec.decodeQueueSize, d.waiting.length);
+      var entry = { draw: draw, rects: rects, done: function () {}, at: performance.now() };
+      d.waiting.push(entry);
+      try {
+        d.dec.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: (gts += 16667), data: data }));
+      } catch (e) { d.waiting.splice(d.waiting.indexOf(entry), 1); return; }
+      if (!draw) return;
+      return new Promise(function (resolve) {
+        var settled = false;
+        entry.done = function () { if (!settled) { settled = true; resolve(); } };
+        setTimeout(function () { if (!settled) { gstats.timeouts++; entry.done(); } }, 40);
+      });
+    });
+  }
+  function gpixels(buf) {
+    var v = new DataView(buf), sid = v.getUint16(1, true), x = v.getUint16(3, true), y = v.getUint16(5, true);
+    var blob = new Blob([new Uint8Array(buf, 11)], { type: "image/png" });
+    var bmp = createImageBitmap(blob);   // decode starts now, drawing waits its turn
+    gqueue(function () {
+      return bmp.then(function (b) { var s = gsurf[sid]; if (s) s.ctx.drawImage(b, x, y); if (b.close) b.close(); });
+    });
+  }
+  function gop(o) {
+    var s;
+    switch (o.o) {
+      case "reset":
+        canvas.width = o.w; canvas.height = o.h; gsurf = {};
+        for (var k in gdec) { try { gdec[k].dec.close(); } catch (e) {} }
+        gdec = {}; cellSeq = {}; fit();
+        return;
+      case "cs": gsurf[o.id] = gsurface(o.id, o.w, o.h); return;
+      case "ds": delete gsurf[o.id]; if (gdec[o.id]) { try { gdec[o.id].dec.close(); } catch (e) {} delete gdec[o.id]; } return;
+      case "ms":
+        s = gsurf[o.id]; if (!s) return;
+        s.mapped = true; s.x = o.x; s.y = o.y;
+        if (o.x === 0 && o.y === 0 && s.w === canvas.width && s.h === canvas.height && !s.direct) {
+          // The desktop surface covers the whole output: draw straight on the visible canvas.
+          ctx.drawImage(s.canvas, 0, 0);
+          s.canvas = canvas; s.ctx = ctx; s.direct = true;
+        }
+        return;
+      case "fill":
+        s = gsurf[o.s]; if (!s) return;
+        s.ctx.fillStyle = "rgb(" + o.c[0] + "," + o.c[1] + "," + o.c[2] + ")";
+        o.r.forEach(function (r) { s.ctx.fillRect(r[0], r[1], r[2], r[3]); });
+        return;
+      case "copy":
+        var src = gsurf[o.f]; s = gsurf[o.s]; if (!src || !s || !o.r[2] || !o.r[3]) return;
+        o.p.forEach(function (p) { s.ctx.drawImage(src.canvas, o.r[0], o.r[1], o.r[2], o.r[3], p[0], p[1], o.r[2], o.r[3]); });
+        return;
+      case "tc":
+        s = gsurf[o.s]; if (!s || !o.r[2] || !o.r[3]) return;
+        return createImageBitmap(s.canvas, o.r[0], o.r[1], o.r[2], o.r[3]).then(function (b) {
+          if (gcache[o.slot] && gcache[o.slot].close) gcache[o.slot].close();
+          gcache[o.slot] = b;
+        });
+      case "fc":
+        s = gsurf[o.s]; var b = gcache[o.slot]; if (!s || !b) return;
+        o.p.forEach(function (p) { s.ctx.drawImage(b, p[0], p[1]); });
+        return;
+      case "ev":
+        if (gcache[o.slot] && gcache[o.slot].close) gcache[o.slot].close();
+        delete gcache[o.slot];
+        return;
+      case "ef":
+        // Surfaces shown somewhere other than full-screen are composited per frame.
+        for (var id in gsurf) { s = gsurf[id]; if (s.mapped && !s.direct) ctx.drawImage(s.canvas, s.x, s.y); }
+        send({ t: "fa", id: o.id });
+        gstats.frames++; gstats.lastFrameAt = performance.now();
+        if (!gotFrame) { gotFrame = true; retries = 0; overlay.classList.add("hidden"); canvas.focus(); }
+        return;
+    }
+  }
+
   function onText(text) {
     var m = JSON.parse(text);
+    if (m.t === "g") { m.ops.forEach(function (o) { gqueue(function () {
+      var t = performance.now(), r = gop(o), rec = gstats.ops[o.o] || (gstats.ops[o.o] = { n: 0, ms: 0 });
+      rec.n++;
+      return Promise.resolve(r).then(function () { rec.ms += performance.now() - t; });
+    }); }); return; }
     if (m.t === "size") {
       draw = draw.then(function () { canvas.width = m.w; canvas.height = m.h; cellSeq = {}; cur = { x: m.w / 2, y: m.h / 2 }; fit(); });
     } else if (m.t === "cur") {
@@ -225,6 +374,8 @@ form{display:inline}
   window.__cells = cellsOf;
   function onBinary(buf) {
     var kind = new DataView(buf).getUint8(0);
+    if (kind === 5) { gvideo(buf); return; }        // Windows' H.264 picture
+    if (kind === 6) { gpixels(buf); return; }       // pixels the portal decoded
     if (kind === 3) { videoPacket(buf); return; }   // one H.264 frame for a block
     if (kind !== 2) return;
     // A batch of changed tiles: decode them all, then paint them together so a
@@ -302,7 +453,7 @@ form{display:inline}
     }
     try {
       pc = new RTCPeerConnection({ iceServers: rtc.iceServers });
-      dc = pc.createDataChannel("session", { ordered: false });  // a lost packet never blocks newer tiles
+      dc = pc.createDataChannel("session", { ordered: true });   // video and drawing commands need their order
     } catch (e) { return giveUp(); }
     dc.binaryType = "arraybuffer";
     timer = setTimeout(giveUp, 8000);
@@ -376,8 +527,13 @@ form{display:inline}
   // Tell the server (via ?vd=1) only if this browser can actually decode the video,
   // so one that can't simply gets the tile stream.
   if (window.VideoDecoder && VideoDecoder.isConfigSupported) {
-    VideoDecoder.isConfigSupported({ codec: VCODEC, optimizeForLatency: true })
-      .then(function (s) { if (s && s.supported) query += "&vd=1"; })
+    // vd=2: can decode Windows' own H.264 (High profile); vd=1: the portal's.
+    VideoDecoder.isConfigSupported({ codec: GCODEC, optimizeForLatency: true })
+      .then(function (s) {
+        if (s && s.supported) { query += "&vd=2"; return; }
+        return VideoDecoder.isConfigSupported({ codec: VCODEC, optimizeForLatency: true })
+          .then(function (t) { if (t && t.supported) query += "&vd=1"; });
+      })
       .catch(function () {})
       .then(startLink);
   } else {
