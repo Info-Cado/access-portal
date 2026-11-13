@@ -145,7 +145,7 @@ function Fix($id) {
       Restart-RemoteDesktop
     }
     'group' {
-      if (-not (GroupSid)) { New-LocalGroup -Name $portalGroup -Description 'Accounts that Access Portal signs in over Remote Desktop' | Out-Null }
+      if (-not (GroupSid)) { New-LocalGroup -Name $portalGroup -Description 'Access Portal Remote Desktop users' -ErrorAction Stop | Out-Null }
       $sid = GroupSid
       if (-not [ApLsa]::Has((SidBytes $sid), 'SeRemoteInteractiveLogonRight')) { [ApLsa]::Add((SidBytes $sid), 'SeRemoteInteractiveLogonRight') }
       if (-not (HasAce $sid)) {
