@@ -68,6 +68,17 @@ pub struct Target {
     pub files_dir: Option<std::path::PathBuf>,
     /// Ask Windows for its graphics pipeline (H.264 from the host).
     pub egfx: bool,
+    /// Signalled when an administrator disconnects this session.
+    pub kick: Option<std::sync::Arc<crate::presence::Kick>>,
+}
+
+/// What a session needs besides the connection itself.
+struct Extras {
+    /// Finished print jobs, saved in the user's folder.
+    printed: std::sync::mpsc::Receiver<crate::print::PrintedFile>,
+    kick: Option<std::sync::Arc<crate::presence::Kick>>,
+    /// The Windows account, for signing it out on request.
+    win_username: String,
 }
 
 /// Name of the redirected drive inside the session: `\\tsclient\P`.
@@ -126,6 +137,9 @@ enum ClientMsg {
     /// the browser has drawn graphics-pipeline frame `id`
     #[serde(rename = "fa")]
     FrameAck { id: u32 },
+    /// the user chose "Sign out of Windows" (closes their apps)
+    #[serde(rename = "signout")]
+    SignOut,
     /// text typed on an on-screen keyboard, which reports characters, not keys
     #[serde(rename = "txt")]
     Text { s: String },
@@ -198,7 +212,10 @@ impl CliprdrBackend for ClipBackend {
 
 /// The shared drive: one folder on the portal host, shown inside the session.
 #[cfg(windows)]
-fn drive_channel(dir: &std::path::Path) -> anyhow::Result<ironrdp_rdpdr::Rdpdr> {
+fn drive_channel(
+    dir: &std::path::Path,
+    printed: std::sync::mpsc::Sender<crate::print::PrintedFile>,
+) -> anyhow::Result<ironrdp_rdpdr::Rdpdr> {
     use ironrdp_rdpdr::{RdpdrBackendFactory as _, RdpdrDrive};
     use ironrdp_rdpdr_native::{RedirectedDrive, WindowsRdpdrBackendFactory, FIRST_NAMED_DRIVE_DEVICE_ID};
 
@@ -208,7 +225,15 @@ fn drive_channel(dir: &std::path::Path) -> anyhow::Result<ironrdp_rdpdr::Rdpdr> 
         .map_err(|e| anyhow!("drive backend: {e}"))?;
     let (backend, drives) = product.into_parts();
     let drives = drives.into_iter().map(RdpdrDrive::into_parts).collect();
-    Ok(ironrdp_rdpdr::Rdpdr::new(backend, "access-portal".to_owned()).with_drives(Some(drives)))
+    // Printing rides on the same channel: jobs land in the same folder as PDFs.
+    let backend = Box::new(crate::print::Backend::new(backend, dir.to_path_buf(), printed));
+    Ok(ironrdp_rdpdr::Rdpdr::new(backend, "access-portal".to_owned())
+        .with_drives(Some(drives))
+        .with_printer_driver(
+            crate::print::PRINTER_DEVICE_ID,
+            crate::print::PRINTER_NAME.to_owned(),
+            crate::print::PRINTER_DRIVER.to_owned(),
+        ))
 }
 
 /// Encode queued messages of one static channel into a frame for the host.
@@ -293,7 +318,7 @@ fn config(target: &Target) -> Config {
 
 async fn connect(
     target: &Target,
-) -> anyhow::Result<(ConnectionResult, TlsFramed, std::sync::mpsc::Receiver<ClipEvent>, Option<crate::gfx::SharedRef>)> {
+) -> anyhow::Result<(ConnectionResult, TlsFramed, std::sync::mpsc::Receiver<ClipEvent>, Option<crate::gfx::SharedRef>, Extras)> {
     let addr = format!("{}:{}", target.host, target.port);
     let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr))
         .await
@@ -304,6 +329,8 @@ async fn connect(
 
     let mut framed = MovableTokioFramed::new(tcp);
     let (clip_tx, clip_rx) = std::sync::mpsc::channel();
+    #[allow(unused_variables)]
+    let (print_tx, print_rx) = std::sync::mpsc::channel();
     #[allow(unused_mut)]
     // Display control lets the session follow the browser window's size.
     let mut dvc = DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
@@ -318,7 +345,7 @@ async fn connect(
         .with_static_channel(CliprdrClient::new(Box::new(ClipBackend { tx: clip_tx })));
     #[cfg(windows)]
     if let Some(dir) = &target.files_dir {
-        match drive_channel(dir) {
+        match drive_channel(dir, print_tx) {
             Ok(rdpdr) => {
                 // Windows only starts device redirection when the audio channel
                 // is present too, so join it with a backend that plays nothing.
@@ -358,14 +385,15 @@ async fn connect(
     .map_err(|e| anyhow!("RDP sign-in failed: {e:#}"))?;
 
     let result = outcome.into_connected().map_err(|e| anyhow!("{e:#}"))?;
-    Ok((result, framed, clip_rx, gfx_shared))
+    let extras = Extras { printed: print_rx, kick: target.kick.clone(), win_username: target.username.clone() };
+    Ok((result, framed, clip_rx, gfx_shared, extras))
 }
 
 /// Run one RDP session for one browser tab. Returns when either side closes.
 pub async fn run(target: Target, mut io: Box<dyn Transport>) {
     let outcome = match connect(&target).await {
-        Ok((result, framed, clip_rx, gfx)) => {
-            session(result, framed, clip_rx, target.resizable, target.video_ok && gfx.is_none(), gfx, io.as_mut()).await
+        Ok((result, framed, clip_rx, gfx, extras)) => {
+            session(result, framed, clip_rx, target.resizable, target.video_ok && gfx.is_none(), gfx, extras, io.as_mut()).await
         }
         Err(e) => Err(e),
     };
@@ -381,6 +409,10 @@ pub async fn run(target: Target, mut io: Box<dyn Transport>) {
         }
     };
     let _ = io.send_text(json!({"t": "closed", "m": message}).to_string()).await;
+    // Let the message leave before the link closes: a data channel drops
+    // whatever is still queued when it closes, and the page would then
+    // reconnect instead of showing why the session ended.
+    tokio::time::sleep(Duration::from_millis(600)).await;
     io.close().await;
 }
 
@@ -475,8 +507,16 @@ async fn session(
     resizable: bool,
     video_ok: bool,
     gfx: Option<crate::gfx::SharedRef>,
+    extras: Extras,
     io: &mut dyn Transport,
 ) -> anyhow::Result<String> {
+    let kicked = async {
+        match &extras.kick {
+            Some(k) => k.wait().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(kicked);
     let ConnectionResult {
         io_channel_id,
         user_channel_id,
@@ -604,6 +644,10 @@ async fn session(
             host_ms.clear();
             portal_ms.clear();
         }
+        // Print jobs finished since the last turn: offer them in the browser.
+        while let Ok(job) = extras.printed.try_recv() {
+            send_json(io, json!({"t": "print", "name": job.name, "size": job.size})).await?;
+        }
         // Clipboard events queued while the last PDU was processed.
         while let Ok(event) = clip_rx.try_recv() {
             if let ClipEvent::RemoteText(text) = event {
@@ -638,6 +682,9 @@ async fn session(
 
         let outputs = tokio::select! {
             biased;
+            reason = &mut kicked => {
+                return Ok(reason);
+            }
             // The browser first: input and frame acknowledgements are tiny, and
             // must never wait behind a stream of screen updates from the host
             // (that adds input lag, and holds back acknowledgements Windows waits for).
@@ -652,6 +699,11 @@ async fn session(
                 };
                 let events = match msg {
                     None => continue,
+                    Some(ClientMsg::SignOut) => {
+                        let user = extras.win_username.clone();
+                        tokio::task::spawn_blocking(move || crate::host::sign_out_blocking(&user)).await.ok();
+                        return Ok("You signed out of Windows. Your apps were closed.".to_owned());
+                    }
                     Some(ClientMsg::FrameAck { id }) => {
                         if let Some(t) = gfx_sent_at.remove(&id) {
                             gfx_acked += 1;
@@ -961,7 +1013,7 @@ fn input_events(db: &mut Database, msg: ClientMsg, width: u16, height: u16) -> V
         }
         ClientMsg::ReleaseAll => return db.release_all().into_iter().collect(),
         // Handled by the session loop, not as input.
-        ClientMsg::Resize { .. } | ClientMsg::Clip { .. } | ClientMsg::Ack { .. } | ClientMsg::FrameAck { .. } => {
+        ClientMsg::Resize { .. } | ClientMsg::Clip { .. } | ClientMsg::Ack { .. } | ClientMsg::FrameAck { .. } | ClientMsg::SignOut => {
             return Vec::new()
         }
     };

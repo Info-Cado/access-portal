@@ -15,6 +15,7 @@ mod error;
 mod host;
 mod models;
 mod presence;
+mod print;
 mod rdp;
 mod tiles;
 mod transport;

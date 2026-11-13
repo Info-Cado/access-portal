@@ -14,8 +14,22 @@ html,body{margin:0;height:100%;background:#0b0e18;overflow:hidden;font-family:sy
 .btn{display:inline-block;background:#2453d6;color:#fff;border:0;border-radius:8px;padding:9px 16px;font-size:.95rem;cursor:pointer;text-decoration:none;margin:0 4px}
 .btn.sec{background:#2a3149}
 form{display:inline}
-#filesBtn{position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:10;background:#171c2e;color:#e8ecf6;border:1px solid #2a3149;border-top:0;border-radius:0 0 8px 8px;padding:3px 14px;font-size:.8rem;cursor:pointer;opacity:.35}
-#filesBtn:hover,#filesBtn:focus{opacity:1}
+#tools{position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:10;display:flex;gap:2px;background:#171c2e;border:1px solid #2a3149;border-top:0;border-radius:0 0 10px 10px;padding:2px 4px;opacity:.35;transition:opacity .15s}
+#tools:hover,#tools:focus-within,#tools.open{opacity:1}
+#tools button{background:none;border:0;color:#e8ecf6;font-size:.8rem;padding:4px 10px;border-radius:7px;cursor:pointer}
+#tools button:hover{background:#2a3149}
+#tools .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#5fd39a;margin-right:6px;vertical-align:1px}
+#tools .dot.relayed{background:#e6b450}
+#menu{position:fixed;top:34px;left:50%;transform:translateX(-50%);z-index:11;min-width:250px;background:#171c2e;border:1px solid #2a3149;border-radius:10px;padding:6px;box-shadow:0 12px 32px rgba(0,0,0,.45)}
+#menu.hidden{display:none}
+#menu button{display:block;width:100%;text-align:left;background:none;border:0;color:#e8ecf6;font-size:.88rem;padding:9px 12px;border-radius:7px;cursor:pointer}
+#menu button:hover{background:#2a3149}
+#menu button small{display:block;color:#9aa3ba;font-size:.74rem;margin-top:2px}
+#menu .danger{color:#ff8a80}
+#menu hr{border:0;border-top:1px solid #2a3149;margin:4px 0}
+#toast .acts{margin-top:8px;display:flex;gap:8px}
+#toast .acts a{color:#fff;background:#2453d6;border-radius:6px;padding:5px 12px;text-decoration:none;font-size:.85rem}
+#toast .acts a.sec{background:#2a3149}
 #panel{position:fixed;top:0;right:0;bottom:0;width:min(360px,100vw);box-sizing:border-box;background:#171c2e;border-left:1px solid #2a3149;z-index:20;padding:16px;display:flex;flex-direction:column}
 #panel h2{margin:0 0 6px;font-size:1.1rem}
 #panel .hint{color:#9aa3ba;font-size:.82rem;margin:0 0 12px;line-height:1.4}
@@ -38,7 +52,17 @@ form{display:inline}
 </head>
 <body>
 <canvas id="screen" tabindex="0" width="1" height="1"></canvas>
-<button id="filesBtn" type="button">Files</button>
+<div id="tools">
+  <button id="filesBtn" type="button" title="Shared files and print jobs"><span id="linkDot" class="dot"></span>Files</button>
+  <button id="fullBtn" type="button" title="Full screen">Full screen</button>
+  <button id="menuBtn" type="button" title="More" aria-haspopup="menu">&#8943;</button>
+</div>
+<div id="menu" class="hidden" role="menu">
+  <button type="button" data-menu="disconnect">Disconnect<small>Leave your apps running and come back later</small></button>
+  <button type="button" data-menu="signout" class="danger">Sign out of Windows<small>Closes your apps; save your work first</small></button>
+  <hr>
+  <button type="button" data-menu="logout">Log out of the portal</button>
+</div>
 <div id="cursor"><img id="cursorImg" alt=""></div>
 <textarea id="kb" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="Keyboard input"></textarea>
 <div id="bar">
@@ -124,7 +148,7 @@ form{display:inline}
     $("detail").textContent = detail || "";
     $("actions").innerHTML =
       '<a class="btn" href="">Reconnect</a>' +
-      '<form method="post" action="/logout"><button class="btn sec">Log out</button></form>';
+      '<form method="post" action="/logout"><button class="btn sec">Log out of the portal</button></form>';
     overlay.classList.remove("hidden");
   }
 
@@ -354,6 +378,8 @@ form{display:inline}
       vstart(m.b, m.g, m.x, m.y, m.w, m.h);
     } else if (m.t === "vstop") {
       vstop(m.b);
+    } else if (m.t === "print") {
+      printed(m.name, m.size);
     } else if (m.t === "closed") {
       showEnd("Session ended", m.m);
     }
@@ -410,7 +436,7 @@ form{display:inline}
   // When the link drops (network change, a proxy restarting), reconnect on our
   // own: the Windows session is still there and is picked up again. Each
   // attempt has a number so events from an old, abandoned link are ignored.
-  var linkGen = 0, retries = 0, MAX_RETRIES = 8;
+  var linkGen = 0, retries = 0, MAX_RETRIES = 8, closeLink = function () {};
   function lost(gen) {
     if (closed || gen !== linkGen) return;
     link = null;
@@ -437,6 +463,7 @@ form{display:inline}
     ws.onopen = function () { link = { kind: "relayed", send: function (s) { if (ws.readyState === 1) ws.send(s); } }; showLink(); };
     ws.onmessage = function (ev) { if (typeof ev.data === "string") onText(ev.data); else onBinary(ev.data); };
     ws.onclose = function () { lost(mine); };
+    closeLink = function () { ws.onclose = null; try { ws.close(); } catch (e) {} };
   }
 
   // Data channel messages are chunked: one flag byte (1 = last chunk, 2 = text) then the payload.
@@ -492,6 +519,7 @@ form{display:inline}
       if (chunk[0] & 2) onText(decoder.decode(whole)); else onBinary(whole.buffer);
     };
     dc.onclose = function () { if (settled && link && link.kind === "direct") lost(mine); else giveUp(); };
+    closeLink = function () { linkGen++; try { dc.close(); } catch (e) {} try { pc.close(); } catch (e) {} };
     pc.onconnectionstatechange = function () {
       if (pc.connectionState === "failed") {
         if (link && link.kind === "direct") { try { pc.close(); } catch (e) {} lost(mine); } else giveUp();
@@ -518,9 +546,10 @@ form{display:inline}
   }
 
   function showLink() {
-    var b = document.getElementById("filesBtn");
-    b.title = link.kind === "direct" ? "Connection: direct (peer-to-peer)" : "Connection: through the portal server";
+    var b = document.getElementById("filesBtn"), d = document.getElementById("linkDot");
+    b.title = (link.kind === "direct" ? "Connected directly (peer-to-peer)" : "Connected through the portal server") + ". Shared files and print jobs.";
     b.dataset.link = link.kind;
+    d.className = "dot" + (link.kind === "direct" ? "" : " relayed");
   }
 
   function startLink() { if (rtc.p2p && window.RTCPeerConnection) startDirect(); else startWebSocket(); }
@@ -875,6 +904,57 @@ form{display:inline}
     };
     next();
   }
+  // ---- session menu ----
+  var menu = $("menu"), tools = $("tools");
+  function setMenu(open) { menu.classList.toggle("hidden", !open); tools.classList.toggle("open", open); }
+  $("menuBtn").addEventListener("click", function (e) { e.stopPropagation(); setMenu(menu.classList.contains("hidden")); });
+  document.addEventListener("mousedown", function (e) { if (!menu.contains(e.target) && e.target !== $("menuBtn")) setMenu(false); });
+  function logout() {
+    var f = document.createElement("form"); f.method = "post"; f.action = "/logout";
+    document.body.appendChild(f); f.submit();
+  }
+  menu.addEventListener("click", function (e) {
+    var b = e.target.closest ? e.target.closest("button[data-menu]") : null;
+    if (!b) return;
+    setMenu(false);
+    var act = b.getAttribute("data-menu");
+    if (act === "disconnect") {
+      closed = true; closeLink();
+      showEnd("Disconnected", "Your apps are still running. Reconnect any time to pick up where you left off.");
+    } else if (act === "signout") {
+      if (!confirm("Sign out of Windows? Your apps will close and unsaved work will be lost.")) return;
+      $("title").textContent = "Signing out…"; $("detail").textContent = ""; $("actions").innerHTML = "";
+      overlay.classList.remove("hidden");
+      send({ t: "signout" });
+    } else if (act === "logout") {
+      closed = true; closeLink(); logout();
+    }
+  });
+  function fullscreenOn() { return document.fullscreenElement || document.webkitFullscreenElement; }
+  $("fullBtn").addEventListener("click", function () {
+    var el = document.documentElement;
+    if (fullscreenOn()) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    else if (el.requestFullscreen) el.requestFullscreen().catch(function () {});
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    canvas.focus();
+  });
+  document.addEventListener("fullscreenchange", function () { $("fullBtn").textContent = fullscreenOn() ? "Exit full screen" : "Full screen"; });
+
+  // ---- printing: the session's "Portal printer" saves jobs as PDFs in the shared folder ----
+  function printed(name, bytes) {
+    var url = "/files/dl/" + encodeURIComponent(name);
+    toast.innerHTML = "";
+    var title = document.createElement("div"); title.textContent = "Printed: " + name + " (" + size(bytes) + ")";
+    var acts = document.createElement("div"); acts.className = "acts";
+    var open = document.createElement("a"); open.href = url + "?inline=1"; open.target = "_blank"; open.rel = "noopener"; open.textContent = /\.pdf$/i.test(name) ? "Open to print" : "Open";
+    var dl = document.createElement("a"); dl.href = url; dl.className = "sec"; dl.setAttribute("download", name); dl.textContent = "Download";
+    acts.appendChild(open); acts.appendChild(dl);
+    toast.appendChild(title); toast.appendChild(acts);
+    toast.classList.remove("hidden");
+    clearTimeout(toastTimer); toastTimer = setTimeout(function () { toast.classList.add("hidden"); }, 20000);
+    if (!panel.classList.contains("hidden")) refresh();
+  }
+
   $("filesBtn").addEventListener("click", function () { panel.classList.toggle("hidden"); if (!panel.classList.contains("hidden")) refresh(); });
   $("closePanel").addEventListener("click", function () { panel.classList.add("hidden"); canvas.focus(); });
   $("pick").addEventListener("click", function () { $("picker").click(); });

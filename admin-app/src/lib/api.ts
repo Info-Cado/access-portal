@@ -5,6 +5,8 @@ import { invoke } from "@tauri-apps/api/core"
 
 /** A session open right now. */
 export type LiveSession = {
+  /** Identifies the connection, for disconnecting it. */
+  id: number
   app: string
   /** Unix seconds. */
   since: number

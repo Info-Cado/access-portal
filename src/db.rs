@@ -322,3 +322,9 @@ pub async fn delete_expired(pool: &SqlitePool) -> Result<()> {
     sqlx::query("DELETE FROM pending_logins WHERE expires_at <= ?").bind(now()).execute(pool).await?;
     Ok(())
 }
+
+/// End every portal sign-in of a user.
+pub async fn delete_sessions_for_user(pool: &SqlitePool, user_id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(user_id).execute(pool).await?;
+    Ok(())
+}

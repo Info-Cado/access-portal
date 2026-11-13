@@ -11,6 +11,8 @@ use serde::Serialize;
 
 #[derive(Clone, Serialize)]
 pub struct Connection {
+    /// Assigned when the connection is listed.
+    pub id: u64,
     pub user_id: i64,
     /// The app's display name.
     pub app: String,
@@ -24,9 +26,32 @@ pub struct Connection {
     pub link: &'static str,
 }
 
+/// Ends a connection from outside, with the message its user sees.
+#[derive(Default)]
+pub struct Kick {
+    notify: tokio::sync::Notify,
+    reason: Mutex<String>,
+}
+
+impl Kick {
+    pub fn kick(&self, reason: &str) {
+        *self.reason.lock().unwrap() = reason.to_string();
+        self.notify.notify_one();
+    }
+
+    /// Waits for a kick and returns its message.
+    pub async fn wait(&self) -> String {
+        self.notify.notified().await;
+        self.reason.lock().unwrap().clone()
+    }
+}
+
+pub const DISCONNECTED: &str = "Your administrator disconnected this session. Your apps are still running.";
+pub const SIGNED_OUT: &str = "Your administrator signed you out. Your apps were closed.";
+
 #[derive(Default)]
 pub struct Presence {
-    open: Mutex<HashMap<u64, Connection>>,
+    open: Mutex<HashMap<u64, (Connection, Arc<Kick>)>>,
     next: AtomicU64,
 }
 
@@ -34,6 +59,8 @@ pub struct Presence {
 pub struct Guard {
     presence: Arc<Presence>,
     id: u64,
+    /// Signalled when an administrator disconnects this connection.
+    pub kick: Arc<Kick>,
 }
 
 impl Drop for Guard {
@@ -43,17 +70,43 @@ impl Drop for Guard {
 }
 
 impl Presence {
-    pub fn enter(self: &Arc<Self>, connection: Connection) -> Guard {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.open.lock().unwrap().insert(id, connection);
-        Guard { presence: self.clone(), id }
+    pub fn enter(self: &Arc<Self>, mut connection: Connection) -> Guard {
+        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        connection.id = id;
+        let kick = Arc::new(Kick::default());
+        self.open.lock().unwrap().insert(id, (connection, kick.clone()));
+        Guard { presence: self.clone(), id, kick }
     }
 
     /// Open connections, oldest first.
     pub fn snapshot(&self) -> Vec<Connection> {
-        let mut all: Vec<Connection> = self.open.lock().unwrap().values().cloned().collect();
+        let mut all: Vec<Connection> = self.open.lock().unwrap().values().map(|(c, _)| c.clone()).collect();
         all.sort_by_key(|c| c.since);
         all
+    }
+
+    /// Disconnect one connection. False if it is already gone.
+    pub fn kick(&self, id: u64, reason: &str) -> bool {
+        match self.open.lock().unwrap().get(&id) {
+            Some((_, k)) => {
+                k.kick(reason);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Disconnect every connection of a portal user; returns how many.
+    pub fn kick_user(&self, user_id: i64, reason: &str) -> usize {
+        let open = self.open.lock().unwrap();
+        let mut n = 0;
+        for (c, k) in open.values() {
+            if c.user_id == user_id {
+                k.kick(reason);
+                n += 1;
+            }
+        }
+        n
     }
 }
 

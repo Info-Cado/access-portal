@@ -252,7 +252,8 @@ catch {
 ///
 /// - encode Windows' H.264 on the graphics card when there is one;
 /// - render sessions on the graphics card instead of in software;
-/// - let sessions run at 60 frames a second (Windows' default is 30).
+/// - let sessions run at 60 frames a second (Windows' default is 30);
+/// - skip the privacy-settings screen a new account sees at its first sign-in.
 ///
 /// Already-open sessions keep their old setup until their user signs out; the
 /// frame rate applies once the Remote Desktop service restarts (a reboot).
@@ -264,6 +265,8 @@ pub fn tune_remote_desktop() {
             (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "AVCHardwareEncodePreferred", 1u32),
             (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "bEnumerateHWBeforeSW", 1),
             (r"HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations", "DWMFRAMEINTERVAL", 15),
+            // New accounts would otherwise start with Windows' privacy-settings screen.
+            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\OOBE", "DisablePrivacyExperience", 1),
         ];
         for (key, name, value) in settings {
             let current = std::process::Command::new("reg")
@@ -287,5 +290,62 @@ pub fn tune_remote_desktop() {
                 tracing::warn!("could not set {name} (the portal needs administrator rights for this)");
             }
         }
+    }
+}
+
+/// Sign a Windows account out of every session it has on this machine: its
+/// apps close (unsaved work is lost). Returns how many sessions were signed out.
+pub fn sign_out_blocking(win_username: &str) -> usize {
+    #[cfg(windows)]
+    {
+        use base64::Engine;
+        use std::os::windows::process::CommandExt;
+        const SCRIPT: &str = r#"
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices; using System.Collections.Generic;
+public static class ApWts {
+  [StructLayout(LayoutKind.Sequential)] struct INFO { public int SessionId; [MarshalAs(UnmanagedType.LPWStr)] public string Name; public int State; }
+  [DllImport("wtsapi32.dll")] static extern bool WTSEnumerateSessionsW(IntPtr h, int r, int v, out IntPtr p, out int c);
+  [DllImport("wtsapi32.dll", CharSet=CharSet.Unicode)] static extern bool WTSQuerySessionInformationW(IntPtr h, int id, int cls, out IntPtr buf, out int len);
+  [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr p);
+  [DllImport("wtsapi32.dll")] public static extern bool WTSLogoffSession(IntPtr h, int id, bool wait);
+  public static List<int> SessionsOf(string user) {
+    var r = new List<int>(); IntPtr p; int c;
+    if (!WTSEnumerateSessionsW(IntPtr.Zero, 0, 1, out p, out c)) return r;
+    int sz = Marshal.SizeOf(typeof(INFO));
+    for (int i = 0; i < c; i++) {
+      var s = (INFO)Marshal.PtrToStructure(new IntPtr(p.ToInt64() + i * sz), typeof(INFO));
+      IntPtr b; int l;
+      if (WTSQuerySessionInformationW(IntPtr.Zero, s.SessionId, 5, out b, out l)) {
+        if (string.Equals(Marshal.PtrToStringUni(b), user, StringComparison.OrdinalIgnoreCase)) r.Add(s.SessionId);
+        WTSFreeMemory(b);
+      }
+    }
+    WTSFreeMemory(p); return r;
+  }
+}
+'@
+$n = 0
+foreach ($id in [ApWts]::SessionsOf($env:AP_WINUSER)) { if ([ApWts]::WTSLogoffSession([IntPtr]::Zero, $id, $true)) { $n++ } }
+$n
+"#;
+        let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encoded])
+            .env("AP_WINUSER", win_username)
+            .creation_flags(0x0800_0000)
+            .output();
+        let n = out
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().lines().last().and_then(|l| l.trim().parse().ok()))
+            .unwrap_or(0);
+        tracing::info!("signed {win_username} out of Windows ({n} session(s))");
+        n
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = win_username;
+        0
     }
 }

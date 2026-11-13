@@ -267,19 +267,56 @@ function UserDetails({
                   Connected now
                 </FieldLegend>
                 <div className="flex flex-col gap-2">
-                  {user.sessions.map((s, i) => (
-                    <div key={i} className="rounded-md border px-3 py-2 text-sm">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="font-medium">{s.app}</span>
-                        <span className="text-xs text-muted-foreground">for {since(s.since).replace(/^just now$/, "under a minute")}</span>
+                  {user.sessions.map((s) => (
+                    <div key={s.id} className="flex items-center gap-3 rounded-md border px-3 py-2 text-sm">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-medium">{s.app}</span>
+                          <span className="text-xs text-muted-foreground">for {since(s.since).replace(/^just now$/, "under a minute")}</span>
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          {s.device} · from {s.address === "local" ? "this computer" : s.address} ·{" "}
+                          {s.link === "direct" ? "direct link" : "through the portal"}
+                        </div>
                       </div>
-                      <div className="text-xs text-muted-foreground">
-                        {s.device} · from {s.address === "local" ? "this computer" : s.address} ·{" "}
-                        {s.link === "direct" ? "direct link" : "through the portal"}
-                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() =>
+                          change(() => api("POST", `/api/admin/connections/${s.id}/disconnect`), "Disconnected")
+                        }
+                      >
+                        Disconnect
+                      </Button>
                     </div>
                   ))}
                 </div>
+                <FieldDescription>
+                  Disconnecting leaves their apps running; they can connect again. To close their apps and
+                  stop them reconnecting with their current sign-in, sign them out instead.
+                </FieldDescription>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  className="self-start"
+                  disabled={busy}
+                  onClick={() =>
+                    setConfirmation({
+                      title: `Sign ${user.username} out?`,
+                      description:
+                        "This disconnects them, ends their portal sign-in and signs their Windows account out. Their apps close and unsaved work is lost.",
+                      action: "Sign out",
+                      run: async () => {
+                        await api("POST", `${base}/sign-out`)
+                        await reload()
+                        toast.success(`${user.username} signed out`)
+                      },
+                    })
+                  }
+                >
+                  Sign out of Windows
+                </Button>
               </FieldSet>
             </>
           )}

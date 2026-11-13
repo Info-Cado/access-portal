@@ -31,6 +31,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/users/:id/totp", put(set_totp))
         .route("/api/admin/users/:id/desktop", get(desktop_mode).put(set_desktop_mode))
         .route("/api/admin/users/:id/windows-account", post(create_windows_account))
+        .route("/api/admin/users/:id/sign-out", post(sign_out_user))
+        .route("/api/admin/connections/:id/disconnect", post(disconnect))
         .route("/api/admin/apps", post(create_app))
         .route("/api/admin/apps/:id", delete(delete_app))
 }
@@ -386,6 +388,28 @@ async fn set_desktop_mode(
         user.username
     );
     Ok(Json(json!({ "mode": mode })))
+}
+
+/// Disconnect one open session. The user's apps keep running in Windows and the
+/// user can connect again.
+async fn disconnect(State(state): State<AppState>, _: Admin, Path(id): Path<u64>) -> ApiResult {
+    if !state.presence.kick(id, crate::presence::DISCONNECTED) {
+        return Err(fail(StatusCode::NOT_FOUND, "That session already ended."));
+    }
+    Ok(Json(json!({})))
+}
+
+/// Sign a user out completely: disconnect their sessions, end their portal
+/// sign-ins and sign their Windows account out (their apps close).
+async fn sign_out_user(State(state): State<AppState>, _: Admin, Path(id): Path<i64>) -> ApiResult {
+    let user = existing_user(&state, id).await?;
+    let disconnected = state.presence.kick_user(id, crate::presence::SIGNED_OUT);
+    db::delete_sessions_for_user(&state.pool, id).await?;
+    // Give the sessions a moment to close before Windows signs the account out.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let win = user.win_username.clone();
+    let windows_sessions = tokio::task::spawn_blocking(move || host::sign_out_blocking(&win)).await.unwrap_or(0);
+    Ok(Json(json!({ "disconnected": disconnected, "windows_sessions": windows_sessions })))
 }
 
 // ---------------------------------------------------------------------------

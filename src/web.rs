@@ -457,7 +457,9 @@ async fn rdp_socket(
     let connection = connection_info(&state, &user, &key, &headers, "relayed").await;
     let presence = state.presence.clone();
     Ok(upgrade.on_upgrade(move |socket| async move {
-        let _listed = presence.enter(connection);
+        let listed = presence.enter(connection);
+        let mut target = target;
+        target.kick = Some(listed.kick.clone());
         rdp::run(target, Box::new(transport::WsTransport(socket))).await
     }))
 }
@@ -495,7 +497,9 @@ async fn rtc_offer(
     }];
     let on_open: transport::OnOpen = Box::new(move |link| {
         tokio::spawn(async move {
-            let _listed = presence.enter(connection);
+            let listed = presence.enter(connection);
+            let mut target = target;
+            target.kick = Some(listed.kick.clone());
             rdp::run(target, Box::new(link)).await
         });
     });
@@ -523,6 +527,7 @@ async fn connection_info(
         .map(|a| a.name)
         .unwrap_or_else(|| key.to_string());
     crate::presence::Connection {
+        id: 0,
         user_id: user.id,
         app,
         since: db::now(),
@@ -586,6 +591,7 @@ async fn session_target(
         files_dir: user_files_dir(state, user).await.ok(),
         // The browser advertises it can decode Windows' H.264 (High profile) with ?vd=2.
         egfx: state.config.egfx && viewport.vd == Some(2),
+        kick: None,
     };
     Ok(Ok(target))
 }
@@ -770,10 +776,17 @@ async fn files_upload(
     Ok(Json(serde_json::json!({"name": final_name, "size": total})).into_response())
 }
 
+#[derive(Deserialize)]
+struct DownloadQuery {
+    /// 1 shows a PDF in the browser (to print it) instead of downloading it.
+    inline: Option<u8>,
+}
+
 async fn files_download(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(name): Path<String>,
+    Query(query): Query<DownloadQuery>,
 ) -> Result<Response, AppError> {
     // Only a plain file name that survives sanitising unchanged is accepted,
     // so nothing outside the user's folder can be named.
@@ -798,10 +811,14 @@ async fn files_download(
             }
         })
         .collect();
+    let show_pdf = query.inline == Some(1) && name.to_ascii_lowercase().ends_with(".pdf");
     let response = Response::builder()
-        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_TYPE, if show_pdf { "application/pdf" } else { "application/octet-stream" })
         .header(header::CONTENT_LENGTH, meta.len())
-        .header(header::CONTENT_DISPOSITION, format!("attachment; filename*=UTF-8''{encoded}"))
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("{}; filename*=UTF-8''{encoded}", if show_pdf { "inline" } else { "attachment" }),
+        )
         .header("X-Content-Type-Options", "nosniff")
         .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
         .map_err(|e| anyhow::anyhow!("building download response: {e}"))?;

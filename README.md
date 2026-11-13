@@ -148,10 +148,11 @@ Channels used on the RDP connection:
 | display control | resize the session with the browser window (only with `SESSION_SIZE=auto`) |
 | clipboard | text, both directions |
 | drive redirection | the per-user transfer folder, as `\\tsclient\P` (Windows portal hosts only) |
+| printer redirection | "Portal printer" in every print dialog (`src/print.rs`) |
 | audio | joined silently; Windows only starts drive redirection when it is present |
 
-Not supported yet: sound, printing, copying files through the clipboard, and
-clipboard content other than text.
+Not supported yet: sound, copying files through the clipboard, and clipboard
+content other than text.
 
 ## Prerequisites
 
@@ -205,8 +206,38 @@ user's Windows account on this machine: off, the account's shell is the Miracle
 launcher and Run, the command prompt, PowerShell, Task Manager, the registry
 editor, Control Panel and drive C: are blocked; on, exactly those settings are
 removed and sessions get the normal desktop. Windows administrator accounts are
-never limited. A change applies from the user's next session. The app does not
-create Windows accounts.
+never limited. A change applies from the user's next session. New users get a
+Windows account of their own by default (a standard account in the "Portal RDP
+Users" group); deleting a user leaves the Windows account unless you tick the
+box.
+
+**Connected now** in a user's panel lists their open sessions (app, device,
+address, how long). For each one:
+
+- **Disconnect** ends that browser session. The user's Windows session and apps
+  keep running, and the page tells them their administrator disconnected them
+  (it does not reconnect by itself).
+- **Sign out of Windows** (for the user as a whole) disconnects every session,
+  ends their portal sign-in and signs their Windows account out, which closes
+  their apps. Unsaved work is lost, so it asks first.
+
+## The session page
+
+The buttons at the top right of a session:
+
+- **Files** — the transfer folder (upload, download). The dot shows the link
+  state.
+- **Full screen**.
+- **Menu** — *Disconnect* (leave the apps running and come back later),
+  *Sign out of Windows* (close the apps and end the Windows session) and
+  *Sign out of the portal*.
+
+**Printing.** Every session has a printer called **Portal printer**. Print to it
+from any app and the job is saved as a PDF in the user's transfer folder
+(`Printed <date time>.pdf`); the page shows a notice with **Open to print**
+(opens the PDF in a new tab, where the browser's print button sends it to the
+user's own printer) and **Download**. The host needs Windows' built-in
+"Microsoft Print To PDF" driver, which Windows 11 has.
 
 The admin calls (`src/api.rs`) are never served on the network: the app makes
 them in-process (`Portal::admin` in `src/lib.rs`).
@@ -312,7 +343,9 @@ get around per-user Windows licensing.
 | `src/session.html` | the browser page for a session |
 | `src/web.rs` | router, auth extractors, pages, handlers, file transfer endpoints |
 | `src/api.rs` | admin API, called in-process by the app |
-| `src/host.rs` | Full desktop / Miracle-only switch for a Windows account |
+| `src/host.rs` | Windows accounts: create/delete, Full desktop / Miracle-only switch, sign-out; host tuning |
+| `src/presence.rs` | who is connected now; disconnecting a session from the app |
+| `src/print.rs` | the "Portal printer": print jobs saved as PDFs in the user's folder |
 | `provision/` | the sign-up service (Cloudflare Worker) and its deploy script |
 | `admin-app/` | the Access Portal app (Tauri): `src-tauri/` starts the portal, tray icon; `src/` the window's page (React + shadcn/ui) |
 | `migrations/` | SQLite schema |
