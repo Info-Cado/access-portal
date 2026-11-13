@@ -151,7 +151,6 @@ function UserDetails({
                     />
                     <FieldLabel htmlFor={`app-${app.id}`} className="font-normal">
                       {app.name}
-                      <span className="text-muted-foreground">{app.hostname}</span>
                     </FieldLabel>
                   </Field>
                 ))}

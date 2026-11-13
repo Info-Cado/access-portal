@@ -176,10 +176,9 @@ async fn dashboard(
     }
     for app in &apps {
         list.push_str(&format!(
-            "<div class=\"card app\"><div><strong>{}</strong><div class=\"muted\">{}</div></div>\
+            "<div class=\"card app\"><div><strong>{}</strong></div>\
              <a class=\"btn\" href=\"/connect/{}\" target=\"_blank\" rel=\"noopener\">Open</a></div>",
             esc(&app.name),
-            esc(&app.hostname),
             esc(&app.key),
         ));
     }
