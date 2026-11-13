@@ -37,6 +37,8 @@ use tower_http::trace::TraceLayer;
 pub struct AppState {
     pub pool: sqlx::SqlitePool,
     pub config: Arc<config::Config>,
+    /// Failed sign-ins per network address.
+    pub limiter: Arc<web::LoginLimiter>,
 }
 
 /// A running portal.
@@ -59,6 +61,7 @@ pub const SETTINGS_FILE: &str = "portal.env";
 pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating {}", data_dir.display()))?;
+    restrict_access(data_dir);
     load_settings(data_dir)?;
 
     let config = config::Config::from_env()?;
@@ -82,7 +85,20 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
     let state = AppState {
         pool,
         config: Arc::new(config),
+        limiter: Arc::new(web::LoginLimiter::new()),
     };
+
+    // Forget expired sign-ins once an hour.
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        let mut hourly = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            hourly.tick().await;
+            if let Err(e) = db::delete_expired(&pool).await {
+                tracing::warn!("clearing expired sign-ins: {e:#}");
+            }
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(&address)
         .await
@@ -132,6 +148,35 @@ impl Portal {
         let value = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| json!({ "error": String::from_utf8_lossy(&bytes).trim().to_string() }));
         (status, value)
+    }
+}
+
+/// Only administrators, SYSTEM and the account running the portal may open the
+/// data folder. It holds the secret that decrypts every stored Windows password,
+/// and portal users have Windows accounts on this same machine.
+fn restrict_access(data_dir: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let me = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+            (Ok(d), Ok(u)) => format!("{d}\\{u}:(OI)(CI)F"),
+            _ => String::new(),
+        };
+        let mut args = vec![
+            data_dir.display().to_string(),
+            "/inheritance:r".into(),
+            "/grant:r".into(),
+            "*S-1-5-32-544:(OI)(CI)F".into(), // Administrators
+            "*S-1-5-18:(OI)(CI)F".into(),     // SYSTEM
+        ];
+        if !me.is_empty() {
+            args.push(me);
+        }
+        match std::process::Command::new("icacls").args(&args).creation_flags(0x0800_0000).output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => tracing::warn!("restricting {}: {}", data_dir.display(), String::from_utf8_lossy(&out.stdout).trim()),
+            Err(e) => tracing::warn!("restricting {}: {e}", data_dir.display()),
+        }
     }
 }
 

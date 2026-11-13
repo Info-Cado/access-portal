@@ -445,6 +445,9 @@ async fn session(
     // screen changes are sent from the `flush_at` branch as they happen.
     let mut ticker = tokio::time::interval(Duration::from_millis(50));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A still screen sends nothing; ping the browser so proxies keep the link open.
+    const KEEPALIVE: Duration = Duration::from_secs(20);
+    let mut last_keepalive = std::time::Instant::now();
 
     // Send what changed. Busy areas go out as H.264 (the video layer); still
     // areas go out as tiles, skipping whatever the video layer is covering.
@@ -614,6 +617,10 @@ async fn session(
             }
             _ = ticker.tick() => {
                 send_pending!();
+                if last_keepalive.elapsed() >= KEEPALIVE {
+                    io.keepalive().await?;
+                    last_keepalive = std::time::Instant::now();
+                }
                 // File operations on the shared drive finish on worker threads;
                 // collect their replies for the host.
                 #[cfg(windows)]

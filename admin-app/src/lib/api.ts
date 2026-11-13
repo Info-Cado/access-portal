@@ -30,9 +30,16 @@ export type PortalState = {
   apps: PortalApp[]
 }
 
+/** The public link (a Cloudflare Tunnel to name.<domain>). */
+export type PublicLink = {
+  state: "unavailable" | "setting-up" | "connecting" | "online" | "error"
+  url?: string | null
+  error?: string | null
+}
+
 export type ServerStatus =
-  | { running: true; address: string; data_dir: string }
-  | { running: false; error: string; data_dir: string }
+  | { running: true; address: string; data_dir: string; public: PublicLink }
+  | { running: false; error: string; data_dir: string; public: PublicLink }
 
 /** Authenticator setup details; the portal hands these out once. */
 export type TotpSetup = { secret: string; uri: string }

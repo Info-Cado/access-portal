@@ -25,13 +25,35 @@ static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// The account's mode: `"app"`, `"full"`, or `"missing"` when no local Windows
 /// account has that name.
 pub async fn desktop_mode(win_username: &str) -> Result<String> {
-    run("read", win_username).await
+    run("read", win_username, None).await
 }
 
 /// Switch the account to a full desktop (`true`) or to Miracle only (`false`).
 /// Returns the mode now in effect.
 pub async fn set_desktop_mode(win_username: &str, full: bool) -> Result<String> {
-    run(if full { "full" } else { "app" }, win_username).await
+    run(if full { "full" } else { "app" }, win_username, None).await
+}
+
+/// Create a local Windows account for a portal user: a standard user in the
+/// "Portal RDP Users" group, password never expires, limited to Miracle.
+pub async fn create_account(win_username: &str, password: &str) -> Result<()> {
+    check_account_name(win_username)?;
+    run("create", win_username, Some(password)).await.map(|_| ())
+}
+
+/// Delete a Windows account the portal manages (a member of "Portal RDP Users",
+/// never an administrator) and its profile folder.
+pub async fn delete_account(win_username: &str) -> Result<()> {
+    run("delete", win_username, None).await.map(|_| ())
+}
+
+/// Windows' rules for local account names.
+pub fn check_account_name(name: &str) -> Result<()> {
+    let bad = |c: char| c.is_control() || "\"/\\[]:;|=,+*?<>@".contains(c);
+    if name.is_empty() || name.chars().count() > 20 || name.ends_with('.') || name.trim() != name || name.chars().any(bad) {
+        bail!("A Windows account name has 1–20 characters, no spaces at the ends, and none of \" / \\ [ ] : ; | = , + * ? < > @");
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -42,7 +64,7 @@ struct ScriptResult {
 }
 
 #[cfg(windows)]
-async fn run(action: &str, win_username: &str) -> Result<String> {
+async fn run(action: &str, win_username: &str, password: Option<&str>) -> Result<String> {
     use base64::Engine;
     use std::time::Duration;
 
@@ -60,6 +82,7 @@ async fn run(action: &str, win_username: &str) -> Result<String> {
         .arg(encoded)
         .env("AP_WINUSER", win_username)
         .env("AP_ACTION", action)
+        .env("AP_PASSWORD", password.unwrap_or(""))
         .creation_flags(CREATE_NO_WINDOW)
         .kill_on_drop(true)
         .output();
@@ -85,7 +108,7 @@ async fn run(action: &str, win_username: &str) -> Result<String> {
 }
 
 #[cfg(not(windows))]
-async fn run(_action: &str, _win_username: &str) -> Result<String> {
+async fn run(_action: &str, _win_username: &str, _password: Option<&str>) -> Result<String> {
     bail!("Windows accounts can only be changed when the portal runs on Windows.")
 }
 
@@ -106,23 +129,50 @@ $system   = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'
 $cmdPol   = 'Software\Policies\Microsoft\Windows\System'
 $blocked  = 'cmd.exe','powershell.exe','pwsh.exe','powershell_ise.exe','regedit.exe','mmc.exe','taskmgr.exe','wt.exe'
 
+function GroupSids($group) {
+  @(([ADSI]"WinNT://./$group,group").psbase.Invoke('Members') | ForEach-Object {
+    (New-Object Security.Principal.SecurityIdentifier ([byte[]]$_.GetType().InvokeMember('objectSid', 'GetProperty', $null, $_, $null)), 0).Value
+  })
+}
+$portalGroup = 'Portal RDP Users'
+
 try {
+  $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+  $elevated = $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
   $user = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+
+  if ($action -eq 'create') {
+    if (-not $elevated) { throw 'The portal is not running as an administrator, so it cannot create Windows accounts.' }
+    if ($user) { throw "A Windows account named $name already exists on this computer." }
+    if (-not (Get-LocalGroup -Name $portalGroup -ErrorAction SilentlyContinue)) {
+      throw "This computer has no '$portalGroup' group yet, so a new account could not sign in over Remote Desktop."
+    }
+    $secure = ConvertTo-SecureString $env:AP_PASSWORD -AsPlainText -Force
+    $user = New-LocalUser -Name $name -Password $secure -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -Description 'access-portal RDP user' -ErrorAction Stop
+    Add-LocalGroupMember -Group $portalGroup -Member $name -ErrorAction Stop
+    $action = 'app'   # new accounts start limited to Miracle
+  }
+
   if (-not $user) { Finish @{ ok = $true; mode = 'missing' } }
   $sid = $user.SID.Value
-
-  $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-  if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  if (-not $elevated) {
     throw 'The portal is not running as an administrator, so it cannot read or change Windows accounts.'
+  }
+  $adminGroup = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+  $isAdmin = (GroupSids $adminGroup) -contains $sid
+
+  if ($action -eq 'delete') {
+    if ($isAdmin) { throw "$name is a Windows administrator account; the portal never deletes those." }
+    if (-not ((GroupSids $portalGroup) -contains $sid)) { throw "$name isn't in the '$portalGroup' group, so the portal doesn't manage it and won't delete it." }
+    Remove-LocalUser -SID $sid -ErrorAction Stop
+    # The profile folder too; skipped while the account is still signed in.
+    Get-CimInstance Win32_UserProfile | Where-Object SID -eq $sid | Remove-CimInstance -ErrorAction SilentlyContinue
+    Finish @{ ok = $true; mode = 'missing' }
   }
 
   if ($action -eq 'app') {
     # Never lock an administrator account into one app.
-    $adminGroup = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
-    $members = @(([ADSI]"WinNT://./$adminGroup,group").psbase.Invoke('Members') | ForEach-Object {
-      (New-Object Security.Principal.SecurityIdentifier ([byte[]]$_.GetType().InvokeMember('objectSid', 'GetProperty', $null, $_, $null)), 0).Value
-    })
-    if ($members -contains $sid) { throw "$name is a Windows administrator account; it can't be limited to one app." }
+    if ($isAdmin) { throw "$name is a Windows administrator account; it can't be limited to one app." }
     if (-not (Test-Path -LiteralPath $launcher)) { throw "The Miracle launcher is missing ($launcher)." }
   }
 

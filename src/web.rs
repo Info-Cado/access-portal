@@ -32,7 +32,80 @@ pub fn router(state: AppState) -> Router {
         .route("/files", get(files_list))
         .route("/files/upload", post(files_upload).layer(DefaultBodyLimit::disable()))
         .route("/files/dl/:name", get(files_download))
+        .layer(axum::middleware::from_fn(refuse_cross_site))
         .with_state(state)
+}
+
+/// Browsers send `Origin` with every POST; refuse any that names another site,
+/// so a page elsewhere cannot submit forms (sign in, sign out, uploads) into the
+/// portal with the user's cookies.
+async fn refuse_cross_site(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if request.method() != axum::http::Method::GET
+        && request.method() != axum::http::Method::HEAD
+        && !same_origin(request.headers())
+    {
+        return (StatusCode::FORBIDDEN, "Cross-site request refused.").into_response();
+    }
+    next.run(request).await
+}
+
+// ---------------------------------------------------------------------------
+// Sign-in limits per network address
+// ---------------------------------------------------------------------------
+
+/// Counts failed sign-ins per client address, on top of the per-account
+/// lockout, so one address cannot try passwords across many accounts.
+pub struct LoginLimiter {
+    failures: std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>,
+}
+
+const ADDRESS_MAX_FAILURES: u32 = 20;
+const ADDRESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+impl LoginLimiter {
+    pub fn new() -> Self {
+        Self { failures: std::sync::Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// True when this address has failed too often recently.
+    fn blocked(&self, address: &str) -> bool {
+        let mut map = self.failures.lock().unwrap();
+        match map.get(address) {
+            Some((_, since)) if since.elapsed() > ADDRESS_WINDOW => {
+                map.remove(address);
+                false
+            }
+            Some((count, _)) => *count >= ADDRESS_MAX_FAILURES,
+            None => false,
+        }
+    }
+
+    fn failed(&self, address: &str) {
+        let mut map = self.failures.lock().unwrap();
+        map.retain(|_, (_, since)| since.elapsed() <= ADDRESS_WINDOW);
+        let entry = map.entry(address.to_string()).or_insert((0, std::time::Instant::now()));
+        entry.0 += 1;
+    }
+}
+
+/// The browser's address as reported by the HTTPS front end in front of the
+/// portal (Cloudflare, then any other proxy); the portal itself only listens
+/// on this machine.
+fn client_address(headers: &HeaderMap) -> String {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+    header("cf-connecting-ip")
+        .or_else(|| header("x-forwarded-for").and_then(|v| v.split(',').next()).map(str::trim))
+        .filter(|v| !v.is_empty())
+        .unwrap_or("local")
+        .to_string()
+}
+
+/// True when the browser reached the portal over HTTPS through a front end.
+fn behind_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("https"))
 }
 
 // ---------------------------------------------------------------------------
@@ -103,21 +176,14 @@ fn page(title: &str, body: &str) -> Html<String> {
     ))
 }
 
-pub(crate) fn session_cookie(state: &AppState, token: String) -> Cookie<'static> {
-    Cookie::build(("session", token))
+/// Cookies are marked Secure (HTTPS only) whenever the browser came in over
+/// HTTPS, or always with `COOKIE_SECURE=true`.
+fn cookie(state: &AppState, headers: &HeaderMap, name: &'static str, token: String) -> Cookie<'static> {
+    Cookie::build((name, token))
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
-        .secure(state.config.cookie_secure)
-        .build()
-}
-
-fn pending_cookie(state: &AppState, token: String) -> Cookie<'static> {
-    Cookie::build(("pending", token))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .secure(state.config.cookie_secure)
+        .secure(state.config.cookie_secure || behind_https(headers))
         .build()
 }
 
@@ -197,12 +263,18 @@ fn login_page(error: Option<&str>) -> Html<String> {
 async fn login_submit(
     State(state): State<AppState>,
     jar: CookieJar,
+    headers: HeaderMap,
     Form(input): Form<LoginInput>,
 ) -> Result<Response, AppError> {
+    let address = client_address(&headers);
+    if state.limiter.blocked(&address) {
+        return Ok(login_page(Some("Too many failed sign-ins from your network. Try again in 15 minutes.")).into_response());
+    }
     let user = db::user_by_username(&state.pool, input.username.trim()).await?;
 
     let Some(user) = user else {
         // Same message whether or not the user exists.
+        state.limiter.failed(&address);
         return Ok(login_page(Some("Invalid username or password.")).into_response());
     };
 
@@ -216,6 +288,7 @@ async fn login_submit(
     }
 
     if !auth::verify_password(&input.password, &user.password_hash) {
+        state.limiter.failed(&address);
         db::note_failed_login(&state.pool, &state.config, user.id).await?;
         return Ok(login_page(Some("Invalid username or password.")).into_response());
     }
@@ -224,12 +297,12 @@ async fn login_submit(
 
     if user.totp_enabled() {
         let token = db::create_pending(&state.pool, user.id).await?;
-        let jar = jar.add(pending_cookie(&state, token));
+        let jar = jar.add(cookie(&state, &headers, "pending", token));
         return Ok((jar, Redirect::to("/login/totp")).into_response());
     }
 
     let token = db::create_session(&state.pool, &state.config, user.id).await?;
-    let jar = jar.add(session_cookie(&state, token));
+    let jar = jar.add(cookie(&state, &headers, "session", token));
     Ok((jar, Redirect::to("/")).into_response())
 }
 
@@ -274,8 +347,13 @@ fn totp_page(error: Option<&str>) -> Html<String> {
 async fn totp_submit(
     State(state): State<AppState>,
     jar: CookieJar,
+    headers: HeaderMap,
     Form(input): Form<TotpInput>,
 ) -> Result<Response, AppError> {
+    let address = client_address(&headers);
+    if state.limiter.blocked(&address) {
+        return Ok(totp_page(Some("Too many failed sign-ins from your network. Try again in 15 minutes.")).into_response());
+    }
     let Some(token) = jar.get("pending").map(|c| c.value().to_string()) else {
         return Ok(Redirect::to("/login").into_response());
     };
@@ -288,6 +366,7 @@ async fn totp_submit(
 
     let secret = user.totp_secret.clone().unwrap_or_default();
     if !auth::verify_totp(&secret, &input.code) {
+        state.limiter.failed(&address);
         return Ok(totp_page(Some("Incorrect code. Try again.")).into_response());
     }
 
@@ -295,7 +374,7 @@ async fn totp_submit(
     let session = db::create_session(&state.pool, &state.config, user.id).await?;
     let jar = jar
         .remove(removal_cookie("pending"))
-        .add(session_cookie(&state, session));
+        .add(cookie(&state, &headers, "session", session));
     Ok((jar, Redirect::to("/")).into_response())
 }
 
@@ -479,11 +558,15 @@ async fn session_target(
 
 /// True unless the request names an `Origin` other than the portal itself.
 fn same_origin(headers: &HeaderMap) -> bool {
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
-    match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        Some(origin) => origin.split("://").nth(1).unwrap_or("") == host,
-        None => true,
-    }
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let origin_host = origin.split("://").nth(1).unwrap_or("");
+    // The Host the portal sees, or the public one a front end reports.
+    [header::HOST.as_str(), "x-forwarded-host"]
+        .iter()
+        .filter_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
+        .any(|host| !host.is_empty() && host.eq_ignore_ascii_case(origin_host))
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +617,13 @@ async fn files_list(
     while let Some(entry) = entries.next_entry().await? {
         let Ok(meta) = entry.metadata().await else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".upload-") || name.ends_with(".uploading") {
+            let abandoned = meta.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > STALE_UPLOAD);
+            if abandoned {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+            continue;
+        }
         if !meta.is_file() || name.starts_with('.') {
             continue;
         }
@@ -556,23 +646,80 @@ async fn files_list(
 #[derive(Deserialize)]
 struct UploadQuery {
     name: String,
+    /// Upload id chosen by the browser; the same for every chunk of one file.
+    /// Absent for a file sent in one request.
+    id: Option<String>,
+    /// Where this chunk starts in the file.
+    #[serde(default)]
+    offset: u64,
+    /// 1 on the file's last chunk.
+    #[serde(default)]
+    last: Option<u8>,
 }
 
-/// Receive one file from the browser (raw request body) into the user's folder.
+/// Largest single chunk accepted. Kept well under the 100 MB request limit of
+/// Cloudflare's free plan, which sits in front of public portals.
+const MAX_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+/// Half-sent uploads older than this are removed.
+const STALE_UPLOAD: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Receive a file from the browser into the user's folder, in one request or in
+/// chunks (`id`, `offset`, `last=1` on the final one). Chunks are appended to a
+/// hidden `.upload-<id>` file that only becomes visible once complete.
 async fn files_upload(
     State(state): State<AppState>,
     CurrentUser(user): CurrentUser,
     Query(query): Query<UploadQuery>,
-    headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    if !same_origin(&headers) {
-        return Ok(StatusCode::FORBIDDEN.into_response());
-    }
     let Some(name) = safe_file_name(&query.name) else {
         return Ok((StatusCode::BAD_REQUEST, "That file name can't be used.").into_response());
     };
+    let single = query.id.is_none();
+    let id = match &query.id {
+        Some(id) if (8..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit()) => id.clone(),
+        Some(_) => return Ok((StatusCode::BAD_REQUEST, "Bad upload id.").into_response()),
+        None => auth::random_token(),
+    };
+    let last = single || query.last == Some(1);
     let dir = user_files_dir(&state, &user).await?;
+    let partial = dir.join(format!(".upload-{id}"));
+
+    // A chunk must continue exactly where the file got to.
+    let have = match tokio::fs::metadata(&partial).await {
+        Ok(meta) => meta.len(),
+        Err(_) => 0,
+    };
+    if query.offset != have {
+        return Ok((StatusCode::CONFLICT, Json(serde_json::json!({"error": "out of order", "have": have}))).into_response());
+    }
+    let mut file = tokio::fs::OpenOptions::new().create(true).append(true).open(&partial).await?;
+
+    let chunk_limit = if single { state.config.max_upload_bytes } else { MAX_CHUNK_BYTES };
+    let mut stream = body.into_data_stream();
+    let mut received: u64 = 0;
+    while let Some(piece) = stream.next().await {
+        let Ok(piece) = piece else {
+            drop(file);
+            if single {
+                let _ = tokio::fs::remove_file(&partial).await;
+            }
+            return Ok((StatusCode::BAD_REQUEST, "The upload was interrupted.").into_response());
+        };
+        received += piece.len() as u64;
+        if received > chunk_limit || have + received > state.config.max_upload_bytes {
+            drop(file);
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Ok((StatusCode::PAYLOAD_TOO_LARGE, "That file is too large.").into_response());
+        }
+        file.write_all(&piece).await?;
+    }
+    file.flush().await?;
+    drop(file);
+    let total = have + received;
+    if !last {
+        return Ok(Json(serde_json::json!({"have": total})).into_response());
+    }
 
     // Never overwrite: "report.pdf" becomes "report (1).pdf" and so on.
     let (stem, ext) = match name.rsplit_once('.') {
@@ -585,30 +732,7 @@ async fn files_upload(
         final_name = format!("{stem} ({n}){ext}");
         n += 1;
     }
-
-    // Write under a dot-name first so a half-sent file is never listed.
-    let partial = dir.join(format!(".{final_name}.uploading"));
-    let mut file = tokio::fs::File::create(&partial).await?;
-    let mut stream = body.into_data_stream();
-    let mut total: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else {
-            drop(file);
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Ok((StatusCode::BAD_REQUEST, "The upload was interrupted.").into_response());
-        };
-        total += chunk.len() as u64;
-        if total > state.config.max_upload_bytes {
-            drop(file);
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Ok((StatusCode::PAYLOAD_TOO_LARGE, "That file is too large.").into_response());
-        }
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
-    drop(file);
     tokio::fs::rename(&partial, dir.join(&final_name)).await?;
-
     Ok(Json(serde_json::json!({"name": final_name, "size": total})).into_response())
 }
 

@@ -6,13 +6,15 @@
 //! tray icon. The admin panel talks to the portal in-process, so it exists only
 //! on this computer and cannot be reached over the network.
 
+mod tunnel;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 /// Started from Windows sign-in: stay in the tray instead of opening a window.
@@ -48,13 +50,14 @@ fn start_logging(dir: &std::path::Path) {
         .try_init();
 }
 
-/// Whether the portal is running, where, and where its files are.
+/// Whether the portal is running, where, where its files are, and the public link.
 #[tauri::command]
-fn status(server: State<'_, Server>) -> Value {
+fn status(server: State<'_, Server>, tunnel: State<'_, Option<tunnel::Tunnel>>) -> Value {
     let dir = data_dir().display().to_string();
+    let public = tunnel.inner().as_ref().map(|t| t.status().to_json()).unwrap_or(json!({ "state": "unavailable" }));
     match server.inner() {
-        Server::Running(p) => json!({ "running": true, "address": p.address, "data_dir": dir }),
-        Server::Failed(e) => json!({ "running": false, "error": e, "data_dir": dir }),
+        Server::Running(p) => json!({ "running": true, "address": p.address, "data_dir": dir, "public": public }),
+        Server::Failed(e) => json!({ "running": false, "error": e, "data_dir": dir, "public": public }),
     }
 }
 
@@ -129,6 +132,7 @@ pub fn run() {
         // would fight over the portal's port).
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![HIDDEN_ARG])))
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let dir = data_dir();
             start_logging(&dir);
@@ -144,7 +148,18 @@ pub fn run() {
                 Server::Running(p) => format!("Access Portal — running on {}", p.address),
                 Server::Failed(_) => "Access Portal — not running".to_string(),
             };
+
+            // The public link, once the portal is up.
+            let public = match &server {
+                Server::Running(p) => {
+                    let port = p.address.rsplit(':').next().and_then(|v| v.parse().ok()).unwrap_or(8088);
+                    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from)).unwrap_or_default();
+                    Some(tunnel::start(dir.clone(), port, exe_dir))
+                }
+                Server::Failed(_) => None,
+            };
             app.manage(server);
+            app.manage(public);
 
             // Start with Windows by default, once; after that the tray setting
             // rules. While it is on, re-register on every start so the entry
@@ -174,6 +189,14 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![status, request])
-        .run(tauri::generate_context!())
-        .expect("running Access Portal");
+        .build(tauri::generate_context!())
+        .expect("starting Access Portal")
+        .run(|app, event| {
+            // Quitting stops the tunnel program too (it is a separate process).
+            if let RunEvent::Exit = event {
+                if let Some(t) = app.state::<Option<tunnel::Tunnel>>().inner() {
+                    t.stop();
+                }
+            }
+        });
 }

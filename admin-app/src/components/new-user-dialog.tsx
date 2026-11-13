@@ -34,6 +34,7 @@ const blank = {
   winPass: "",
   appIds: [] as number[],
   totp: false,
+  createWin: true,
 }
 
 export function NewUserDialog({
@@ -72,7 +73,8 @@ export function NewUserDialog({
         username: form.username,
         password: form.password,
         win_username: form.winUser,
-        win_password: form.winPass,
+        win_password: form.createWin ? "" : form.winPass,
+        create_windows_account: form.createWin,
         enable_totp: form.totp,
         app_ids: form.appIds,
       })
@@ -128,7 +130,18 @@ export function NewUserDialog({
             <FieldSeparator />
 
             <FieldSet>
-              <FieldLegend variant="label">Windows login on the RDP host</FieldLegend>
+              <FieldLegend variant="label">Windows account on this computer</FieldLegend>
+              <Field orientation="horizontal">
+                <FieldContent>
+                  <FieldLabel htmlFor="nu-create-win">Create a Windows account for them</FieldLabel>
+                  <FieldDescription>
+                    {form.createWin
+                      ? "A new account with a random password nobody needs to know, limited to Miracle."
+                      : "Use an account that already exists on this computer."}
+                  </FieldDescription>
+                </FieldContent>
+                <Switch id="nu-create-win" checked={form.createWin} onCheckedChange={(createWin) => set({ createWin })} />
+              </Field>
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field>
                   <FieldLabel htmlFor="nu-win-user">Windows username</FieldLabel>
@@ -140,17 +153,19 @@ export function NewUserDialog({
                     spellCheck={false}
                   />
                 </Field>
-                <Field>
-                  <FieldLabel htmlFor="nu-win-pass">Windows password</FieldLabel>
-                  <Input
-                    id="nu-win-pass"
-                    type="password"
-                    autoComplete="new-password"
-                    value={form.winPass}
-                    onChange={(e) => set({ winPass: e.target.value })}
-                    placeholder="Can be set later"
-                  />
-                </Field>
+                {!form.createWin && (
+                  <Field>
+                    <FieldLabel htmlFor="nu-win-pass">Windows password</FieldLabel>
+                    <Input
+                      id="nu-win-pass"
+                      type="password"
+                      autoComplete="new-password"
+                      value={form.winPass}
+                      onChange={(e) => set({ winPass: e.target.value })}
+                      required
+                    />
+                  </Field>
+                )}
               </div>
             </FieldSet>
 

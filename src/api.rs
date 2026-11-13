@@ -30,6 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/users/:id/unlock", post(unlock))
         .route("/api/admin/users/:id/totp", put(set_totp))
         .route("/api/admin/users/:id/desktop", get(desktop_mode).put(set_desktop_mode))
+        .route("/api/admin/users/:id/windows-account", post(create_windows_account))
         .route("/api/admin/apps", post(create_app))
         .route("/api/admin/apps/:id", delete(delete_app))
 }
@@ -144,6 +145,15 @@ struct NewUser {
     enable_totp: bool,
     #[serde(default)]
     app_ids: Vec<i64>,
+    /// Make a new Windows account for the user (named `win_username`, or the
+    /// username) with a random password nobody needs to know.
+    #[serde(default)]
+    create_windows_account: bool,
+}
+
+/// A long random Windows password that also meets Windows' complexity rules.
+fn new_windows_password() -> String {
+    format!("{}aA1!", auth::random_windows_password())
 }
 
 fn totp_details(secret: &str, username: &str) -> Value {
@@ -169,7 +179,12 @@ async fn create_user(
         "" => username,
         w => w,
     };
-    let win_password = if input.win_password.is_empty() {
+    let win_password = if input.create_windows_account {
+        // The account is made first, so a failure leaves nothing half done.
+        let password = new_windows_password();
+        host::create_account(win_username, &password).await.map_err(host_error)?;
+        password
+    } else if input.win_password.is_empty() {
         auth::random_windows_password()
     } else {
         input.win_password
@@ -194,13 +209,40 @@ async fn create_user(
     })))
 }
 
+#[derive(Deserialize)]
+struct DeleteOptions {
+    /// Also delete the user's Windows account (only ones the portal manages).
+    #[serde(default)]
+    windows: Option<u8>,
+}
+
 async fn delete_user(
     State(state): State<AppState>,
     _: Admin,
     Path(id): Path<i64>,
+    axum::extract::Query(options): axum::extract::Query<DeleteOptions>,
 ) -> ApiResult {
+    let user = existing_user(&state, id).await?;
+    if options.windows == Some(1) {
+        host::delete_account(&user.win_username).await.map_err(host_error)?;
+    }
     db::delete_user(&state.pool, id).await?;
     Ok(Json(json!({})))
+}
+
+/// Make the Windows account a portal user is set to sign in as, when it does
+/// not exist yet, with a new random password.
+async fn create_windows_account(
+    State(state): State<AppState>,
+    _: Admin,
+    Path(id): Path<i64>,
+) -> ApiResult {
+    let user = existing_user(&state, id).await?;
+    let password = new_windows_password();
+    host::create_account(&user.win_username, &password).await.map_err(host_error)?;
+    db::set_windows_login(&state.pool, &state.config, id, &user.win_username, &password).await?;
+    tracing::info!("created windows account {} for portal user {}", user.win_username, user.username);
+    Ok(Json(json!({ "mode": "app" })))
 }
 
 #[derive(Deserialize)]

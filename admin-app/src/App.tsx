@@ -24,6 +24,11 @@ export default function App() {
         if (s.running) return reload()
       })
       .catch((e) => setError(errorText(e)))
+    // Keep the public link's state fresh (it comes up a few seconds after start).
+    const timer = setInterval(() => {
+      serverStatus().then(setStatus).catch(() => {})
+    }, 3000)
+    return () => clearInterval(timer)
   }, [reload])
 
   let body

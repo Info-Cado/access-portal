@@ -70,8 +70,12 @@ type Mode = "app" | "full" | "missing"
 
 /** Full Windows desktop vs Miracle only. The setting lives on the Windows
  * account itself, so it is read from the host each time the panel opens. */
-function DesktopMode({ user }: { user: PortalUser }) {
-  const [mode, setMode] = useState<Mode | null>(null)
+function DesktopMode({ user, onMode }: { user: PortalUser; onMode: (mode: Mode | null) => void }) {
+  const [mode, setModeState] = useState<Mode | null>(null)
+  const setMode = (m: Mode | null) => {
+    setModeState(m)
+    onMode(m)
+  }
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
   const path = `/api/admin/users/${user.id}/desktop`
@@ -86,7 +90,23 @@ function DesktopMode({ user }: { user: PortalUser }) {
     return () => {
       live = false
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, user.win_username])
+
+  const createAccount = async () => {
+    setBusy(true)
+    try {
+      const r = await api<{ mode: Mode }>("POST", `/api/admin/users/${user.id}/windows-account`)
+      setMode(r.mode)
+      toast.success(`Windows account ${user.win_username} created`, {
+        description: "Limited to Miracle. Its password is random and stored by the portal.",
+      })
+    } catch (e) {
+      toast.error(errorText(e))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const change = async (full: boolean) => {
     setBusy(true)
@@ -107,7 +127,7 @@ function DesktopMode({ user }: { user: PortalUser }) {
   if (error) description = error
   else if (mode === null) description = "Checking the Windows account…"
   else if (mode === "missing")
-    description = `There is no Windows account named ${user.win_username} on this computer, so this can't be set here.`
+    description = `There is no Windows account named ${user.win_username} on this computer yet, so this user can't open a session.`
   else if (mode === "full")
     description = "On. Sessions get the normal Windows desktop, Start menu and all programs."
   else
@@ -123,6 +143,11 @@ function DesktopMode({ user }: { user: PortalUser }) {
         </FieldDescription>
         {(mode === "app" || mode === "full") && (
           <FieldDescription>Changes apply from the next session; an open one keeps its mode.</FieldDescription>
+        )}
+        {mode === "missing" && (
+          <Button size="sm" className="mt-1 self-start" disabled={busy} onClick={createAccount}>
+            Create Windows account {user.win_username}
+          </Button>
         )}
       </FieldContent>
       {mode === null && !error ? (
@@ -158,6 +183,7 @@ function UserDetails({
   const [winUser, setWinUser] = useState(user.win_username)
   const [winPass, setWinPass] = useState("")
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null)
+  const [winMode, setWinMode] = useState<Mode | null>(null)
 
   /** Run one change, refresh the data, and say how it went. */
   const change = async (work: () => Promise<unknown>, done: string) => {
@@ -230,7 +256,7 @@ function UserDetails({
           </FieldSet>
 
           <FieldSeparator />
-          <DesktopMode user={user} />
+          <DesktopMode user={user} onMode={setWinMode} />
 
           {(user.locked || user.failed_count > 0) && (
             <>
@@ -383,10 +409,15 @@ function UserDetails({
               setConfirmation({
                 title: `Delete ${user.username}?`,
                 description:
-                  "Their portal account and app permissions are removed. The Windows account on the host is not touched.",
+                  "Their portal account and app permissions are removed." +
+                  (winMode === "app" || winMode === "full" ? "" : " They have no Windows account on this computer."),
                 action: "Delete user",
-                run: async () => {
-                  await api("DELETE", base)
+                option:
+                  winMode === "app" || winMode === "full"
+                    ? { label: `Also delete the Windows account ${user.win_username} and its files on this computer`, checked: true }
+                    : undefined,
+                run: async (alsoWindows) => {
+                  await api("DELETE", alsoWindows ? `${base}?windows=1` : base)
                   onClose()
                   await reload()
                   toast.success("User deleted")

@@ -28,8 +28,8 @@ import {
   SidebarRail,
   SidebarTrigger,
 } from "@/components/ui/sidebar"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { errorText, type PortalState } from "@/lib/api"
+import { PublicLinkFooter } from "@/components/public-link"
+import { errorText, type PortalState, type PublicLink } from "@/lib/api"
 
 type View = "users" | "apps"
 
@@ -39,7 +39,7 @@ export function AppShell({
   data,
   status,
   reload,
-}: ViewProps & { status: { address: string } }) {
+}: ViewProps & { status: { address: string; public: PublicLink } }) {
   const [view, setView] = useState<View>("users")
   const [refreshing, setRefreshing] = useState(false)
 
@@ -103,28 +103,7 @@ export function AppShell({
         </SidebarContent>
 
         <SidebarFooter>
-          <SidebarMenu>
-            <SidebarMenuItem>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <SidebarMenuButton size="lg" className="cursor-default hover:bg-transparent active:bg-transparent">
-                    <span className="relative flex size-8 items-center justify-center">
-                      <span className="absolute size-2.5 animate-ping rounded-full bg-emerald-500/60" />
-                      <span className="size-2.5 rounded-full bg-emerald-500" />
-                    </span>
-                    <div className="grid flex-1 text-left text-sm leading-tight">
-                      <span className="truncate font-medium">Portal running</span>
-                      <span className="truncate text-xs text-muted-foreground">{status.address}</span>
-                    </div>
-                  </SidebarMenuButton>
-                </TooltipTrigger>
-                <TooltipContent side="right" className="max-w-64">
-                  Closing this window keeps the portal running in the notification area. Quit it from
-                  the tray icon to stop it.
-                </TooltipContent>
-              </Tooltip>
-            </SidebarMenuItem>
-          </SidebarMenu>
+          <PublicLinkFooter link={status.public} local={status.address} />
         </SidebarFooter>
         <SidebarRail />
       </Sidebar>

@@ -149,7 +149,7 @@ form{display:inline}
         output: function (frame) {
           try {
             ctx.drawImage(frame, d.x, d.y);
-            if (!gotFrame) { gotFrame = true; overlay.classList.add("hidden"); canvas.focus(); }
+            if (!gotFrame) { gotFrame = true; retries = 0; overlay.classList.add("hidden"); canvas.focus(); }
           } catch (e) {}
           frame.close();
         },
@@ -256,23 +256,45 @@ form{display:inline}
     }).catch(function () { send({ t: "ack", n: seq }); });
   }
 
-  function lost() { if (!closed) showEnd("Disconnected", "The connection to the portal was lost."); }
+  // When the link drops (network change, a proxy restarting), reconnect on our
+  // own: the Windows session is still there and is picked up again. Each
+  // attempt has a number so events from an old, abandoned link are ignored.
+  var linkGen = 0, retries = 0, MAX_RETRIES = 8;
+  function lost(gen) {
+    if (closed || gen !== linkGen) return;
+    link = null;
+    if (retries >= MAX_RETRIES) {
+      showEnd("Disconnected", "The connection to the portal was lost.");
+      return;
+    }
+    retries++;
+    var wait = Math.min(1000 * Math.pow(2, retries - 1), 15000);
+    $("title").textContent = "Reconnecting…";
+    $("detail").textContent = "The connection dropped. Trying again (" + retries + " of " + MAX_RETRIES + ")…";
+    $("actions").innerHTML = "";
+    overlay.classList.remove("hidden");
+    gotFrame = false;
+    Object.keys(decoders).forEach(function (b) { vstop(+b); });
+    setTimeout(function () { if (!closed) startLink(); }, wait);
+  }
 
   function startWebSocket() {
+    var mine = ++linkGen;
     var proto = location.protocol === "https:" ? "wss" : "ws";
     var ws = new WebSocket(proto + "://" + location.host + "/ws/" + encodeURIComponent(key) + query);
     ws.binaryType = "arraybuffer";
     ws.onopen = function () { link = { kind: "relayed", send: function (s) { if (ws.readyState === 1) ws.send(s); } }; showLink(); };
     ws.onmessage = function (ev) { if (typeof ev.data === "string") onText(ev.data); else onBinary(ev.data); };
-    ws.onclose = lost;
+    ws.onclose = function () { lost(mine); };
   }
 
   // Data channel messages are chunked: one flag byte (1 = last chunk, 2 = text) then the payload.
   var CHUNK = 15000;
   function startDirect() {
+    var mine = ++linkGen;
     var settled = false, pc, dc, timer;
     function giveUp() {
-      if (settled) return;
+      if (settled || mine !== linkGen) return;
       settled = true;
       clearTimeout(timer);
       try { if (pc) pc.close(); } catch (e) {}
@@ -318,9 +340,11 @@ form{display:inline}
       parts = [];
       if (chunk[0] & 2) onText(decoder.decode(whole)); else onBinary(whole.buffer);
     };
-    dc.onclose = function () { if (settled && link && link.kind === "direct") lost(); else giveUp(); };
+    dc.onclose = function () { if (settled && link && link.kind === "direct") lost(mine); else giveUp(); };
     pc.onconnectionstatechange = function () {
-      if (pc.connectionState === "failed") { if (link && link.kind === "direct") lost(); else giveUp(); }
+      if (pc.connectionState === "failed") {
+        if (link && link.kind === "direct") { try { pc.close(); } catch (e) {} lost(mine); } else giveUp();
+      }
     };
 
     pc.createOffer().then(function (offer) { return pc.setLocalDescription(offer); }).then(function () {
@@ -655,6 +679,28 @@ form{display:inline}
       });
     }).catch(function () {});
   }
+  // Files go up in chunks: every request stays well under proxy size limits, and
+  // a chunk that fails is retried from where the server says it got to.
+  var UPLOAD_CHUNK = 16 * 1024 * 1024;
+  function sendFile(f, progress) {
+    var id = Array.prototype.map.call(crypto.getRandomValues(new Uint8Array(12)), function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
+    var offset = 0, attempts = 0;
+    function step() {
+      var end = Math.min(offset + UPLOAD_CHUNK, f.size), last = end >= f.size;
+      var url = "/files/upload?name=" + encodeURIComponent(f.name) + "&id=" + id + "&offset=" + offset + (last ? "&last=1" : "");
+      return fetch(url, { method: "POST", body: f.slice(offset, end), credentials: "same-origin" })
+        .then(function (r) {
+          if (r.ok) { attempts = 0; offset = end; progress(offset); return last ? null : step(); }
+          if (r.status === 409) return r.json().then(function (j) { offset = j.have; return retry(); });
+          throw new Error("upload refused: " + r.status);
+        }, retry);
+    }
+    function retry() {
+      if (++attempts > 5) throw new Error("upload failed");
+      return new Promise(function (ok) { setTimeout(ok, 1000 * attempts); }).then(step);
+    }
+    return step();
+  }
   function upload(files) {
     files = Array.prototype.slice.call(files || []);
     if (!files.length) return;
@@ -667,10 +713,9 @@ form{display:inline}
         refresh();
         return;
       }
-      fetch("/files/upload?name=" + encodeURIComponent(f.name), { method: "POST", body: f, credentials: "same-origin" })
-        .then(function (r) { if (r.ok) done++; else failed++; })
-        .catch(function () { failed++; })
-        .then(next);
+      sendFile(f, function (sent) {
+        say("Sending " + f.name + "… " + Math.floor(100 * sent / Math.max(f.size, 1)) + "%", true);
+      }).then(function () { done++; }, function () { failed++; }).then(next);
     };
     next();
   }

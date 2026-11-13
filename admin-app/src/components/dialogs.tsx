@@ -1,6 +1,6 @@
 // Small dialogs shared by the Users and Apps screens.
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { CheckIcon, CopyIcon } from "lucide-react"
 import { toast } from "sonner"
 
@@ -15,6 +15,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
   DialogContent,
@@ -31,8 +32,10 @@ export type Confirmation = {
   title: string
   description: string
   action: string
+  /** An optional tick box shown above the buttons; its value goes to `run`. */
+  option?: { label: string; checked: boolean }
   /** Does the work; the dialog closes when it succeeds. */
-  run: () => Promise<void>
+  run: (optionChecked: boolean) => Promise<void>
 }
 
 /** Asks before something destructive. Pass `null` to keep it closed. */
@@ -44,12 +47,14 @@ export function ConfirmDialog({
   onClose: () => void
 }) {
   const [busy, setBusy] = useState(false)
+  const [ticked, setTicked] = useState(false)
+  useEffect(() => setTicked(confirmation?.option?.checked ?? false), [confirmation])
 
   const go = async () => {
     if (!confirmation) return
     setBusy(true)
     try {
-      await confirmation.run()
+      await confirmation.run(ticked)
       onClose()
     } catch (e) {
       toast.error(errorText(e))
@@ -65,6 +70,19 @@ export function ConfirmDialog({
           <AlertDialogTitle>{confirmation?.title}</AlertDialogTitle>
           <AlertDialogDescription>{confirmation?.description}</AlertDialogDescription>
         </AlertDialogHeader>
+        {confirmation?.option && (
+          <Field orientation="horizontal">
+            <Checkbox
+              id="confirm-option"
+              checked={ticked}
+              disabled={busy}
+              onCheckedChange={(v) => setTicked(v === true)}
+            />
+            <FieldLabel htmlFor="confirm-option" className="font-normal">
+              {confirmation.option.label}
+            </FieldLabel>
+          </Field>
+        )}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={busy}>Cancel</AlertDialogCancel>
           <AlertDialogAction

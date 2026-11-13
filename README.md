@@ -144,7 +144,8 @@ accounts).
 
 ## Where things live
 
-Everything the portal keeps is in `C:\ProgramData\AccessPortal`:
+Everything the portal keeps is in `C:\ProgramData\AccessPortal`, which only
+administrators can open (it holds the key to the stored Windows passwords):
 
 | | |
 |---|---|
@@ -152,6 +153,7 @@ Everything the portal keeps is in `C:\ProgramData\AccessPortal`:
 | `portal.db` | users, apps, permissions, sign-in sessions |
 | `files\` | one transfer folder per user |
 | `portal.log` | the server's log |
+| `install-id`, `tunnel.json` | this install's public link (keep private: the tunnel token is in it) |
 
 Restart the app (tray icon → Quit, then open it) after changing `portal.env`.
 
@@ -178,9 +180,50 @@ create Windows accounts.
 The admin calls (`src/api.rs`) are never served on the network: the app makes
 them in-process (`Portal::admin` in `src/lib.rs`).
 
-Remote users open the portal's address (`BIND_ADDR`, `127.0.0.1:8088` by
-default) through an HTTPS front end such as `tailscale serve` or a reverse
-proxy, sign in, and open their app.
+## Public link
+
+Every install gets its own public HTTPS address, such as
+`khush-laptop.infocado.in`, shown at the top of the window with a **Copy link**
+button. Remote users open it in any browser, sign in and open their app. Nothing
+is needed on the host's router or firewall.
+
+How it works:
+
+1. On first start the app sends a random install id (kept in the data folder)
+   to the sign-up service, a Cloudflare Worker in `provision/worker.js`.
+2. The service creates a Cloudflare Tunnel for that install, picks a free name
+   from the computer's name, points the name at the tunnel and returns the
+   tunnel's token. Later starts reuse it (`tunnel.json` in the data folder).
+3. The app runs Cloudflare's `cloudflared` (shipped with the app, pinned and
+   checksum-checked by `admin-app/scripts/fetch-cloudflared.mjs`) with that
+   token and restarts it if it stops. It only makes outgoing connections.
+
+The page, sign-in and connection setup go through the tunnel. The screen
+stream first tries a direct peer-to-peer link and only uses the tunnel when no
+direct path exists. To suit Cloudflare's limits, sessions ping the browser every
+20 seconds (idle connections are closed after about 100), the page reconnects
+by itself if the link drops, and uploads go in 16 MB chunks (requests are
+limited to 100 MB).
+
+Setting up the sign-up service (once, for the domain the links use):
+
+```powershell
+.\provision\deploy.ps1 -TokenFile <file with a Cloudflare API token> -Zone infocado.in
+```
+
+The token needs Account → Cloudflare Tunnel → Edit, Account → Workers Scripts →
+Edit, Zone → DNS → Edit and Zone → Zone → Read. The script stores it as a
+secret of the Worker and writes `admin-app/src-tauri/provision.env` (not
+committed) with the service's address and key; builds made after that have the
+public link. A build without that file works, just without a public link.
+
+Because the portal is public, it:
+
+- marks sign-in cookies Secure whenever the browser came in over HTTPS;
+- refuses form posts and uploads sent from other sites;
+- limits failed sign-ins per network address (20 per 15 minutes) on top of the
+  per-account lockout;
+- clears expired sign-ins hourly.
 
 The window's page is React with shadcn/ui components (Tailwind), built by Vite;
 add more components with `npx shadcn@latest add <name>`.
@@ -238,5 +281,6 @@ get around per-user Windows licensing.
 | `src/web.rs` | router, auth extractors, pages, handlers, file transfer endpoints |
 | `src/api.rs` | admin API, called in-process by the app |
 | `src/host.rs` | Full desktop / Miracle-only switch for a Windows account |
+| `provision/` | the sign-up service (Cloudflare Worker) and its deploy script |
 | `admin-app/` | the Access Portal app (Tauri): `src-tauri/` starts the portal, tray icon; `src/` the window's page (React + shadcn/ui) |
 | `migrations/` | SQLite schema |

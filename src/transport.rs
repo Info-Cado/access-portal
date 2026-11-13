@@ -42,6 +42,11 @@ pub trait Transport: Send {
     async fn recv(&mut self) -> Incoming;
     async fn send_text(&mut self, text: String) -> anyhow::Result<()>;
     async fn send_binary(&mut self, data: Vec<u8>) -> anyhow::Result<()>;
+    /// Keep an otherwise quiet link open. Proxies in front of the portal
+    /// (Cloudflare closes idle WebSockets after about 100 seconds) need this.
+    async fn keepalive(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn close(&mut self);
 }
 
@@ -69,6 +74,12 @@ impl Transport for WsTransport {
 
     async fn send_binary(&mut self, data: Vec<u8>) -> anyhow::Result<()> {
         self.0.send(Message::Binary(data)).await.context("browser disconnected")
+    }
+
+    /// A WebSocket ping; the browser answers with a pong by itself, so traffic
+    /// flows both ways.
+    async fn keepalive(&mut self) -> anyhow::Result<()> {
+        self.0.send(Message::Ping(Vec::new())).await.context("browser disconnected")
     }
 
     async fn close(&mut self) {

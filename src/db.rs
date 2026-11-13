@@ -315,3 +315,10 @@ pub async fn delete_pending(pool: &SqlitePool, token: &str) -> Result<()> {
         .await?;
     Ok(())
 }
+
+/// Remove sign-in sessions and half-finished 2FA logins that have expired.
+pub async fn delete_expired(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("DELETE FROM sessions WHERE expires_at <= ?").bind(now()).execute(pool).await?;
+    sqlx::query("DELETE FROM pending_logins WHERE expires_at <= ?").bind(now()).execute(pool).await?;
+    Ok(())
+}
