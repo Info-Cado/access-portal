@@ -145,13 +145,12 @@ Channels used on the RDP connection:
 
 | Channel | Purpose |
 |---|---|
-| display control | resize the session with the browser window (only with `SESSION_SIZE=auto`) |
+| display control | the session's size (Fit to window, Quality) and a second monitor |
 | clipboard | text, pictures and files, both directions |
 | drive redirection | the per-user transfer folder, as `\\tsclient\P` (Windows portal hosts only) |
 | printer redirection | "Portal printer" in every print dialog (`src/print.rs`) |
-| audio | the session's sound, played in the browser (`src/sound.rs`) |
-
-Not supported yet: microphone, webcam, and several monitors.
+| audio | the session's sound, AAC when the browser can decode it (`src/sound.rs`) |
+| audio input, camera | the user's microphone and camera for apps in the session (`src/devices.rs`); Windows Pro/Enterprise hosts only |
 
 ## Prerequisites
 
@@ -170,8 +169,31 @@ npm run dev        # or run it straight from source
 ```
 
 Install it on the RDP host and open it. It must run as a Windows
-**administrator** for the "Full desktop" switch (it changes other Windows
-accounts).
+**administrator** (it changes Windows accounts and Remote Desktop settings).
+
+**Setting up a new computer:** open **Settings → This computer** and click
+**Fix everything** (`src/host_setup.ps1`). It checks and, where needed, sets up:
+
+- Remote Desktop on, with network-level sign-in;
+- RDP Wrapper, so several people can be connected at once on Windows Home or
+  Pro (the official v1.6.2 release, checked against its known checksum, with a
+  Microsoft Defender exclusion for its folder) and its settings for this
+  Windows build, fetched from the portal's update service first and then from
+  community sources; after a Windows update breaks it, the same button fixes it;
+- the "Portal RDP Users" group and its permission to sign in over Remote Desktop;
+- the Miracle launcher (it finds `miracle.exe`);
+- Windows' PDF printer driver;
+- the Remote Desktop settings the portal is tuned for.
+
+Fixing RDP Wrapper restarts Remote Desktop (connected users drop for a moment;
+it asks first). A banner in the app points here while anything is missing.
+
+**Releasing an update:** `.\scripts\release.ps1 -Version 0.2.1 -Notes "..."
+-TokenFile <Cloudflare token>` builds, signs (with
+`admin-app/src-tauri/updater.key`, not committed: keep a copy somewhere safe,
+installs only accept updates signed with it) and publishes to the update
+service. Installed copies check every 6 hours and install when nobody is
+connected (Settings → Updates; `"Access Portal.exe" --update` installs at once).
 
 ## Where things live
 
@@ -184,6 +206,7 @@ administrators can open (it holds the key to the stored Windows passwords):
 | `portal.db` | users, apps, permissions, access rules, sign-in sessions, app settings, the activity log |
 | `files\` | one transfer folder per user (`files\.clipboard\` holds files being pasted into sessions) |
 | `portal.log` | the server's log |
+| `backups\` | daily backups (database, settings, public link details) |
 | `install-id`, `tunnel.json` | this install's public link (keep private: the tunnel token is in it) |
 
 Restart the app (tray icon → Quit, then open it) after changing `portal.env`.
@@ -211,13 +234,26 @@ The window has four screens:
   why), print jobs, uploads and downloads, clipboard file transfers, and every
   admin action, newest first; filter by user, search, **Export CSV** (saved to
   Downloads). Kept for 180 days (`src/activity.rs`).
-- **Settings** — for every user:
-  - *Disconnect idle sessions* after a time without keyboard or mouse input
-    (default 1 hour; a one-minute warning first; apps keep running);
-  - *Sign out disconnected Windows sessions* after a time (default never; apps
-    close; Windows administrator accounts are never signed out);
-  - *Ask before viewing a user's screen* (default on);
-  - the app's own sign-in.
+- **Settings**:
+  - *This computer* — what the computer needs, with one-click fixes (above);
+  - *Sessions* — disconnect idle sessions after a time without keyboard or
+    mouse input (default 1 hour; a one-minute warning first; apps keep
+    running); sign out Windows sessions left disconnected (default never;
+    apps close; Windows administrator accounts never); ask before viewing a
+    user's screen (default on);
+  - *Phone alerts* — a notification (ntfy app, free) when the computer goes
+    offline, the public link is down for 10 minutes, sessions keep failing to
+    start, Remote Desktop stops accepting connections or the disk is almost
+    full, and again when it's fixed. The app checks every minute; the
+    "offline" alert comes from the update service when the app's heartbeats
+    stop for 15 minutes. Default server `ntfy.envs.net` (ntfy.sh limits
+    messages from Cloudflare's shared addresses);
+  - *Backups* — made daily and kept 14 (configurable), optionally copied to a
+    second folder (another drive, OneDrive…); **Back up now**; **Restore** puts
+    one back and restarts the app (what was there is saved first). Users'
+    files aren't included;
+  - *Updates* — the version, **Check now**, and automatic installation;
+  - *App sign-in*.
 
 Each user also has a **Full desktop** switch (`src/host.rs`). It changes the
 user's Windows account on this machine: off, the account's shell is the Miracle
@@ -258,14 +294,49 @@ The buttons at the top right of a session:
 - **Files** — the transfer folder (upload, download). The dot shows the link
   state.
 - **Full screen**.
+- **Connection** — round-trip time (green under 80 ms, amber under 200 ms,
+  red above or no reply); hover for frames per second, data rate and link type.
 - **Menu** — *Disconnect* (leave the apps running and come back later),
   *Sign out of Windows* (close the apps and end the Windows session),
-  *Sound* on/off, *Printing* (print dialog straight away, or a notice) and
-  *Sign out of the portal*.
+  *Sound*, *Printing* (print dialog straight away, or a notice), *Fit to
+  window*, *Second screen*, *Quality*, *Microphone*, *Camera*, *Change
+  password* and *Sign out of the portal*.
 
-**Sound.** The session's sound plays in the browser (Windows sends 16-bit PCM,
-about 1.4 Mbit/s while something plays, nothing otherwise). Browsers start
-audio after the first click or key press on the page.
+**Sound.** The session's sound plays in the browser: AAC (about 0.1 Mbit/s)
+when the browser can decode it, else plain PCM (1.4 Mbit/s), and only while
+something plays. Browsers start audio after the first click or key press.
+
+**Size and quality.** By default the session is 1920×1080 and the browser
+scales it. *Fit to window* (on by default on phones and tablets) makes the
+Windows session exactly the size of the browser window, following it when it
+changes. *Quality*: *Auto* lowers the resolution by a third after 10 seconds
+of a slow link (over 200 ms, or no replies) and restores it after a minute of a
+good one; *Sharp* never lowers it; *Fast* always does.
+
+**Second screen.** Opens a second window showing the session's second monitor
+(the session gets two monitors side by side). In Chrome and Edge it opens on
+the other screen once the browser's window-management permission is allowed;
+its *Full screen* button fills that screen.
+
+**Phones and tablets.** The screen works as a trackpad: slide to move the
+pointer, tap to click, tap twice to double-click, tap then hold and slide to
+drag, hold still for a right-click, two fingers to scroll (up, down and
+sideways), pinch to zoom, two-finger tap to right-click. *Direct* mode (in the
+key bar) clicks where the finger is. The key bar has the keyboard, Esc, Tab,
+arrows, Ctrl/Alt/Shift and F1–F12.
+
+**Microphone and camera.** When an app in the session starts recording or opens
+the camera, the browser asks the user once and then sends its microphone (as
+the PCM format Windows asked for) or camera (JPEG, about 15 frames a second); a
+red marker in the toolbar shows it. Windows Home doesn't allow either in
+Remote Desktop sessions (its licence turns them off in services RDP Wrapper
+doesn't touch), so this needs a Windows Pro or Enterprise host; the app's
+*This computer* list says which.
+
+**Your password.** Users change their password from the menu (or `/account`).
+Someone who forgot it can set a new one at *Forgot your password?* on the
+sign-in page with a code from their authenticator app (two-step verification
+must be on); otherwise the administrator sets one.
 
 **Copy and paste.** Text, pictures and files go both ways:
 
@@ -403,6 +474,10 @@ get around per-user Windows licensing.
 | `src/activity.rs` | the activity log |
 | `src/settings.rs` | settings changed from the app (timeouts, screen viewing, the app's sign-in) |
 | `src/clock.rs` | this computer's local time |
+| `src/backup.rs` | daily backups and restoring one |
+| `src/devices.rs` | the user's microphone and camera (MS-RDPEAI, MS-RDPECAM) |
+| `src/host_setup.ps1` | checks and sets up a computer for the portal |
+| `scripts/release.ps1` | builds, signs and publishes an update |
 | `provision/` | the sign-up service (Cloudflare Worker) and its deploy script |
 | `admin-app/` | the Access Portal app (Tauri): `src-tauri/` starts the portal, tray icon; `src/` the window's page (React + shadcn/ui) |
 | `migrations/` | SQLite schema |

@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import {
   AppWindowIcon,
   HistoryIcon,
@@ -35,7 +35,7 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar"
 import { PublicLinkFooter } from "@/components/public-link"
-import { errorText, type PortalState, type PublicLink } from "@/lib/api"
+import { api, errorText, type PortalState, type PublicLink } from "@/lib/api"
 
 type View = "users" | "apps" | "activity" | "settings"
 
@@ -51,6 +51,13 @@ export function AppShell({
 }: ViewProps & { status: { address: string; public: PublicLink }; onLock: () => void }) {
   const [view, setView] = useState<View>("users")
   const [refreshing, setRefreshing] = useState(false)
+  // Is this computer fully set up? Checked once when the app is opened.
+  const [setupProblems, setSetupProblems] = useState(0)
+  useEffect(() => {
+    api<{ checks: { ok: boolean; fix: string }[] }>("GET", "/api/admin/setup")
+      .then((r) => setSetupProblems(r.checks.filter((c) => !c.ok && c.fix).length))
+      .catch(() => {})
+  }, [view])
 
   const refresh = async () => {
     setRefreshing(true)
@@ -141,6 +148,17 @@ export function AppShell({
           </Button>
         </header>
         <div className="flex flex-1 flex-col gap-4 p-4 lg:p-6">
+          {setupProblems > 0 && view !== "settings" && (
+            <div className="flex items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
+              <TriangleAlertIcon className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <span className="flex-1">
+                This computer isn’t fully set up for the portal ({setupProblems} thing{setupProblems === 1 ? "" : "s"} to fix).
+              </span>
+              <Button size="sm" variant="outline" onClick={() => setView("settings")}>
+                Set it up
+              </Button>
+            </div>
+          )}
           {data.admin.default_password && view !== "settings" && (
             <div className="flex items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
               <TriangleAlertIcon className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />

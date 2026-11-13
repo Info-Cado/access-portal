@@ -11,6 +11,7 @@
 //!   text    {"t":"cur", ...}                 pointer shape (png/default/hidden)
 //!   text    {"t":"closed","m":".."}          session ended
 //!   binary  [7][channels u8][rate u32][16-bit PCM]   sound
+//!   binary  [9][channels u8][rate u32][AAC frames]   sound, compressed
 //!   binary  [8][PNG]                         a picture copied in the session
 //!   text    {"t":"clipfiles","files":[..]}   files copied in the session
 //!   text    {"t":"idle","s":..}              disconnecting soon for inactivity
@@ -86,6 +87,8 @@ pub struct Target {
     pub actor: Option<crate::activity::Actor>,
     /// Where files pasted from the browser wait for Windows to read them.
     pub clip_dir: Option<std::path::PathBuf>,
+    /// The browser can decode AAC sound (much smaller than PCM).
+    pub sound_aac: bool,
 }
 
 /// What a session needs besides the connection itself.
@@ -94,6 +97,8 @@ struct Extras {
     printed: std::sync::mpsc::Receiver<crate::print::PrintedFile>,
     /// Sound from the session.
     sound: std::sync::mpsc::Receiver<crate::sound::Block>,
+    /// The user's microphone and camera.
+    devices: crate::devices::SharedRef,
     kick: Option<std::sync::Arc<crate::presence::Kick>>,
     notices: Option<crate::presence::Notices>,
     /// The Windows account, for signing it out on request.
@@ -176,6 +181,12 @@ enum ClientMsg {
     /// sound on or off for this browser
     #[serde(rename = "snd")]
     Sound { on: bool },
+    /// the session's screens: one entry per monitor, left to right
+    #[serde(rename = "monitors")]
+    Monitors { m: Vec<(u32, u32)> },
+    /// measuring the link: answered at once with {"t":"pong","n":n}
+    #[serde(rename = "ping")]
+    Ping { n: f64 },
     /// a picture copied on the user's computer, uploaded as PNG to the
     /// clipboard folder `b` as `f`
     #[serde(rename = "clipimg")]
@@ -435,7 +446,9 @@ fn config(target: &Target) -> Config {
             password: target.password.clone(),
         },
         domain: None,
-        client_build: 0,
+        // A current client build: Windows only offers newer features (microphone,
+        // camera) to clients that report one.
+        client_build: 22621,
         client_name: "access-portal".to_owned(),
         keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
@@ -455,7 +468,7 @@ fn config(target: &Target) -> Config {
         request_data: None,
         autologon: false,
         enable_audio_playback: true,
-        enable_audio_capture: false,
+        enable_audio_capture: true,
         // With Windows' H.264 the full desktop experience costs little: show window
         // contents while dragging, animations, smooth fonts and composition.
         performance_flags: if target.egfx {
@@ -484,6 +497,7 @@ async fn connect(
     Option<crate::gfx::SharedRef>,
     std::sync::mpsc::Receiver<crate::print::PrintedFile>,
     std::sync::mpsc::Receiver<crate::sound::Block>,
+    crate::devices::SharedRef,
 )> {
     let addr = format!("{}:{}", target.host, target.port);
     let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr))
@@ -498,20 +512,32 @@ async fn connect(
     #[allow(unused_variables)]
     let (print_tx, print_rx) = std::sync::mpsc::channel();
     #[allow(unused_mut)]
+    let (sound_tx, sound_rx) = std::sync::mpsc::channel();
     // Display control lets the session follow the browser window's size.
-    let mut dvc = DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+    // Sound: Windows prefers the dynamic audio channels, and sends AAC only on
+    // the "lossy" one; both share one negotiation.
+    let audio = ironrdp_rdpsnd::client::RdpsndDvcState::new(Box::new(crate::sound::Backend::new(sound_tx.clone(), target.sound_aac)));
+    // The user's microphone and camera, for apps in the session.
+    let devices = crate::devices::SharedRef::default();
+    let mut dvc = DrdynvcClient::new()
+        .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())))
+        .with_dynamic_channel(audio.channel())
+        .with_dynamic_channel(audio.lossy_channel())
+        .with_dynamic_channel(crate::devices::microphone(devices.clone()))
+        .with_dynamic_channel(crate::devices::camera_enumerator(devices.clone()))
+        .with_dynamic_channel(crate::devices::camera_device(devices.clone()));
     let mut gfx_shared = None;
     if target.egfx {
         let (gfx, shared) = crate::gfx::channel();
         dvc = dvc.with_dynamic_channel(gfx);
         gfx_shared = Some(shared);
     }
-    let (sound_tx, sound_rx) = std::sync::mpsc::channel();
     let mut connector = ClientConnector::new(config(target), client_addr)
         .with_static_channel(dvc)
         .with_static_channel(CliprdrClient::new(Box::new(ClipBackend { tx: clip_tx })))
-        // Sound (Windows also only starts device redirection when this channel is there).
-        .with_static_channel(ironrdp_rdpsnd::client::Rdpsnd::new(Box::new(crate::sound::Backend::new(sound_tx))));
+        // The older sound channel: used when the dynamic ones aren't, and Windows
+        // only starts device redirection when it is there.
+        .with_static_channel(ironrdp_rdpsnd::client::Rdpsnd::new(Box::new(crate::sound::Backend::new(sound_tx, false))));
     #[cfg(windows)]
     if let Some(dir) = &target.files_dir {
         match drive_channel(dir, print_tx) {
@@ -547,17 +573,19 @@ async fn connect(
     .map_err(|e| anyhow!("RDP sign-in failed: {e:#}"))?;
 
     let result = outcome.into_connected().map_err(|e| anyhow!("{e:#}"))?;
-    Ok((result, framed, clip_rx, gfx_shared, print_rx, sound_rx))
+    Ok((result, framed, clip_rx, gfx_shared, print_rx, sound_rx, devices))
 }
 
 /// Run one RDP session for one browser tab. Returns when either side closes,
-/// with what the user was told about why it ended.
-pub async fn run(mut target: Target, mut io: Box<dyn Transport>) -> String {
+/// with what the user was told about why it ended, and whether it failed
+/// (could not be opened or broke) rather than ended normally.
+pub async fn run(mut target: Target, mut io: Box<dyn Transport>) -> (String, Option<String>) {
     let connected = connect(&target).await;
-    let connected = connected.map(|(result, framed, clip_rx, gfx, printed, sound)| {
+    let connected = connected.map(|(result, framed, clip_rx, gfx, printed, sound, devices)| {
         let extras = Extras {
             printed,
             sound,
+            devices,
             kick: target.kick.clone(),
             notices: target.notices.take(),
             win_username: target.username.clone(),
@@ -575,10 +603,12 @@ pub async fn run(mut target: Target, mut io: Box<dyn Transport>) -> String {
         }
         Err(e) => Err(e),
     };
+    let mut failure = None;
     let message = match outcome {
         Ok(reason) => reason,
         Err(e) => {
             tracing::warn!("rdp session for {} ended with error: {e:#}", target.username);
+            failure = Some(format!("{e:#}"));
             if target.show_errors {
                 format!("{e:#}")
             } else {
@@ -592,7 +622,7 @@ pub async fn run(mut target: Target, mut io: Box<dyn Transport>) -> String {
     // reconnect instead of showing why the session ended.
     tokio::time::sleep(Duration::from_millis(600)).await;
     io.close().await;
-    message
+    (message, failure)
 }
 
 fn png(width: u32, height: u32, color: png::ColorType, data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -998,13 +1028,25 @@ async fn session(
         // Sound that arrived since the last turn.
         while let Ok(block) = extras.sound.try_recv() {
             if sound_on {
-                let mut msg = Vec::with_capacity(6 + block.pcm.len());
-                msg.push(7);
+                let mut msg = Vec::with_capacity(6 + block.data.len());
+                msg.push(if block.aac { 9 } else { 7 });
                 msg.push(block.channels);
                 msg.extend_from_slice(&block.rate.to_le_bytes());
-                msg.extend_from_slice(&block.pcm);
+                msg.extend_from_slice(&block.data);
                 io.send_binary(msg).await?;
             }
+        }
+        // Apps in the session started or stopped the microphone or camera.
+        let device_events = std::mem::take(&mut extras.devices.lock().unwrap().events);
+        for event in device_events {
+            use crate::devices::Event;
+            let msg = match event {
+                Event::MicOn { rate, channels } => json!({"t": "mic", "on": true, "rate": rate, "ch": channels}),
+                Event::MicOff => json!({"t": "mic", "on": false}),
+                Event::CameraOn { width, height } => json!({"t": "cam", "on": true, "w": width, "h": height}),
+                Event::CameraOff => json!({"t": "cam", "on": false}),
+            };
+            send_json(io, msg).await?;
         }
         // Print jobs finished since the last turn: offer them in the browser.
         while let Ok(job) = extras.printed.try_recv() {
@@ -1184,6 +1226,24 @@ async fn session(
             // (that adds input lag, and holds back acknowledgements Windows waits for).
             msg = io.recv() => {
                 let msg = match msg {
+                    Incoming::Binary(data) => {
+                        // [1][JPEG] a camera frame, [2][PCM] microphone sound.
+                        let (messages, channel) = {
+                            let devices = &extras.devices;
+                            match data.split_first() {
+                                Some((1, jpeg)) => (crate::devices::camera_frame(devices, jpeg.to_vec()), devices.lock().unwrap().camera_channel),
+                                Some((2, pcm)) => (crate::devices::mic_packets(devices, pcm), devices.lock().unwrap().mic_channel),
+                                _ => (Vec::new(), None),
+                            }
+                        };
+                        if let (false, Some(channel_id)) = (messages.is_empty(), channel) {
+                            let messages = ironrdp_dvc::encode_dvc_messages(channel_id, messages, ironrdp_svc::ChannelFlags::empty())
+                                .map_err(|e| anyhow!("device data: {e}"))?;
+                            let frame = svc_frame(&stage, SvcProcessorMessages::<DrdynvcClient>::new(messages))?;
+                            framed.write_all(&frame).await.context("writing to the host")?;
+                        }
+                        continue;
+                    }
                     Incoming::Text(text) => serde_json::from_str::<ClientMsg>(&text).ok(),
                     Incoming::Closed => {
                         // Tab closed: drop the connection. Windows keeps the session
@@ -1347,6 +1407,34 @@ async fn session(
                     }
                     Some(ClientMsg::Sound { on }) => {
                         sound_on = on;
+                        continue;
+                    }
+                    Some(ClientMsg::Monitors { m }) => {
+                        // Two (or more) monitors side by side; one goes back to a plain resize.
+                        let monitors: Vec<(u32, u32)> = m.into_iter().take(4).map(|(w, h)| {
+                            let (w, h) = sane_size(w, h);
+                            (u32::from(w), u32::from(h))
+                        }).collect();
+                        let frame = if monitors.len() <= 1 {
+                            let (w, h) = monitors.first().copied().unwrap_or((u32::from(image.width()), u32::from(image.height())));
+                            stage.encode_resize(w, h, None, None)
+                        } else {
+                            match monitor_layout(&monitors) {
+                                Ok(layout) => stage.encode_monitor_layout(&layout),
+                                Err(e) => {
+                                    tracing::warn!("monitor layout: {e:#}");
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(frame) = frame {
+                            let frame = frame.map_err(|e| anyhow!("RDP monitor layout error: {e:#}"))?;
+                            framed.write_all(&frame).await.context("writing to the host")?;
+                        }
+                        continue;
+                    }
+                    Some(ClientMsg::Ping { n }) => {
+                        send_json(io, json!({"t": "pong", "n": n})).await?;
                         continue;
                     }
                     Some(other) => {
@@ -1581,6 +1669,23 @@ async fn session(
     }
 }
 
+/// Monitors side by side, the first one primary.
+fn monitor_layout(monitors: &[(u32, u32)]) -> anyhow::Result<ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout> {
+    use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
+    let mut entries = Vec::new();
+    let mut left = 0i32;
+    for (i, &(w, h)) in monitors.iter().enumerate() {
+        let entry = if i == 0 {
+            MonitorLayoutEntry::new_primary(w, h).map_err(|e| anyhow!("{e}"))?
+        } else {
+            MonitorLayoutEntry::new_secondary(w, h).map_err(|e| anyhow!("{e}"))?.with_position(left, 0).map_err(|e| anyhow!("{e}"))?
+        };
+        entries.push(entry);
+        left += w as i32;
+    }
+    DisplayControlMonitorLayout::new(&entries).map_err(|e| anyhow!("{e}"))
+}
+
 fn input_events(db: &mut Database, msg: ClientMsg, width: u16, height: u16) -> Vec<FastPathInputEvent> {
     let ops: Vec<Operation> = match msg {
         ClientMsg::Move { x, y } => vec![Operation::MouseMove(MousePosition {
@@ -1653,6 +1758,8 @@ fn input_events(db: &mut Database, msg: ClientMsg, width: u16, height: u16) -> V
         | ClientMsg::FrameAck { .. }
         | ClientMsg::SignOut
         | ClientMsg::Sound { .. }
+        | ClientMsg::Ping { .. }
+        | ClientMsg::Monitors { .. }
         | ClientMsg::ClipImage { .. }
         | ClientMsg::ClipFiles { .. }
         | ClientMsg::Fetch => return Vec::new(),

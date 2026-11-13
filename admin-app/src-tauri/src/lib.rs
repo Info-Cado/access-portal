@@ -6,7 +6,9 @@
 //! tray icon. The admin panel talks to the portal in-process, so it exists only
 //! on this computer and cannot be reached over the network.
 
+mod alerts;
 mod tunnel;
+mod updates;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -20,7 +22,7 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 /// Started from Windows sign-in: stay in the tray instead of opening a window.
 const HIDDEN_ARG: &str = "--hidden";
 
-enum Server {
+pub(crate) enum Server {
     Running(access_portal::Portal),
     /// Why the portal could not start (shown in the window).
     Failed(String),
@@ -116,6 +118,43 @@ fn lock(lock: State<'_, AppLock>) {
     lock.lock();
 }
 
+/// Send a test phone alert to the topic set in the app.
+#[tauri::command]
+async fn test_alert(app: AppHandle, lock: State<'_, AppLock>, server: String, topic: String) -> Result<(), String> {
+    if !lock.is_unlocked() {
+        return Err("The app is locked.".into());
+    }
+    let name = alerts::install_name(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        alerts::send(&server, &topic, &format!("{name}: test alert"), "Alerts from Access Portal will arrive like this.", "bell", false)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Restart the app (and the portal in it), e.g. to restore a backup.
+#[tauri::command]
+fn restart_app(app: AppHandle, lock: State<'_, AppLock>) -> Result<(), String> {
+    if !lock.is_unlocked() {
+        return Err("The app is locked.".into());
+    }
+    app.restart()
+}
+
+#[tauri::command]
+fn update_status(app: AppHandle) -> Value {
+    updates::status_json(&app)
+}
+
+/// Check for an update now; with `install`, install it (the app restarts).
+#[tauri::command]
+async fn update_check(app: AppHandle, lock: State<'_, AppLock>, install: bool) -> Result<Value, String> {
+    if !lock.is_unlocked() {
+        return Err("The app is locked.".into());
+    }
+    updates::check(&app, install).await
+}
+
 /// Save a file to the Downloads folder and show it in Explorer.
 #[tauri::command]
 fn save_download(lock: State<'_, AppLock>, name: String, contents: String) -> Result<String, String> {
@@ -207,12 +246,30 @@ pub fn run() {
     tauri::Builder::default()
         // A second launch just brings the running copy to the front (two copies
         // would fight over the portal's port).
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
+        // Running it again with `--update` makes the running copy install an
+        // available update right away (for scripts and support).
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|a| a == "--update") {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = updates::check(&app, true).await {
+                        tracing::warn!("update on request: {e}");
+                    }
+                });
+            } else {
+                show_window(app)
+            }
+        }))
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![HIDDEN_ARG])))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().pubkey(updates::PUBKEY).build())
         .setup(|app| {
             let dir = data_dir();
             start_logging(&dir);
+            // Where the portal fetches RDP Wrapper settings from (see host_setup.ps1).
+            if let Some(base) = tunnel::service_base() {
+                std::env::set_var("ACCESS_PORTAL_SERVICE_URL", base);
+            }
 
             let server = match tauri::async_runtime::block_on(access_portal::start(&dir)) {
                 Ok(portal) => Server::Running(portal),
@@ -238,6 +295,9 @@ pub fn run() {
             app.manage(server);
             app.manage(public);
             app.manage(AppLock::default());
+            app.manage(updates::UpdateState::default());
+            alerts::start(app.handle().clone());
+            updates::start(app.handle().clone());
 
             // Start with Windows by default, once; after that the tray setting
             // rules. While it is on, re-register on every start so the entry
@@ -268,7 +328,17 @@ pub fn run() {
                 window.app_handle().state::<AppLock>().lock();
             }
         })
-        .invoke_handler(tauri::generate_handler![status, request, unlock, lock, save_download])
+        .invoke_handler(tauri::generate_handler![
+            status,
+            request,
+            unlock,
+            lock,
+            save_download,
+            test_alert,
+            restart_app,
+            update_status,
+            update_check
+        ])
         .build(tauri::generate_context!())
         .expect("starting Access Portal")
         .run(|app, event| {

@@ -33,6 +33,8 @@ const FLAG_TEXT: u8 = 2;
 
 pub enum Incoming {
     Text(String),
+    /// Microphone sound and camera frames (first byte says which).
+    Binary(Vec<u8>),
     Closed,
 }
 
@@ -62,6 +64,7 @@ impl Transport for WsTransport {
         loop {
             match self.0.recv().await {
                 Some(Ok(Message::Text(text))) => return Incoming::Text(text),
+                Some(Ok(Message::Binary(data))) => return Incoming::Binary(data),
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Incoming::Closed,
                 Some(Ok(_)) => {}
             }
@@ -202,11 +205,13 @@ impl PeerConnectionEventHandler for Handler {
                         pending.extend_from_slice(body);
                         if flags & FLAG_LAST != 0 {
                             let whole = std::mem::take(&mut pending);
-                            if flags & FLAG_TEXT != 0 {
-                                let text = String::from_utf8_lossy(&whole).into_owned();
-                                if tx.send(Incoming::Text(text)).is_err() {
-                                    return;
-                                }
+                            let message = if flags & FLAG_TEXT != 0 {
+                                Incoming::Text(String::from_utf8_lossy(&whole).into_owned())
+                            } else {
+                                Incoming::Binary(whole)
+                            };
+                            if tx.send(message).is_err() {
+                                return;
                             }
                         }
                     }

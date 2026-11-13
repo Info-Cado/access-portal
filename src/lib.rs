@@ -10,10 +10,12 @@ mod access;
 mod activity;
 mod api;
 mod auth;
+mod backup;
 mod clipimage;
 mod clock;
 mod config;
 mod db;
+mod devices;
 mod gfx;
 mod error;
 mod host;
@@ -50,6 +52,34 @@ pub struct AppState {
     pub limiter: Arc<web::LoginLimiter>,
     /// Sessions open right now.
     pub presence: Arc<presence::Presence>,
+    /// The folder holding the database, settings and backups.
+    pub data_dir: PathBuf,
+    /// Recent problems, for the app's alerts.
+    pub health: Arc<Health>,
+}
+
+/// Sessions that could not be opened recently (unix time, why).
+#[derive(Default)]
+pub struct Health {
+    failures: std::sync::Mutex<std::collections::VecDeque<(i64, String)>>,
+}
+
+impl Health {
+    pub fn session_failed(&self, why: &str) {
+        let mut f = self.failures.lock().unwrap();
+        f.push_back((db::now(), why.to_string()));
+        while f.len() > 50 {
+            f.pop_front();
+        }
+    }
+
+    /// How many sessions failed in the last `secs` seconds, and the latest reason.
+    pub fn recent_failures(&self, secs: i64) -> (usize, Option<String>) {
+        let f = self.failures.lock().unwrap();
+        let since = db::now() - secs;
+        let recent: Vec<_> = f.iter().filter(|(t, _)| *t >= since).collect();
+        (recent.len(), recent.last().map(|(_, why)| why.clone()))
+    }
 }
 
 /// A running portal.
@@ -73,6 +103,10 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating {}", data_dir.display()))?;
     restrict_access(data_dir);
+    // A backup chosen in the app is put in place before anything is opened.
+    if let Err(e) = backup::restore_if_requested(data_dir) {
+        tracing::error!("restoring a backup: {e:#}");
+    }
     load_settings(data_dir)?;
 
     let config = config::Config::from_env()?;
@@ -101,7 +135,25 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
         config: Arc::new(config),
         limiter: Arc::new(web::LoginLimiter::new()),
         presence: Arc::default(),
+        data_dir: data_dir.to_path_buf(),
+        health: Arc::default(),
     };
+
+    // A backup a day (checked hourly, so a computer that was off catches up).
+    let backups = state.clone();
+    tokio::spawn(async move {
+        let mut hourly = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            hourly.tick().await;
+            let newest = backup::list(&backups.data_dir).first().map(|b| b.at).unwrap_or(0);
+            if db::now() - newest >= 23 * 3600 {
+                let settings = settings::backups(&backups.pool).await;
+                if let Err(e) = backup::make(&backups.pool, &backups.data_dir, &settings).await {
+                    tracing::warn!("daily backup: {e:#}");
+                }
+            }
+        }
+    });
 
     // Forget expired sign-ins and old activity once an hour.
     let pool = state.pool.clone();

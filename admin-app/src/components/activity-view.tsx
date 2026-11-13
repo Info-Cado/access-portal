@@ -20,6 +20,8 @@ const KINDS: Record<string, { label: string; tone?: "bad" | "warn" | "admin" }> 
   signin_failed: { label: "Sign-in failed", tone: "bad" },
   signin_denied: { label: "Not allowed now", tone: "warn" },
   signout: { label: "Signed out" },
+  password: { label: "Password changed" },
+  session_failed: { label: "Session failed", tone: "bad" },
   session_start: { label: "Session opened" },
   session_end: { label: "Session closed" },
   print: { label: "Printed" },

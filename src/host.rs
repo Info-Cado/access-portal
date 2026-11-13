@@ -267,6 +267,10 @@ pub fn tune_remote_desktop() {
             (r"HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations", "DWMFRAMEINTERVAL", 15),
             // New accounts would otherwise start with Windows' privacy-settings screen.
             (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\OOBE", "DisablePrivacyExperience", 1),
+            // Let sessions use the user's microphone and camera, and play sound.
+            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableAudioCapture", 0),
+            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableCam", 0),
+            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableCameraRedir", 0),
         ];
         for (key, name, value) in settings {
             let current = std::process::Command::new("reg")
@@ -516,4 +520,59 @@ pub fn set_shadow_policy(ask: bool) {
     }
     #[cfg(not(windows))]
     let _ = ask;
+}
+
+/// What this computer needs to serve portal sessions, checked (and with `fix`,
+/// repaired) by `host_setup.ps1`: one JSON object per check.
+pub fn setup_blocking(fix: &[String]) -> anyhow::Result<Vec<serde_json::Value>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Too long for -EncodedCommand (the command line limit), so run it as a file.
+        let path = std::env::temp_dir().join(format!("access-portal-setup-{}.ps1", std::process::id()));
+        std::fs::write(&path, include_str!("host_setup.ps1")).context("writing the setup script")?;
+        let ini_urls = std::env::var("ACCESS_PORTAL_SERVICE_URL")
+            .map(|base| format!("{}/v1/rdpwrap.ini", base.trim_end_matches('/')))
+            .unwrap_or_default();
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&path)
+            .env("AP_ACTION", if fix.is_empty() { "check" } else { "fix" })
+            .env("AP_FIX", fix.join(","))
+            .env("AP_INI_URLS", ini_urls)
+            .creation_flags(0x0800_0000)
+            .output();
+        let _ = std::fs::remove_file(&path);
+        let out = out.context("starting PowerShell")?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let last = stdout.lines().rev().find(|l| l.trim_start().starts_with('[')).unwrap_or("");
+        serde_json::from_str(last.trim()).with_context(|| {
+            format!("unexpected answer from the setup script: {}{}", stdout.trim(), String::from_utf8_lossy(&out.stderr).trim())
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = fix;
+        bail!("Setting up the computer needs Windows.")
+    }
+}
+
+/// Free space on the drive holding `path`, in bytes (`None` if unknown).
+pub fn disk_free(path: &std::path::Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        extern "system" {
+            fn GetDiskFreeSpaceExW(dir: *const u16, free_to_caller: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+        let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+        (ok != 0).then_some(avail)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
 }

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
 <style>
-html,body{margin:0;height:100%;background:#0b0e18;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#e8ecf6}
+html,body{margin:0;height:100%;background:#0b0e18;overflow:hidden;overscroll-behavior:none;font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#e8ecf6}
 #screen{position:absolute;display:block;outline:none;touch-action:none;-webkit-user-select:none;user-select:none}
 #overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0b0e18;text-align:center;z-index:30}
 #overlay.hidden,#drop.hidden,#panel.hidden,#toast.hidden{display:none}
@@ -20,6 +20,10 @@ form{display:inline}
 #tools button:hover{background:#2a3149}
 #tools .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#5fd39a;margin-right:6px;vertical-align:1px}
 #tools .dot.relayed{background:#e6b450}
+#sig{font-size:.75rem;color:#9aa3ba;padding:4px 8px;display:flex;align-items:center;gap:5px;cursor:default;white-space:nowrap}
+#sig i{display:inline-block;width:7px;height:7px;border-radius:50%;background:#5c6378}
+#sig.good i{background:#5fd39a}#sig.ok i{background:#e6b450}#sig.poor i{background:#ff6b6b}
+#dev{font-size:.75rem;color:#ff8a80;padding:4px 8px;white-space:nowrap}#dev:empty{display:none}
 #menu{position:fixed;top:34px;left:50%;transform:translateX(-50%);z-index:11;min-width:250px;background:#171c2e;border:1px solid #2a3149;border-radius:10px;padding:6px;box-shadow:0 12px 32px rgba(0,0,0,.45)}
 #menu.hidden{display:none}
 #menu button{display:block;width:100%;text-align:left;background:none;border:0;color:#e8ecf6;font-size:.88rem;padding:9px 12px;border-radius:7px;cursor:pointer}
@@ -63,6 +67,8 @@ form{display:inline}
 <div id="tools">
   <button id="filesBtn" type="button" title="Shared files and print jobs"><span id="linkDot" class="dot"></span>Files</button>
   <button id="fullBtn" type="button" title="Full screen">Full screen</button>
+  <span id="sig" title="Connection"><i></i><span id="sigText">…</span></span>
+  <span id="dev" title="An app in the session is using it"></span>
   <button id="menuBtn" type="button" title="More" aria-haspopup="menu">&#8943;</button>
 </div>
 <div id="menu" class="hidden" role="menu">
@@ -71,6 +77,11 @@ form{display:inline}
   <hr>
   <button type="button" data-menu="sound">Sound<small id="soundState"></small></button>
   <button type="button" data-menu="autoprint">Printing<small id="printState"></small></button>
+  <button type="button" data-menu="fit">Fit to window<small id="fitState"></small></button>
+  <button type="button" data-menu="screen2">Second screen<small id="screen2State"></small></button>
+  <button type="button" data-menu="quality">Quality<small id="qualityState"></small></button>
+  <button type="button" data-menu="mic">Microphone<small id="micState"></small></button>
+  <button type="button" data-menu="cam">Camera<small id="camState"></small></button>
   <hr>
   <button type="button" data-menu="logout">Log out of the portal</button>
 </div>
@@ -142,6 +153,9 @@ form{display:inline}
       var out = ab.getChannelData(c);
       for (var i = 0; i < frames; i++) out[i] = pcm[i * ch + c] / 32768;
     }
+    playBuffer(ab);
+  }
+  function playBuffer(ab) {
     var src = actx.createBufferSource();
     src.buffer = ab; src.connect(actx.destination);
     var now = actx.currentTime;
@@ -151,19 +165,57 @@ form{display:inline}
     aNext += ab.duration;
     window.__sound = (window.__sound || 0) + 1;   // for tests
   }
+  // AAC (ADTS frames) decoded by the browser; a tenth of the bandwidth of PCM.
+  var adec = null, adecKey = "", aTs = 0;
+  function soundAac(buf) {
+    window.__soundIn = (window.__soundIn || 0) + 1;   // for tests
+    window.__soundAac = (window.__soundAac || 0) + 1;
+    if (!soundOn || !actx || actx.state !== "running" || !window.AudioDecoder) return;
+    var v = new DataView(buf), ch = v.getUint8(1), rate = v.getUint32(2, true), key = ch + "/" + rate;
+    if (!adec || adec.state === "closed" || adecKey !== key) {
+      try { if (adec && adec.state !== "closed") adec.close(); } catch (e) {}
+      adec = new AudioDecoder({
+        output: function (ad) {
+          var ab = actx.createBuffer(ad.numberOfChannels, ad.numberOfFrames, ad.sampleRate);
+          for (var c = 0; c < ad.numberOfChannels; c++) {
+            var plane = new Float32Array(ad.numberOfFrames);
+            ad.copyTo(plane, { planeIndex: c, format: "f32-planar" });
+            ab.copyToChannel(plane, c);
+          }
+          ad.close();
+          playBuffer(ab);
+        },
+        error: function (e) { window.__soundError = String(e); adec = null; }
+      });
+      adec.configure({ codec: "mp4a.40.2", sampleRate: rate, numberOfChannels: ch });
+      adecKey = key;
+    }
+    var bytes = new Uint8Array(buf, 6), off = 0, step = 1024 * 1e6 / rate;
+    // A block may hold several ADTS frames; the decoder takes one at a time.
+    while (off + 7 <= bytes.length && bytes[off] === 0xFF && (bytes[off + 1] & 0xF0) === 0xF0) {
+      var len = ((bytes[off + 3] & 3) << 11) | (bytes[off + 4] << 3) | (bytes[off + 5] >> 5);
+      if (len < 7 || off + len > bytes.length) break;
+      adec.decode(new EncodedAudioChunk({ type: "key", timestamp: aTs, data: bytes.subarray(off, off + len) }));
+      aTs += step; off += len;
+    }
+    if (off === 0) { adec.decode(new EncodedAudioChunk({ type: "key", timestamp: aTs, data: bytes })); aTs += step; }
+  }
 
   // ---- layout: the session follows the window; until the host catches up the picture is scaled ----
-  var zoom = 1, cur = { x: 0, y: 0 }, touchUi = false, barH = 0;
+  var zoom = 1, cur = { x: 0, y: 0 }, touchUi = false, barH = 0, screens = null;
   function view() {
     var v = window.visualViewport;
     return v ? { w: v.width, h: v.height, x: v.offsetLeft, y: v.offsetTop } : { w: window.innerWidth, h: window.innerHeight, x: 0, y: 0 };
   }
   function fit() {
     var v = view(), availH = v.h - barH;
-    var s = Math.min(v.w / canvas.width, availH / canvas.height, 1) * zoom;
-    var w = Math.round(canvas.width * s), h = Math.round(canvas.height * s);
+    // With a second screen, this window shows only the first monitor (the left
+    // part of the desktop); the rest of the canvas lies off to the right.
+    var shownW = screens ? Math.min(screens[0].w, canvas.width) : canvas.width;
+    var s = Math.min(v.w / shownW, availH / canvas.height, 1) * zoom;
+    var w = Math.round(canvas.width * s), h = Math.round(canvas.height * s), sw = Math.round(shownW * s);
     // Larger than the viewport (zoomed in): keep the pointer in view. Otherwise centre.
-    var left = w <= v.w ? (v.w - w) / 2 : Math.min(0, Math.max(v.w - w, v.w / 2 - cur.x * s));
+    var left = sw <= v.w ? (v.w - sw) / 2 : Math.min(0, Math.max(v.w - sw, v.w / 2 - cur.x * s));
     var top = h <= availH ? (availH - h) / 2 : Math.min(0, Math.max(availH - h, availH / 2 - cur.y * s));
     canvas.style.width = w + "px";
     canvas.style.height = h + "px";
@@ -185,11 +237,38 @@ form{display:inline}
     window.visualViewport.addEventListener("resize", fit);
     window.visualViewport.addEventListener("scroll", fit);
   }
+  // ---- session size ----
+  // "Fit to window" (default on phones and tablets): the Windows session takes
+  // the size of the browser window. Otherwise it has the portal's fixed size
+  // (1920x1080 by default) and the browser scales it. On a slow link ("Quality:
+  // Auto" or "Fast") the session is made smaller, which needs much less data.
+  var phone = matchMedia("(pointer: coarse)").matches && Math.min(screen.width, screen.height) < 900;
+  var fitWindow = pref("fit", phone), quality = prefText("quality", "auto"), slowLink = false, askedSize = null;
+  function prefText(name, fallback) { try { return localStorage.getItem("portal." + name) || fallback; } catch (e) { return fallback; } }
+  function setPrefText(name, v) { try { localStorage.setItem("portal." + name, v); } catch (e) {} }
+  function wantedSize() {
+    var w, h;
+    if (fitWindow) {
+      // Phones get a desktop-sized session (at least 1280 wide in landscape), not a tiny one.
+      var k = phone ? Math.max(1, Math.min(2, 1280 / Math.max(window.innerWidth, window.innerHeight))) : 1;
+      w = window.innerWidth * k; h = (window.innerHeight - barH) * k;
+    } else if (rtc.fixed) { w = rtc.fixed[0]; h = rtc.fixed[1]; }
+    else { w = window.innerWidth; h = window.innerHeight; }
+    if (quality === "fast" || (quality === "auto" && slowLink)) { w *= 0.67; h *= 0.67; }
+    return { w: Math.round(w), h: Math.round(h) };
+  }
+  function applySize() {
+    if (screen2) { sendScreens(); return; }
+    var s = wantedSize();
+    if (askedSize && askedSize.w === s.w && askedSize.h === s.h) return;
+    askedSize = s;
+    send({ t: "resize", w: s.w, h: s.h });
+  }
   var resizeTimer = null;
   window.addEventListener("resize", function () {
     fit();
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function () { send({ t: "resize", w: window.innerWidth, h: window.innerHeight }); }, 350);
+    if (fitWindow) resizeTimer = setTimeout(applySize, 350);
   });
 
   function showEnd(title, detail) {
@@ -204,7 +283,9 @@ form{display:inline}
 
   // ---- link to the portal: a direct peer-to-peer channel when possible, else a WebSocket ----
   var rtc = __RTC__;
-  var query = "?w=" + window.innerWidth + "&h=" + window.innerHeight;
+  var firstSize = wantedSize();
+  askedSize = firstSize;
+  var query = "?w=" + firstSize.w + "&h=" + firstSize.h + "&sz=1";
   var link = null;                       // { send(string), kind }
   function send(obj) { if (link) link.send(JSON.stringify(obj)); }
 
@@ -410,6 +491,7 @@ form{display:inline}
   }
 
   function onText(text) {
+    bytesIn += text.length;
     var m = JSON.parse(text);
     if (m.t === "g") { m.ops.forEach(function (o) { gqueue(function () {
       var t = performance.now(), r = gop(o), rec = gstats.ops[o.o] || (gstats.ops[o.o] = { n: 0, ms: 0 });
@@ -430,6 +512,12 @@ form{display:inline}
       vstop(m.b);
     } else if (m.t === "print") {
       printed(m.name, m.size);
+    } else if (m.t === "mic") {
+      if (m.on) micStart(m.rate, m.ch); else micStop();
+    } else if (m.t === "cam") {
+      if (m.on) camStart(m.w, m.h); else camStop();
+    } else if (m.t === "pong") {
+      pong(m.n);
     } else if (m.t === "msg") {
       adminMessage(m.text, m.at);
     } else if (m.t === "note") {
@@ -463,8 +551,10 @@ form{display:inline}
   }
   window.__cells = cellsOf;
   function onBinary(buf) {
+    bytesIn += buf.byteLength;
     var kind = new DataView(buf).getUint8(0);
     if (kind === 7) { sound(buf); return; }         // sound from the session
+    if (kind === 9) { soundAac(buf); return; }      // sound from the session, AAC
     if (kind === 8) { remoteImage(buf); return; }   // a picture copied in the session
     if (kind === 5) { gvideo(buf); return; }        // Windows' H.264 picture
     if (kind === 6) { gpixels(buf); return; }       // pixels the portal decoded
@@ -526,7 +616,14 @@ form{display:inline}
     var proto = location.protocol === "https:" ? "wss" : "ws";
     var ws = new WebSocket(proto + "://" + location.host + "/ws/" + encodeURIComponent(key) + query);
     ws.binaryType = "arraybuffer";
-    ws.onopen = function () { link = { kind: "relayed", send: function (s) { if (ws.readyState === 1) ws.send(s); } }; showLink(); };
+    ws.onopen = function () {
+      link = {
+        kind: "relayed",
+        send: function (s) { if (ws.readyState === 1) ws.send(s); },
+        sendBin: function (b) { if (ws.readyState === 1 && ws.bufferedAmount < 4e6) ws.send(b); }
+      };
+      showLink();
+    };
     ws.onmessage = function (ev) { if (typeof ev.data === "string") onText(ev.data); else onBinary(ev.data); };
     ws.onclose = function () { lost(mine); };
     closeLink = function () { ws.onclose = null; try { ws.close(); } catch (e) {} };
@@ -564,6 +661,17 @@ form{display:inline}
           do {
             var end = Math.min(off + CHUNK, bytes.length), out = new Uint8Array(end - off + 1);
             out[0] = 2 | (end === bytes.length ? 1 : 0);
+            out.set(bytes.subarray(off, end), 1);
+            dc.send(out);
+            off = end;
+          } while (off < bytes.length);
+        },
+        sendBin: function (bytes) {
+          if (dc.readyState !== "open" || dc.bufferedAmount > 4e6) return;
+          var off = 0;
+          do {
+            var end = Math.min(off + CHUNK, bytes.length), out = new Uint8Array(end - off + 1);
+            out[0] = end === bytes.length ? 1 : 0;
             out.set(bytes.subarray(off, end), 1);
             dc.send(out);
             off = end;
@@ -620,6 +728,11 @@ form{display:inline}
   }
 
   function startLink() { if (rtc.p2p && window.RTCPeerConnection) startDirect(); else startWebSocket(); }
+  // Tell the server (?ad=aac) when this browser can decode AAC sound.
+  var audioCheck = (window.AudioDecoder && AudioDecoder.isConfigSupported)
+    ? AudioDecoder.isConfigSupported({ codec: "mp4a.40.2", sampleRate: 44100, numberOfChannels: 2 })
+        .then(function (s) { if (s && s.supported) query += "&ad=aac"; }).catch(function () {})
+    : Promise.resolve();
   // Tell the server (via ?vd=1) only if this browser can actually decode the video,
   // so one that can't simply gets the tile stream.
   if (window.VideoDecoder && VideoDecoder.isConfigSupported) {
@@ -631,9 +744,10 @@ form{display:inline}
           .then(function (t) { if (t && t.supported) query += "&vd=1"; });
       })
       .catch(function () {})
+      .then(function () { return audioCheck; })
       .then(startLink);
   } else {
-    startLink();
+    audioCheck.then(startLink);
   }
 
 
@@ -825,22 +939,37 @@ form{display:inline}
   }
   function clickAt(button, p) { press(button, p); release(button, p); }
 
-  var g = null, lastTap = 0, dragging = false;
+  var g = null, lastTap = 0, dragging = false, holdTimer = null;
   function mid(ts) { return { x: (ts[0].clientX + ts[1].clientX) / 2, y: (ts[0].clientY + ts[1].clientY) / 2 }; }
   function spread(ts) { return Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY); }
   canvas.addEventListener("touchstart", function (e) {
     e.preventDefault();                       // no delayed, synthesized mouse events
     enableTouchUi();
     var now = performance.now(), t = e.touches[0];
+    clearTimeout(holdTimer);
     if (!padMode) {
-      if (e.touches.length === 1) { g = { direct: true, id: t.identifier }; press(0, pos(t)); }
+      if (e.touches.length === 1) {
+        g = { direct: true, id: t.identifier, x: t.clientX, y: t.clientY, p: pos(t) };
+        press(0, g.p);
+        // Holding still: right-click there instead.
+        holdTimer = setTimeout(function () {
+          if (!g || !g.direct || g.moved) return;
+          release(0, g.p); clickAt(2, g.p); g.held = true;
+        }, 550);
+      }
       return;
     }
     if (e.touches.length === 1) {
       g = { t0: now, x: t.clientX, y: t.clientY, lx: t.clientX, ly: t.clientY, moved: false, two: false, armed: now - lastTap < 320 };
+      // Holding still (not after a tap, which starts a drag): right-click at the pointer.
+      if (!g.armed) holdTimer = setTimeout(function () {
+        if (!g || g.moved || g.two) return;
+        clickAt(2, curPos()); g.held = true;
+      }, 550);
     } else if (e.touches.length === 2 && g) {
+      clearTimeout(holdTimer);
       var m = mid(e.touches);
-      g.two = true; g.d0 = spread(e.touches); g.z0 = zoom; g.my = m.y; g.pinch = false; g.scrolled = false;
+      g.two = true; g.d0 = spread(e.touches); g.z0 = zoom; g.my = m.y; g.mx = m.x; g.pinch = false; g.scrolled = false;
     }
   }, { passive: false });
   canvas.addEventListener("touchmove", function (e) {
@@ -848,6 +977,7 @@ form{display:inline}
     if (!g) return;
     if (g.direct) {
       for (var i = 0; i < e.touches.length; i++) if (e.touches[i].identifier === g.id) {
+        if (Math.hypot(e.touches[i].clientX - g.x, e.touches[i].clientY - g.y) > 10) g.moved = true;
         pending = pos(e.touches[i]);
         if (!queued) { queued = true; requestAnimationFrame(flushMove); }
       }
@@ -863,6 +993,9 @@ form{display:inline}
         // fingers up = content up, like a touch screen
         send({ t: "w", v: m.y < g.my ? -1 : 1, h: 0 });
         g.my = m.y; g.scrolled = true;
+      } else if (Math.abs(m.x - g.mx) >= 22) {
+        send({ t: "w", v: 0, h: m.x < g.mx ? 1 : -1 });
+        g.mx = m.x; g.scrolled = true;
       }
       return;
     }
@@ -879,7 +1012,9 @@ form{display:inline}
   function touchDone(e) {
     e.preventDefault();
     if (!g || e.touches.length) return;       // wait until every finger is up
+    clearTimeout(holdTimer);
     var now = performance.now(), quick = now - g.t0 < 350;
+    if (g.held) { g = null; return; }         // the hold already right-clicked
     if (g.direct) { release(0, e.changedTouches.length ? pos(e.changedTouches[0]) : null); }
     else if (dragging) { dragging = false; release(0, curPos()); }
     else if (g.two) { if (quick && !g.pinch && !g.scrolled) clickAt(2, curPos()); }
@@ -1079,6 +1214,17 @@ form{display:inline}
       if (soundOn) audio(); else aNext = 0;
     } else if (act === "autoprint") {
       autoPrint = !autoPrint; setPref("autoprint", autoPrint); showPrefs();
+    } else if (act === "screen2") {
+      if (screen2) closeScreen2(); else openScreen2();
+    } else if (act === "mic") {
+      micAllowed = !micAllowed; setPref("mic", micAllowed); if (!micAllowed) micStop(); showPrefs();
+    } else if (act === "cam") {
+      camAllowed = !camAllowed; setPref("cam", camAllowed); if (!camAllowed) camStop(); showPrefs();
+    } else if (act === "fit") {
+      fitWindow = !fitWindow; setPref("fit", fitWindow); showPrefs(); applySize();
+    } else if (act === "quality") {
+      quality = { auto: "sharp", sharp: "fast", fast: "auto" }[quality] || "auto";
+      setPrefText("quality", quality); showPrefs(); applySize();
     }
   });
   function fullscreenOn() { return document.fullscreenElement || document.webkitFullscreenElement; }
@@ -1151,8 +1297,213 @@ form{display:inline}
   function showPrefs() {
     $("soundState").textContent = soundOn ? "On · click to mute" : "Off · click to turn on";
     $("printState").textContent = autoPrint ? "Opens the print dialog right away" : "Shows a notice; you open the job yourself";
+    $("fitState").textContent = fitWindow ? "On · the session is the size of this window" : "Off · the session is scaled to fit";
+    $("micState").textContent = micAllowed ? "Used when an app in the session asks" : "Off";
+    $("camState").textContent = camAllowed ? "Used when an app in the session asks" : "Off";
+    $("screen2State").textContent = screen2 ? "On · click to go back to one screen" : "Opens the session's second monitor in a new window";
+    $("qualityState").textContent = {
+      auto: "Auto · lower resolution while the connection is slow",
+      sharp: "Sharp · always full resolution",
+      fast: "Fast · lower resolution, less data"
+    }[quality] || "";
   }
-  showPrefs();
+
+  // ---- microphone and camera ----
+  // Started only when an app in the session opens them (the browser asks the
+  // user the first time), and stopped when it closes them.
+  var micAllowed = pref("mic", true), camAllowed = pref("cam", true), mic = null, cam = null;
+  function sendBin(bytes) { if (link && link.sendBin) link.sendBin(bytes); }
+  function showDevices() {
+    $("dev").textContent = [mic ? "● Mic" : "", cam ? "● Camera" : ""].filter(Boolean).join("  ");
+  }
+  function micStart(rate, ch) {
+    micStop();
+    if (!micAllowed || !navigator.mediaDevices) return;
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }).then(function (stream) {
+      if (!micAllowed) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+      var AC = window.AudioContext || window.webkitAudioContext, ctx = new AC();
+      var src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(2048, 1, 1);
+      var ratio = ctx.sampleRate / rate, at = 0;
+      proc.onaudioprocess = function (e) {
+        // Resample to Windows' rate (linear), 16-bit, its channel count.
+        var input = e.inputBuffer.getChannelData(0), n = Math.max(0, Math.floor((input.length - at) / ratio));
+        var out = new Int16Array(n * ch);
+        for (var i = 0; i < n; i++) {
+          var x = at + i * ratio, j = Math.floor(x), f = x - j;
+          var a = input[j] || 0, b = j + 1 < input.length ? input[j + 1] : a;
+          var v = Math.max(-1, Math.min(1, a + (b - a) * f)), s = v < 0 ? v * 32768 : v * 32767;
+          for (var c = 0; c < ch; c++) out[i * ch + c] = s;
+        }
+        at = at + n * ratio - input.length;
+        var msg = new Uint8Array(1 + out.byteLength);
+        msg[0] = 2; msg.set(new Uint8Array(out.buffer), 1);
+        sendBin(msg);
+        window.__micSent = (window.__micSent || 0) + 1;   // for tests
+      };
+      src.connect(proc); proc.connect(ctx.destination);   // (its output is silence)
+      mic = { stream: stream, ctx: ctx };
+      showDevices();
+    }).catch(function () { say("The microphone is blocked. Allow it in the browser to use it in the session."); });
+  }
+  function micStop() {
+    if (!mic) return;
+    mic.stream.getTracks().forEach(function (t) { t.stop(); });
+    mic.ctx.close().catch(function () {});
+    mic = null; showDevices();
+  }
+  function camStart(w, h) {
+    camStop();
+    if (!camAllowed || !navigator.mediaDevices) return;
+    navigator.mediaDevices.getUserMedia({ video: { width: { ideal: w }, height: { ideal: h } } }).then(function (stream) {
+      if (!camAllowed) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+      var video = document.createElement("video");
+      video.muted = true; video.playsInline = true; video.srcObject = stream; video.play().catch(function () {});
+      var c = document.createElement("canvas"); c.width = w; c.height = h;
+      var cx = c.getContext("2d"), busy = false;
+      // About 15 frames a second, never more than one on its way.
+      var timer = setInterval(function () {
+        if (busy || video.readyState < 2) return;
+        busy = true;
+        cx.drawImage(video, 0, 0, w, h);
+        c.toBlob(function (blob) {
+          if (!blob) { busy = false; return; }
+          blob.arrayBuffer().then(function (ab) {
+            var msg = new Uint8Array(1 + ab.byteLength);
+            msg[0] = 1; msg.set(new Uint8Array(ab), 1);
+            sendBin(msg); busy = false;
+            window.__camFrames = (window.__camFrames || 0) + 1;   // for tests
+          });
+        }, "image/jpeg", 0.75);
+      }, 66);
+      cam = { stream: stream, timer: timer };
+      showDevices();
+    }).catch(function () { say("The camera is blocked. Allow it in the browser to use it in the session."); });
+  }
+  function camStop() {
+    if (!cam) return;
+    clearInterval(cam.timer);
+    cam.stream.getTracks().forEach(function (t) { t.stop(); });
+    cam = null; showDevices();
+  }
+
+  // ---- second screen ----
+  // A second window shows the session's second monitor. The session gets two
+  // monitors side by side (this window's size, then that window's); this page
+  // decodes the whole desktop and the other window copies its part of it each
+  // frame. Its mouse and keyboard go to the session like this window's. With
+  // the browser's window-management permission it opens on the other screen.
+  var screen2 = null, screen2Timer = null;
+  function sendScreens() {
+    if (!screen2 || screen2.closed) return;
+    var a = wantedSize(), d = screen2.document.documentElement;
+    var b = { w: Math.round(d.clientWidth), h: Math.round(d.clientHeight) };
+    screens = [a, b];
+    askedSize = null;
+    send({ t: "monitors", m: [[a.w, a.h], [b.w, b.h]] });
+    fit();
+  }
+  function openScreen2() {
+    var w = window.open("", "portal-screen-2", "popup,width=1280,height=720");
+    if (!w) { say("The browser blocked the second window. Allow pop-ups for this site and try again."); return; }
+    screen2 = w;
+    w.document.open();
+    w.document.write('<!doctype html><title>' + document.title + ' (screen 2)</title>' +
+      '<style>html,body{margin:0;height:100%;background:#0b0e18;overflow:hidden}canvas{display:block;width:100%;height:100%;outline:none;cursor:default}' +
+      '#fs{position:fixed;top:0;left:50%;transform:translateX(-50%);background:#171c2e;color:#e8ecf6;border:1px solid #2a3149;border-top:0;border-radius:0 0 10px 10px;padding:4px 12px;font:13px system-ui;opacity:.35;cursor:pointer}#fs:hover{opacity:1}</style>' +
+      '<canvas id="c" tabindex="0"></canvas><div id="fs">Full screen</div>');
+    w.document.close();
+    var c = w.document.getElementById("c"), cx = c.getContext("2d");
+    w.document.getElementById("fs").onclick = function () {
+      var el = w.document.documentElement;
+      if (w.document.fullscreenElement) w.document.exitFullscreen(); else el.requestFullscreen().then(function () {
+        if (w.navigator.keyboard && w.navigator.keyboard.lock) w.navigator.keyboard.lock().catch(function () {});
+      }).catch(function () {});
+    };
+    // Its part of the desktop, copied whenever the page has drawn.
+    var copy = function () {
+      if (!screen2 || w.closed) return;
+      if (screens && canvas.width > screens[0].w) {
+        var x = screens[0].w, sw = canvas.width - x, sh = Math.min(canvas.height, screens[1].h);
+        if (c.width !== sw || c.height !== sh) { c.width = sw; c.height = sh; }
+        cx.drawImage(canvas, x, 0, sw, sh, 0, 0, sw, sh);
+      }
+      w.requestAnimationFrame(copy);
+    };
+    w.requestAnimationFrame(copy);
+    // Input there goes to the session, offset by the first monitor's width.
+    var at = function (e) {
+      var r = c.getBoundingClientRect(), x0 = screens ? screens[0].w : 0;
+      return { x: Math.round(x0 + (e.clientX - r.left) * c.width / Math.max(1, r.width)), y: Math.round((e.clientY - r.top) * c.height / Math.max(1, r.height)) };
+    };
+    c.addEventListener("mousemove", function (e) { var p = at(e); send({ t: "m", x: p.x, y: p.y }); });
+    c.addEventListener("mousedown", function (e) { e.preventDefault(); c.focus(); var p = at(e); send({ t: "m", x: p.x, y: p.y }); send({ t: "b", b: e.button, d: true }); });
+    c.addEventListener("mouseup", function (e) { var p = at(e); send({ t: "m", x: p.x, y: p.y }); send({ t: "b", b: e.button, d: false }); });
+    c.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+    c.addEventListener("wheel", function (e) { e.preventDefault(); send({ t: "w", v: e.deltaY > 0 ? -1 : e.deltaY < 0 ? 1 : 0, h: e.deltaX > 0 ? 1 : e.deltaX < 0 ? -1 : 0 }); }, { passive: false });
+    w.addEventListener("keydown", function (e) { e.preventDefault(); if (!(e.repeat && modifiers.test(e.code))) send({ t: "k", c: e.code, d: true }); });
+    w.addEventListener("keyup", function (e) { e.preventDefault(); send({ t: "k", c: e.code, d: false }); });
+    w.addEventListener("blur", function () { send({ t: "rel" }); });
+    w.addEventListener("resize", function () { clearTimeout(screen2Timer); screen2Timer = setTimeout(sendScreens, 400); });
+    w.addEventListener("beforeunload", function () { setTimeout(closeScreen2, 0); });
+    // Put it on the other screen when the browser lets us (Chrome and Edge ask once).
+    if (window.getScreenDetails) {
+      window.getScreenDetails().then(function (d) {
+        var other = d.screens.filter(function (s) { return s !== d.currentScreen; })[0];
+        if (other && !w.closed) { w.moveTo(other.availLeft, other.availTop); w.resizeTo(other.availWidth, other.availHeight); }
+      }).catch(function () {}).then(function () { setTimeout(sendScreens, 300); });
+    } else {
+      setTimeout(sendScreens, 300);
+    }
+    window.__screen2 = w;   // for tests
+    showPrefs();
+  }
+  function closeScreen2() {
+    if (screen2 && !screen2.closed) screen2.close();
+    screen2 = null; screens = null; askedSize = null;
+    var s = wantedSize();
+    send({ t: "monitors", m: [[s.w, s.h]] });
+    askedSize = s;
+    fit(); showPrefs();
+  }
+  window.addEventListener("beforeunload", function () { if (screen2 && !screen2.closed) screen2.close(); });
+
+  // ---- connection quality ----
+  // A ping every 2 s measures the round trip; frames and bytes are counted too.
+  // On "Quality: Auto", 10 s of a slow link lowers the resolution, and a minute
+  // of a good one brings it back.
+  var rtt = null, lastPong = performance.now(), bytesIn = 0, poorSince = 0, goodSince = 0, lastFrames = 0, fps = 0;
+  function pong(n) {
+    var r = performance.now() - n;
+    rtt = rtt === null ? r : rtt * 0.7 + r * 0.3;
+    lastPong = performance.now();
+  }
+  setInterval(function () {
+    if (closed || !link) return;
+    var now = performance.now();
+    send({ t: "ping", n: now });
+    fps = Math.round((gstats.frames - lastFrames) / 2); lastFrames = gstats.frames;
+    var kbps = Math.round(bytesIn * 8 / 2 / 1000); bytesIn = 0;
+    var silent = now - lastPong > 6000;
+    var level = silent || rtt === null ? "poor" : rtt < 80 ? "good" : rtt < 200 ? "ok" : "poor";
+    var el = $("sig");
+    el.className = level;
+    $("sigText").textContent = silent ? "no reply" : rtt === null ? "…" : Math.round(rtt) + " ms";
+    el.title = "Connection: " + (silent ? "no reply for " + Math.round((now - lastPong) / 1000) + " s" : Math.round(rtt || 0) + " ms round trip") +
+      " · " + fps + " frames/s · " + (kbps > 1000 ? (kbps / 1000).toFixed(1) + " Mbit/s" : kbps + " kbit/s") +
+      " · " + (link.kind === "direct" ? "direct link" : "through the portal") + (slowLink ? " · lower resolution while slow" : "");
+    window.__sig = { rtt: rtt, level: level, fps: fps, kbps: kbps, slow: slowLink };   // for tests
+    if (quality !== "auto") return;
+    if (level === "poor") {
+      goodSince = 0; poorSince = poorSince || now;
+      if (!slowLink && now - poorSince > 10000) {
+        slowLink = true; applySize();
+        say("The connection is slow: lowering the resolution to keep things responsive.");
+      }
+    } else {
+      poorSince = 0; goodSince = goodSince || now;
+      if (slowLink && now - goodSince > 60000) { slowLink = false; applySize(); }
+    }
+  }, 2000);
 
   // ---- admin messages ----
   var notices = [];
@@ -1184,6 +1535,8 @@ form{display:inline}
   }
   function active() { if (idleTimer) { clearInterval(idleTimer); idleTimer = null; $("idle").classList.add("hidden"); } }
   ["keydown", "pointerdown", "pointermove", "wheel", "touchstart"].forEach(function (t) { window.addEventListener(t, active, true); });
+
+  showPrefs();
 
   $("filesBtn").addEventListener("click", function () { panel.classList.toggle("hidden"); if (!panel.classList.contains("hidden")) refresh(); });
   $("closePanel").addEventListener("click", function () { panel.classList.add("hidden"); canvas.focus(); });

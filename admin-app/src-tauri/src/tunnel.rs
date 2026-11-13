@@ -15,7 +15,13 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 const PROVISION_URL: Option<&str> = option_env!("ACCESS_PORTAL_PROVISION_URL");
-const PROVISION_KEY: Option<&str> = option_env!("ACCESS_PORTAL_PROVISION_KEY");
+pub const PROVISION_KEY: Option<&str> = option_env!("ACCESS_PORTAL_PROVISION_KEY");
+
+/// The sign-up service's address (also serves updates and heartbeats), if this
+/// build has one: `https://access-portal-provision.<account>.workers.dev`.
+pub fn service_base() -> Option<String> {
+    PROVISION_URL.map(|u| u.trim_end_matches("/v1/provision").trim_end_matches('/').to_string())
+}
 
 /// What the window shows about the public link.
 #[derive(Clone, Default)]
@@ -134,7 +140,7 @@ async fn get_tunnel(data_dir: &Path, url: &str, key: &str, port: u16) -> anyhow:
 }
 
 /// A random id for this install, made once and kept.
-fn install_id(data_dir: &Path) -> anyhow::Result<String> {
+pub fn install_id(data_dir: &Path) -> anyhow::Result<String> {
     let file = data_dir.join("install-id");
     if let Ok(id) = std::fs::read_to_string(&file) {
         let id = id.trim();

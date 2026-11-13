@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::models::User;
-use crate::{access, activity, auth, db, host, settings, AppState};
+use crate::{access, activity, auth, backup, db, host, settings, AppState};
 
 /// The admin routes. Not for the network listener: see the module notes.
 pub fn router() -> Router<AppState> {
@@ -38,6 +38,13 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/message", post(message))
         .route("/api/admin/activity", get(activity_list))
         .route("/api/admin/settings/sessions", put(set_session_settings))
+        .route("/api/admin/setup", get(setup_check).post(setup_fix))
+        .route("/api/admin/backups", get(backups_list).post(backup_now))
+        .route("/api/admin/backups/:name/restore", post(backup_restore))
+        .route("/api/admin/settings/backups", put(set_backup_settings))
+        .route("/api/admin/settings/alerts", put(set_alert_settings))
+        .route("/api/admin/settings/updates", put(set_update_settings))
+        .route("/api/admin/health", get(health))
         .route("/api/admin/auth/verify", post(verify_admin))
         .route("/api/admin/auth", put(change_admin))
         .route("/api/admin/apps", post(create_app))
@@ -139,6 +146,11 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
         "users": users,
         "apps": apps,
         "settings": settings::sessions(&state.pool).await,
+        "updates": settings::updates(&state.pool).await,
+        "alerts": {
+            "topic": settings::alerts(&state.pool).await.topic,
+            "server": settings::alerts(&state.pool).await.server(),
+        },
         "admin": { "username": admin_name, "default_password": default_password },
     })))
 }
@@ -588,6 +600,142 @@ async fn set_session_settings(
     )
     .await;
     Ok(Json(json!({ "settings": input })))
+}
+
+async fn backups_list(State(state): State<AppState>, _: Admin) -> ApiResult {
+    Ok(Json(json!({
+        "backups": backup::list(&state.data_dir),
+        "settings": settings::backups(&state.pool).await,
+        "folder": backup::dir(&state.data_dir),
+    })))
+}
+
+async fn backup_now(State(state): State<AppState>, _: Admin) -> ApiResult {
+    let settings = settings::backups(&state.pool).await;
+    let name = backup::make(&state.pool, &state.data_dir, &settings)
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e:#}")))?;
+    activity::admin(&state.pool, None, &format!("Made a backup ({name})")).await;
+    Ok(Json(json!({ "name": name })))
+}
+
+/// Restore at the next start; the app restarts itself right after.
+async fn backup_restore(State(state): State<AppState>, _: Admin, Path(name): Path<String>) -> ApiResult {
+    // Keep what is there now, in case the restore was a mistake.
+    let settings = settings::backups(&state.pool).await;
+    backup::request_restore(&state.data_dir, &name).map_err(|e| bad(&e.to_string()))?;
+    let safety = backup::make_keeping_all(&state.pool, &state.data_dir, &settings).await.ok();
+    activity::admin(&state.pool, None, &format!("Restoring backup {name} (current data saved as {})", safety.as_deref().unwrap_or("-"))).await;
+    Ok(Json(json!({ "restart": true, "saved_as": safety })))
+}
+
+async fn set_backup_settings(State(state): State<AppState>, _: Admin, Json(input): Json<backup::Settings>) -> ApiResult {
+    if !(1..=365).contains(&input.keep) {
+        return Err(bad("Keep between 1 and 365 backups."));
+    }
+    let copy = input.copy_dir.trim();
+    if !copy.is_empty() {
+        let path = std::path::Path::new(copy);
+        if !path.is_absolute() {
+            return Err(bad("Give the full path of the folder, like D:\\Backups."));
+        }
+        if std::fs::create_dir_all(path.join("Access Portal backups")).is_err() {
+            return Err(bad("That folder can't be written to."));
+        }
+    }
+    let value = backup::Settings { copy_dir: copy.to_string(), keep: input.keep };
+    settings::set_backups(&state.pool, &value).await?;
+    activity::admin(&state.pool, None, &format!("Backups: keep {}, copy to {}", value.keep, if copy.is_empty() { "nowhere else" } else { copy })).await;
+    Ok(Json(json!({ "settings": value })))
+}
+
+async fn set_update_settings(State(state): State<AppState>, _: Admin, Json(input): Json<settings::Updates>) -> ApiResult {
+    settings::set_updates(&state.pool, &input).await?;
+    activity::admin(&state.pool, None, if input.auto { "Turned automatic updates on" } else { "Turned automatic updates off" }).await;
+    Ok(Json(json!({ "updates": input })))
+}
+
+#[derive(Deserialize)]
+struct AlertSwitch {
+    enabled: bool,
+    /// Another ntfy server, e.g. "https://ntfy.example.com" ("" = the default).
+    #[serde(default)]
+    server: Option<String>,
+}
+
+/// Turn phone alerts on (a new private ntfy topic) or off.
+async fn set_alert_settings(State(state): State<AppState>, _: Admin, Json(input): Json<AlertSwitch>) -> ApiResult {
+    let current = settings::alerts(&state.pool).await;
+    let server = match input.server.as_deref().map(str::trim) {
+        None => current.server.clone(),
+        Some("") => None,
+        Some(s) if s.starts_with("https://") && !s.contains(char::is_whitespace) => Some(s.trim_end_matches('/').to_string()),
+        Some(_) => return Err(bad("The server address starts with https://.")),
+    };
+    let value = settings::Alerts {
+        topic: if input.enabled { current.topic.or_else(|| Some(format!("access-portal-{}", auth::random_token()[..20].to_lowercase()))) } else { None },
+        server,
+    };
+    settings::set_alerts(&state.pool, &value).await?;
+    activity::admin(&state.pool, None, if input.enabled { "Turned phone alerts on" } else { "Turned phone alerts off" }).await;
+    Ok(Json(json!({ "alerts": value })))
+}
+
+/// For the app's alerts: problems the portal can see from here.
+async fn health(State(state): State<AppState>, _: Admin) -> ApiResult {
+    let (failures, last_failure) = state.health.recent_failures(10 * 60);
+    let listening = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect("127.0.0.1:3389"),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok());
+    let alerts = settings::alerts(&state.pool).await;
+    Ok(Json(json!({
+        "alerts": { "topic": alerts.topic, "server": alerts.server() },
+        "session_failures": failures,
+        "last_failure": last_failure,
+        "disk_free": host::disk_free(&state.data_dir),
+        "rdp_listening": listening,
+    })))
+}
+
+/// What this computer needs to serve portal sessions, and whether it has it.
+async fn setup_check(_: Admin) -> ApiResult {
+    let checks = tokio::task::spawn_blocking(|| host::setup_blocking(&[]))
+        .await
+        .map_err(anyhow::Error::from)?
+        .map_err(host_error)?;
+    Ok(Json(json!({ "checks": checks })))
+}
+
+#[derive(Deserialize)]
+struct SetupFix {
+    fix: Vec<String>,
+}
+
+async fn setup_fix(State(state): State<AppState>, _: Admin, Json(input): Json<SetupFix>) -> ApiResult {
+    const KNOWN: [&str; 6] = ["rdp", "wrapper", "group", "launcher", "pdf", "policies"];
+    let fix: Vec<String> = input.fix.into_iter().filter(|f| KNOWN.contains(&f.as_str())).collect();
+    if fix.is_empty() {
+        return Err(bad("Nothing to fix."));
+    }
+    let list = fix.clone();
+    let checks = tokio::task::spawn_blocking(move || host::setup_blocking(&list))
+        .await
+        .map_err(anyhow::Error::from)?
+        .map_err(host_error)?;
+    let failed: Vec<String> = checks
+        .iter()
+        .filter_map(|c| c.get("error").and_then(Value::as_str).map(|e| format!("{}: {e}", c["id"].as_str().unwrap_or(""))))
+        .collect();
+    let detail = if failed.is_empty() {
+        format!("Set up this computer: {}", fix.join(", "))
+    } else {
+        format!("Set up this computer: {} (problems: {})", fix.join(", "), failed.join("; "))
+    };
+    activity::admin(&state.pool, None, &detail).await;
+    Ok(Json(json!({ "checks": checks })))
 }
 
 #[derive(Deserialize)]

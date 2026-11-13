@@ -2,6 +2,8 @@ import { useState } from "react"
 import { toast } from "sonner"
 
 import type { ViewProps } from "@/components/app-shell"
+import { AlertsCard, BackupsCard, UpdatesCard } from "@/components/maintenance-cards"
+import { SetupCard } from "@/components/setup-card"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import {
@@ -46,7 +48,11 @@ function withCurrent(choices: [number, string][], value: number, unit: string): 
 export function SettingsView({ data, reload }: ViewProps) {
   return (
     <div className="flex max-w-2xl flex-col gap-4">
+      <SetupCard />
       <SessionsCard settings={data.settings} reload={reload} />
+      <AlertsCard data={data} reload={reload} />
+      <BackupsCard />
+      <UpdatesCard data={data} reload={reload} />
       <AdminCard username={data.admin.username} isDefault={data.admin.default_password} reload={reload} />
     </div>
   )

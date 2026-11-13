@@ -477,6 +477,11 @@ struct ViewportQuery {
     h: Option<u32>,
     /// 1 when the browser can decode H.264 (WebCodecs).
     vd: Option<u8>,
+    /// "aac" when the browser can decode AAC sound.
+    ad: Option<String>,
+    /// 1: open the session at the size in `w` and `h` (the page chose it: the
+    /// window's size, or smaller on a slow link) instead of the fixed size.
+    sz: Option<u8>,
 }
 
 /// WebSocket endpoint behind the built-in RDP client page.
@@ -508,9 +513,10 @@ async fn rdp_socket(
     };
     let connection = connection_info(&state, &user, &key, &headers, "relayed").await;
     let presence = state.presence.clone();
+    let health = state.health.clone();
     Ok(upgrade.on_upgrade(move |socket| async move {
         let listed = presence.enter(connection.clone());
-        run_logged(target, listed, connection, Box::new(transport::WsTransport(socket))).await;
+        run_logged(target, listed, connection, health, Box::new(transport::WsTransport(socket))).await;
     }))
 }
 
@@ -520,6 +526,7 @@ async fn run_logged(
     mut target: rdp::Target,
     mut listed: crate::presence::Guard,
     connection: crate::presence::Connection,
+    health: std::sync::Arc<crate::Health>,
     io: Box<dyn transport::Transport>,
 ) {
     target.kick = Some(listed.kick.clone());
@@ -529,17 +536,28 @@ async fn run_logged(
         a.log("session_start", &format!("Opened {} on {} ({})", connection.app, connection.device, connection.link)).await;
     }
     let started = db::now();
-    let reason = rdp::run(target, io).await;
+    let (reason, failure) = rdp::run(target, io).await;
+    if let Some(why) = &failure {
+        health.session_failed(why);
+    }
     if let Some(a) = &actor {
-        let why = match reason.as_str() {
-            "browser closed" => "the browser was closed".to_string(),
-            other => other.trim_end_matches('.').to_string(),
-        };
-        a.log(
-            "session_end",
-            &format!("Closed {} after {}: {why}", connection.app, activity::duration(db::now() - started)),
-        )
-        .await;
+        match &failure {
+            Some(why) => {
+                a.log("session_failed", &format!("{} failed after {}: {why}", connection.app, activity::duration(db::now() - started)))
+                    .await
+            }
+            None => {
+                let why = match reason.as_str() {
+                    "browser closed" => "the browser was closed".to_string(),
+                    other => other.trim_end_matches('.').to_string(),
+                };
+                a.log(
+                    "session_end",
+                    &format!("Closed {} after {}: {why}", connection.app, activity::duration(db::now() - started)),
+                )
+                .await
+            }
+        }
     }
     drop(listed);
 }
@@ -570,6 +588,7 @@ async fn rtc_offer(
     let username = target.username.clone();
     let connection = connection_info(&state, &user, &key, &headers, "direct").await;
     let presence = state.presence.clone();
+    let health = state.health.clone();
     let servers = vec![webrtc::peer_connection::RTCIceServer {
         urls: state.config.ice_urls.clone(),
         username: state.config.ice_username.clone(),
@@ -579,7 +598,7 @@ async fn rtc_offer(
     let on_open: transport::OnOpen = Box::new(move |link| {
         tokio::spawn(async move {
             let listed = presence.enter(connection.clone());
-            run_logged(target, listed, connection, Box::new(link)).await;
+            run_logged(target, listed, connection, health, Box::new(link)).await;
         });
     });
     match transport::answer_offer(offer, servers, on_open).await {
@@ -628,7 +647,8 @@ fn rtc_page_config(config: &crate::config::Config) -> String {
     } else {
         serde_json::json!([server])
     };
-    serde_json::json!({ "p2p": config.p2p, "iceServers": servers })
+    let fixed = config.session_size.map(|(w, h)| serde_json::json!([w, h]));
+    serde_json::json!({ "p2p": config.p2p, "iceServers": servers, "fixed": fixed })
         .to_string()
         .replace("</", "<\\/")
 }
@@ -651,9 +671,9 @@ async fn session_target(
     let password = auth::decrypt_at_rest(&state.config.portal_secret, &user.win_password)?;
     // A fixed size (the default, 1920x1080) is scaled to fit by the browser;
     // otherwise the session takes the size of the browser window.
-    let (width, height) = match state.config.session_size {
-        Some((w, h)) => rdp::sane_size(u32::from(w), u32::from(h)),
-        None => rdp::sane_size(viewport.w.unwrap_or(1280), viewport.h.unwrap_or(800)),
+    let (width, height) = match (state.config.session_size, viewport.sz) {
+        (Some((w, h)), None) => rdp::sane_size(u32::from(w), u32::from(h)),
+        _ => rdp::sane_size(viewport.w.unwrap_or(1280), viewport.h.unwrap_or(800)),
     };
     let target = rdp::Target {
         host: app.hostname.clone(),
@@ -665,7 +685,9 @@ async fn session_target(
         // Only admins are shown why a connection failed; everyone else gets a
         // generic message and the detail goes to the log.
         show_errors: user.is_admin(),
-        resizable: state.config.session_size.is_none(),
+        // The page asks for a new size when the window changes (with "Fit to
+        // window" on) or the link gets slow or fast again.
+        resizable: true,
         // The browser advertises H.264 decode support with ?vd=1.
         video_ok: state.config.video && matches!(viewport.vd, Some(1 | 2)),
         files_dir: user_files_dir(state, user).await.ok(),
@@ -680,6 +702,7 @@ async fn session_target(
         rules: Some(user.rules()).filter(|r| r.from.is_some() || r.days.is_some()),
         actor: Some(Actor::new(&state.pool, user, &client_address(headers))),
         clip_dir: clipboard_dir(state, user).await.ok(),
+        sound_aac: viewport.ad.as_deref() == Some("aac"),
     };
     Ok(Ok(target))
 }

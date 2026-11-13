@@ -77,6 +77,20 @@ export type PortalState = {
   apps: PortalApp[]
   settings: SessionSettings
   admin: { username: string; default_password: boolean }
+  updates: { auto: boolean }
+  alerts: { topic?: string | null; server: string }
+}
+
+export type BackupInfo = { name: string; at: number; size: number }
+
+export type UpdateStatus = {
+  current: string
+  available: string | null
+  notes: string | null
+  checked_at: number | null
+  state: "idle" | "checking" | "installing"
+  error: string | null
+  enabled: boolean
 }
 
 /** The public link (a Cloudflare Tunnel to name.<domain>). */
@@ -130,6 +144,27 @@ export async function unlock(username: string, password: string): Promise<{ defa
 
 export function lockApp(): Promise<void> {
   return invoke("lock")
+}
+
+export function restartApp(): Promise<void> {
+  return invoke("restart_app")
+}
+
+export function testAlert(server: string, topic: string): Promise<void> {
+  return invoke("test_alert", { server, topic })
+}
+
+export function updateStatus(): Promise<UpdateStatus> {
+  return invoke("update_status")
+}
+
+/** Look for an update now; with `install`, install it (the app restarts). */
+export async function updateCheck(install: boolean): Promise<UpdateStatus> {
+  try {
+    return await invoke("update_check", { install })
+  } catch (e) {
+    throw new ApiError(String(e))
+  }
 }
 
 /** Save text as a file in Downloads and show it in Explorer; returns the path. */

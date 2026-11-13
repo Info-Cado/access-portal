@@ -57,6 +57,69 @@ pub async fn set_sessions(pool: &SqlitePool, value: &Sessions) -> Result<()> {
     set(pool, "sessions", &serde_json::to_string(value)?).await
 }
 
+async fn get_json<T: serde::de::DeserializeOwned + Default>(pool: &SqlitePool, key: &str) -> T {
+    match get(pool, key).await {
+        Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
+        _ => T::default(),
+    }
+}
+
+pub async fn backups(pool: &SqlitePool) -> crate::backup::Settings {
+    get_json(pool, "backups").await
+}
+
+pub async fn set_backups(pool: &SqlitePool, value: &crate::backup::Settings) -> Result<()> {
+    set(pool, "backups", &serde_json::to_string(value)?).await
+}
+
+/// Install new versions of the app by themselves (when nobody is connected).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Updates {
+    pub auto: bool,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Self { auto: true }
+    }
+}
+
+pub async fn updates(pool: &SqlitePool) -> Updates {
+    get_json(pool, "updates").await
+}
+
+pub async fn set_updates(pool: &SqlitePool, value: &Updates) -> Result<()> {
+    set(pool, "updates", &serde_json::to_string(value)?).await
+}
+
+/// Phone alerts: sent to this topic on an ntfy server when set.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Alerts {
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// The ntfy server (default `DEFAULT_NTFY`).
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+/// A public ntfy server that also accepts the offline alerts sent from
+/// Cloudflare (ntfy.sh limits messages per address, and Cloudflare's are shared).
+pub const DEFAULT_NTFY: &str = "https://ntfy.envs.net";
+
+impl Alerts {
+    pub fn server(&self) -> String {
+        self.server.clone().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| DEFAULT_NTFY.to_string())
+    }
+}
+
+pub async fn alerts(pool: &SqlitePool) -> Alerts {
+    get_json(pool, "alerts").await
+}
+
+pub async fn set_alerts(pool: &SqlitePool, value: &Alerts) -> Result<()> {
+    set(pool, "alerts", &serde_json::to_string(value)?).await
+}
+
 /// The admin username, and whether the password is still the default one.
 pub async fn admin_account(pool: &SqlitePool) -> Result<(String, bool)> {
     let name = get(pool, "admin_username").await?.unwrap_or_else(|| DEFAULT_ADMIN.0.to_string());

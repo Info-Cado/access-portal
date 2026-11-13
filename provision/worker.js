@@ -7,8 +7,17 @@
 // return the same name and tunnel. The answer carries the tunnel token the app
 // runs `cloudflared` with.
 //
+// It also:
+// - takes a heartbeat from each install every few minutes and, from a cron
+//   trigger, sends the install's phone alert (ntfy) when the heartbeats stop
+//   ("offline") and again when they resume;
+// - serves app updates (latest.json and installers in the R2 bucket UPDATES)
+//   in the format Tauri's updater expects;
+// - serves known-good RDP Wrapper settings (rdpwrap.ini in UPDATES).
+//
 // Bindings: ACCOUNT_ID, ZONE_ID, ZONE_NAME (plain text);
-//           CF_API_TOKEN, PROVISION_KEY (secrets).
+//           CF_API_TOKEN, PROVISION_KEY (secrets);
+//           DB (D1: table installs), UPDATES (R2 bucket).
 
 const API = "https://api.cloudflare.com/client/v4";
 
@@ -19,14 +28,38 @@ const RESERVED = new Set([
   "status", "support", "help", "docs", "blog", "shop", "store", "m", "dev", "test", "staging",
 ]);
 
+/** The ntfy server when an install names none (ntfy.sh rate-limits Cloudflare's shared addresses). */
+const DEFAULT_NTFY = "https://ntfy.envs.net";
+
+/** How long without a heartbeat before an install counts as offline. */
+const OFFLINE_AFTER_SECS = 15 * 60;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname !== "/v1/provision" || request.method !== "POST") {
-      return reply({ error: "Not found." }, 404);
+    // Public: RDP Wrapper settings (no secrets in them).
+    if (url.pathname === "/v1/rdpwrap.ini" && request.method === "GET") {
+      const obj = env.UPDATES && (await env.UPDATES.get("rdpwrap.ini"));
+      if (!obj) return reply({ error: "Not found." }, 404);
+      return new Response(obj.body, { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
     if (!env.PROVISION_KEY || request.headers.get("x-provision-key") !== env.PROVISION_KEY) {
       return reply({ error: "Not allowed." }, 403);
+    }
+    try {
+      if (url.pathname === "/v1/heartbeat" && request.method === "POST") return await heartbeat(request, env);
+      // The offline check on demand (normally run by the cron trigger), for testing.
+      if (url.pathname === "/v1/check-offline" && request.method === "POST") return reply(await checkOffline(env));
+
+      let m = url.pathname.match(/^\/v1\/update\/([\w-]+)\/([\w-]+)\/([\w.+-]+)$/);
+      if (m && request.method === "GET") return await updateCheck(env, url, m[1], m[2], m[3]);
+      m = url.pathname.match(/^\/v1\/download\/([\w.+ -]+)$/);
+      if (m && request.method === "GET") return await download(env, decodeURIComponent(m[1]));
+    } catch (e) {
+      return reply({ error: String(e.message || e) }, 502);
+    }
+    if (url.pathname !== "/v1/provision" || request.method !== "POST") {
+      return reply({ error: "Not found." }, 404);
     }
     let body;
     try {
@@ -45,7 +78,111 @@ export default {
       return reply({ error: String(e.message || e) }, 502);
     }
   },
+
+  // Every few minutes: alert for installs whose heartbeats stopped.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(checkOffline(env));
+  },
 };
+
+// ---------------------------------------------------------------- heartbeats
+
+async function heartbeat(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const installId = String(body.install_id || "");
+  if (!/^[0-9a-f]{32}$/.test(installId)) return reply({ error: "Bad install id." }, 400);
+  const topic = /^[\w-]{8,64}$/.test(String(body.topic || "")) ? String(body.topic) : null;
+  const server = /^https:\/\/[\w.-]+(:\d+)?$/.test(String(body.server || "")) ? String(body.server) : DEFAULT_NTFY;
+  const name = String(body.name || "").slice(0, 100);
+  const now = Math.floor(Date.now() / 1000);
+  const before = await env.DB.prepare("SELECT down FROM installs WHERE install_id = ?").bind(installId).first();
+  await env.DB.prepare(
+    `INSERT INTO installs (install_id, name, topic, server, last_seen, down) VALUES (?1, ?2, ?3, ?4, ?5, 0)
+     ON CONFLICT(install_id) DO UPDATE SET name = ?2, topic = ?3, server = ?4, last_seen = ?5, down = 0`,
+  ).bind(installId, name, topic, server, now).run();
+  if (before && before.down && topic) {
+    await ntfy(server, topic, `${name || "The portal"} is back online`, "Access Portal is running and reachable again.", "white_check_mark");
+  }
+  return reply({ ok: true });
+}
+
+async function checkOffline(env) {
+  const now = Math.floor(Date.now() / 1000);
+  const report = [];
+  const { results } = await env.DB.prepare(
+    "SELECT install_id, name, topic, server, last_seen FROM installs WHERE down = 0 AND topic IS NOT NULL AND last_seen < ?",
+  ).bind(now - OFFLINE_AFTER_SECS).all();
+  for (const row of results) {
+    const mins = Math.round((now - row.last_seen) / 60);
+    const status = await ntfy(
+      row.server || DEFAULT_NTFY,
+      row.topic,
+      `${row.name || "The portal"} is offline`,
+      `No word from Access Portal for ${mins} minutes. The computer may be off, asleep, without internet, or the app was closed. Users can't connect until it's back.`,
+      "rotating_light",
+      "high",
+    );
+    report.push({ install: row.install_id, ntfy: status });
+    if (status < 300) {
+      await env.DB.prepare("UPDATE installs SET down = 1 WHERE install_id = ?").bind(row.install_id).run();
+    }
+  }
+  return { checked_at: now, alerted: report };
+}
+
+/** Send a phone alert; returns the ntfy server's HTTP status (0 if unreachable). */
+async function ntfy(server, topic, title, message, tags, priority = "default") {
+  try {
+    const res = await fetch(`${server}/${topic}`, {
+      method: "POST",
+      headers: { Title: title, Tags: tags, Priority: priority },
+      body: message,
+    });
+    if (!res.ok) console.log(`ntfy ${res.status}: ${await res.text()}`);
+    return res.status;
+  } catch (e) {
+    console.log(`ntfy failed: ${e}`);
+    return 0;
+  }
+}
+
+// ---------------------------------------------------------------- updates
+
+/** "1.2.3" > "1.2.10"? Plain numeric comparison, part by part. */
+function newer(a, b) {
+  const pa = a.split(/[.+-]/).map(Number), pb = b.split(/[.+-]/).map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
+}
+
+async function updateCheck(env, url, target, arch, current) {
+  const obj = await env.UPDATES.get("latest.json");
+  if (!obj) return new Response(null, { status: 204 });
+  const latest = await obj.json();
+  const platform = latest.platforms?.[`${target}-${arch}`];
+  if (!platform || !newer(latest.version, current)) return new Response(null, { status: 204 });
+  return reply({
+    version: latest.version,
+    notes: latest.notes || "",
+    pub_date: latest.pub_date,
+    url: `${url.origin}/v1/download/${encodeURIComponent(platform.file)}`,
+    signature: platform.signature,
+  });
+}
+
+async function download(env, file) {
+  const obj = await env.UPDATES.get(`releases/${file}`);
+  if (!obj) return reply({ error: "Not found." }, 404);
+  return new Response(obj.body, {
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-length": String(obj.size),
+      "content-disposition": `attachment; filename="${file}"`,
+    },
+  });
+}
 
 async function provision(env, installId, port, nameHint) {
   const account = `/accounts/${env.ACCOUNT_ID}`;
