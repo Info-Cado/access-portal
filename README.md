@@ -175,6 +175,9 @@ required for everything. The app can manage any portal it can reach, so point it
 at `http://127.0.0.1:8088` on the host itself or at the portal's HTTPS address
 from elsewhere. It does not create Windows accounts on the RDP host.
 
+The window's page is React with shadcn/ui components (Tailwind), built by Vite;
+add more components with `npx shadcn@latest add <name>`.
+
 Build it (needs Rust, Node.js and, on Windows, the WebView2 runtime that ships
 with Windows 11):
 
@@ -236,5 +239,5 @@ get around per-user Windows licensing.
 | `src/session.html` | the browser page for a session |
 | `src/web.rs` | router, auth extractors, pages, handlers, file transfer endpoints |
 | `src/api.rs` | JSON admin API used by the desktop admin app |
-| `admin-app/` | desktop admin app (Tauri): `src-tauri/` native side, `ui/` the window's page |
+| `admin-app/` | desktop admin app (Tauri): `src-tauri/` native side, `src/` the window's page (React + shadcn/ui) |
 | `migrations/` | SQLite schema |

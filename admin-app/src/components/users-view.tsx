@@ -1,0 +1,131 @@
+import { useState } from "react"
+import { ChevronRightIcon, PlusIcon, SearchIcon, UserXIcon } from "lucide-react"
+
+import type { ViewProps } from "@/components/app-shell"
+import { SecretDialog, type SecretToShow } from "@/components/dialogs"
+import { NewUserDialog } from "@/components/new-user-dialog"
+import { UserSheet } from "@/components/user-sheet"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
+import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group"
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+
+export function UsersView({ data, reload }: ViewProps) {
+  const [query, setQuery] = useState("")
+  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [creating, setCreating] = useState(false)
+  const [secret, setSecret] = useState<SecretToShow | null>(null)
+
+  const q = query.trim().toLowerCase()
+  const shown = data.users.filter(
+    (u) => !q || u.username.toLowerCase().includes(q) || u.win_username.toLowerCase().includes(q),
+  )
+  const selected = data.users.find((u) => u.id === selectedId) ?? null
+
+  return (
+    <>
+      <div className="flex items-center gap-2">
+        <InputGroup className="max-w-xs">
+          <InputGroupAddon>
+            <SearchIcon />
+          </InputGroupAddon>
+          <InputGroupInput
+            placeholder="Search users"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            spellCheck={false}
+          />
+        </InputGroup>
+        <Button className="ml-auto" onClick={() => setCreating(true)}>
+          <PlusIcon />
+          New user
+        </Button>
+      </div>
+
+      {shown.length === 0 ? (
+        <Empty className="border">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <UserXIcon />
+            </EmptyMedia>
+            <EmptyTitle>{q ? "No matching users" : "No users yet"}</EmptyTitle>
+            <EmptyDescription>
+              {q ? `Nothing matches “${query.trim()}”.` : "Create the first user to get started."}
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : (
+        <div className="overflow-hidden rounded-lg border">
+          <Table>
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                <TableHead>User</TableHead>
+                <TableHead>Windows login</TableHead>
+                <TableHead>Apps</TableHead>
+                <TableHead className="w-10" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {shown.map((u) => {
+                const apps = data.apps.filter((a) => u.app_ids.includes(a.id))
+                return (
+                  <TableRow
+                    key={u.id}
+                    tabIndex={0}
+                    className="cursor-pointer"
+                    data-state={u.id === selectedId ? "selected" : undefined}
+                    onClick={() => setSelectedId(u.id)}
+                    onKeyDown={(ev) => ev.key === "Enter" && setSelectedId(u.id)}
+                  >
+                    <TableCell>
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">{u.username}</span>
+                        {u.is_admin && <Badge>Admin</Badge>}
+                        {u.totp && <Badge variant="secondary">2-step</Badge>}
+                        {u.locked && <Badge variant="destructive">Locked</Badge>}
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-muted-foreground">{u.win_username}</TableCell>
+                    <TableCell>
+                      {apps.length ? (
+                        <div className="flex flex-wrap gap-1">
+                          {apps.map((a) => (
+                            <Badge key={a.id} variant="outline">
+                              {a.name}
+                            </Badge>
+                          ))}
+                        </div>
+                      ) : (
+                        <span className="text-muted-foreground">None</span>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <ChevronRightIcon className="size-4 text-muted-foreground" />
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      <UserSheet
+        user={selected}
+        data={data}
+        reload={reload}
+        onClose={() => setSelectedId(null)}
+        onSecret={setSecret}
+      />
+      <NewUserDialog
+        open={creating}
+        onOpenChange={setCreating}
+        apps={data.apps}
+        reload={reload}
+        onSecret={setSecret}
+      />
+      <SecretDialog secret={secret} onClose={() => setSecret(null)} />
+    </>
+  )
+}
