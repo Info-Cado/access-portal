@@ -1,6 +1,6 @@
 [package]
 name = "access-portal-admin"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "Access Portal: runs the portal on the host and manages its users and apps."
 

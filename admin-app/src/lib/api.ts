@@ -79,9 +79,36 @@ export type PortalState = {
   admin: { username: string; default_password: boolean }
   updates: { auto: boolean }
   alerts: { topic?: string | null; server: string }
+  /** The portal user that opens the computer owner's own desktop, if any. */
+  owner_user_id: number | null
 }
 
 export type BackupInfo = { name: string; at: number; size: number }
+
+/** A local Windows account on this computer (Windows' built-in ones are left out). */
+export type WindowsAccount = {
+  name: string
+  full_name: string
+  description: string
+  enabled: boolean
+  is_admin: boolean
+  /** In the "Portal RDP Users" group. */
+  portal: boolean
+  /** The account Access Portal runs as: the computer's owner. */
+  me: boolean
+  /** Signs in with a Microsoft account (its password is changed online). */
+  microsoft: boolean
+  /** Unix seconds, or null if it never signed in. */
+  last_logon: number | null
+  /** Portal users whose sessions run as this account. */
+  portal_users: { id: number; username: string }[]
+}
+
+export type WindowsAccounts = {
+  accounts: WindowsAccount[]
+  /** The portal user that opens the owner's own desktop, if turned on. */
+  owner_user_id: number | null
+}
 
 export type UpdateStatus = {
   current: string

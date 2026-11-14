@@ -47,6 +47,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/health", get(health))
         .route("/api/admin/auth/verify", post(verify_admin))
         .route("/api/admin/auth", put(change_admin))
+        .route("/api/admin/windows-accounts", get(windows_accounts))
+        .route("/api/admin/windows-accounts/:name", put(update_windows_account).delete(delete_windows_account))
+        .route("/api/admin/windows-accounts/:name/desktop", get(account_desktop_mode).put(set_account_desktop_mode))
+        .route("/api/admin/owner-access", post(enable_owner_access).delete(disable_owner_access))
         .route("/api/admin/apps", post(create_app))
         .route("/api/admin/apps/:id", delete(delete_app))
 }
@@ -152,6 +156,7 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
             "server": settings::alerts(&state.pool).await.server(),
         },
         "admin": { "username": admin_name, "default_password": default_password },
+        "owner_user_id": owner_user(&state).await?.map(|u| u.id),
     })))
 }
 
@@ -441,6 +446,196 @@ async fn set_desktop_mode(
         user.username
     );
     Ok(Json(json!({ "mode": mode })))
+}
+
+// ---------------------------------------------------------------------------
+// Windows accounts on this computer (all of them, not only the portal's)
+// ---------------------------------------------------------------------------
+
+/// The settings key holding the id of the portal user that signs in as the
+/// computer owner's own Windows account (see `enable_owner_access`).
+const OWNER_USER_KEY: &str = "owner_user_id";
+
+/// The portal user set up for the owner's own account, if it still exists.
+async fn owner_user(state: &AppState) -> Result<Option<User>, ApiError> {
+    let Some(id) = settings::get(&state.pool, OWNER_USER_KEY).await?.and_then(|v| v.parse::<i64>().ok()) else {
+        return Ok(None);
+    };
+    Ok(db::user_by_id(&state.pool, id).await?)
+}
+
+/// Every local Windows account, each with the portal users that sign in as it,
+/// and the owner's portal access: `{accounts: [...], owner_user_id}`.
+async fn windows_accounts(State(state): State<AppState>, _: Admin) -> ApiResult {
+    let users = db::list_users(&state.pool).await?;
+    let mut accounts = host::list_accounts().await.map_err(host_error)?;
+    for account in &mut accounts {
+        let name = account.get("name").and_then(|n| n.as_str()).unwrap_or("").to_lowercase();
+        let linked: Vec<Value> = users
+            .iter()
+            .filter(|u| u.win_username.to_lowercase() == name)
+            .map(|u| json!({ "id": u.id, "username": u.username }))
+            .collect();
+        account["portal_users"] = json!(linked);
+    }
+    // The owner's account first, then by name.
+    accounts.sort_by_key(|a| {
+        let me = a.get("me").and_then(|m| m.as_bool()) == Some(true);
+        (!me, a.get("name").and_then(|n| n.as_str()).unwrap_or("").to_lowercase())
+    });
+    let owner = owner_user(&state).await?;
+    Ok(Json(json!({ "accounts": accounts, "owner_user_id": owner.map(|u| u.id) })))
+}
+
+#[derive(Deserialize)]
+struct AccountUpdate {
+    full_name: Option<String>,
+    description: Option<String>,
+    enabled: Option<bool>,
+    password: Option<String>,
+}
+
+/// Change a Windows account's details. A new password is also stored for the
+/// portal users that sign in as the account, so their sessions keep working.
+async fn update_windows_account(
+    State(state): State<AppState>,
+    _: Admin,
+    Path(name): Path<String>,
+    Json(input): Json<AccountUpdate>,
+) -> ApiResult {
+    if input.password.as_deref() == Some("") {
+        return Err(bad("The new password can't be empty."));
+    }
+    let changes = host::AccountChanges {
+        full_name: input.full_name.map(|s| s.trim().to_string()),
+        description: input.description.map(|s| s.trim().to_string()),
+        enabled: input.enabled,
+        password: input.password.clone(),
+    };
+    host::update_account(&name, &changes).await.map_err(host_error)?;
+    let mut what = Vec::new();
+    if changes.full_name.is_some() || changes.description.is_some() {
+        what.push("details");
+    }
+    if let Some(on) = changes.enabled {
+        what.push(if on { "turned on" } else { "turned off" });
+    }
+    if let Some(password) = &input.password {
+        what.push("password");
+        for u in db::list_users(&state.pool).await? {
+            if u.win_username.eq_ignore_ascii_case(&name) {
+                db::set_windows_login(&state.pool, &state.config, u.id, &u.win_username, password).await?;
+            }
+        }
+    }
+    activity::admin(&state.pool, None, &format!("Changed Windows account {name}: {}", what.join(", "))).await;
+    Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+struct AccountDelete {
+    /// Also delete the account's profile folder (its files).
+    #[serde(default)]
+    files: Option<u8>,
+}
+
+/// Delete a Windows account. Portal users that sign in as it stay, and can't
+/// connect until they are given another account.
+async fn delete_windows_account(
+    State(state): State<AppState>,
+    _: Admin,
+    Path(name): Path<String>,
+    axum::extract::Query(options): axum::extract::Query<AccountDelete>,
+) -> ApiResult {
+    let files = options.files == Some(1);
+    host::delete_any_account(&name, files).await.map_err(host_error)?;
+    let with = if files { " and its files" } else { "" };
+    activity::admin(&state.pool, None, &format!("Deleted Windows account {name}{with}")).await;
+    Ok(Json(json!({})))
+}
+
+async fn account_desktop_mode(_: Admin, Path(name): Path<String>) -> ApiResult {
+    let mode = host::desktop_mode(&name).await.map_err(host_error)?;
+    Ok(Json(json!({ "mode": mode })))
+}
+
+async fn set_account_desktop_mode(_: Admin, Path(name): Path<String>, Json(input): Json<DesktopSwitch>) -> ApiResult {
+    let mode = host::set_desktop_mode(&name, input.full).await.map_err(host_error)?;
+    if mode == "missing" {
+        return Err(fail(StatusCode::CONFLICT, &format!("There is no Windows account named {name} on this computer.")));
+    }
+    Ok(Json(json!({ "mode": mode })))
+}
+
+#[derive(Deserialize)]
+struct OwnerAccess {
+    /// The name to sign in to the portal with.
+    username: String,
+    /// The portal password.
+    password: String,
+    /// The owner's Windows password, for opening their desktop.
+    win_password: String,
+    /// The Windows sign-in name, when it isn't the account name (a Microsoft
+    /// account's email address).
+    #[serde(default)]
+    win_username: String,
+}
+
+/// Let the computer's owner sign in to the portal and open their own Windows
+/// desktop: a portal user that signs in as the account Access Portal runs as.
+/// Administrator accounts always get the full desktop, so the portal opens it.
+async fn enable_owner_access(State(state): State<AppState>, _: Admin, Json(input): Json<OwnerAccess>) -> ApiResult {
+    let username = input.username.trim();
+    if username.is_empty() || input.password.is_empty() || input.win_password.is_empty() {
+        return Err(bad("A portal username, a portal password and your Windows password are all needed."));
+    }
+    if owner_user(&state).await?.is_some() {
+        return Err(fail(StatusCode::CONFLICT, "Your account can already be opened from the portal."));
+    }
+    if db::user_by_username(&state.pool, username).await?.is_some() {
+        return Err(fail(StatusCode::CONFLICT, "That portal username is already taken."));
+    }
+    let accounts = host::list_accounts().await.map_err(host_error)?;
+    let Some(me) = accounts.iter().find(|a| a.get("me").and_then(|m| m.as_bool()) == Some(true)) else {
+        return Err(fail(StatusCode::CONFLICT, "Access Portal isn't running as a local Windows account."));
+    };
+    let account = me.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string();
+    let microsoft = me.get("microsoft").and_then(|m| m.as_bool()) == Some(true);
+    let win_username = match input.win_username.trim() {
+        "" => account.clone(),
+        w => w.to_string(),
+    };
+    // A wrong password would only show up when the desktop fails to open.
+    if !microsoft && !host::check_password(&account, &input.win_password).await.map_err(host_error)? {
+        return Err(bad("Windows says that isn't the password of your account."));
+    }
+    let (id, _) = db::create_user(
+        &state.pool,
+        &state.config,
+        username,
+        &input.password,
+        &win_username,
+        &input.win_password,
+        false,
+        false,
+    )
+    .await?;
+    settings::set(&state.pool, OWNER_USER_KEY, &id.to_string()).await?;
+    if let Some(user) = db::user_by_id(&state.pool, id).await? {
+        activity::admin(&state.pool, Some(&user), &format!("Turned on portal access to the owner's account {account}")).await;
+    }
+    Ok(Json(json!({ "id": id })))
+}
+
+/// Remove the owner's portal access (the portal user only; the Windows account
+/// stays as it is).
+async fn disable_owner_access(State(state): State<AppState>, _: Admin) -> ApiResult {
+    if let Some(user) = owner_user(&state).await? {
+        db::delete_user(&state.pool, user.id).await?;
+        activity::admin(&state.pool, Some(&user), "Turned off portal access to the owner's account").await;
+    }
+    settings::set(&state.pool, OWNER_USER_KEY, "").await?;
+    Ok(Json(json!({})))
 }
 
 /// Disconnect one open session. The user's apps keep running in Windows and the

@@ -6,6 +6,7 @@ import { SecretDialog, type SecretToShow } from "@/components/dialogs"
 import { MessageDialog, type MessageTarget } from "@/components/message-dialog"
 import { NewUserDialog } from "@/components/new-user-dialog"
 import { UserSheet } from "@/components/user-sheet"
+import { WindowsAccountsSection } from "@/components/windows-accounts"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty"
@@ -105,6 +106,7 @@ export function UsersView({ data, reload }: ViewProps) {
                             Connected{u.sessions.length > 1 ? ` ×${u.sessions.length}` : ""}
                           </Badge>
                         )}
+                        {u.id === data.owner_user_id && <Badge>Your desktop</Badge>}
                         {u.totp && <Badge variant="secondary">2-step</Badge>}
                         {u.locked && <Badge variant="destructive">Locked</Badge>}
                       </div>
@@ -133,6 +135,8 @@ export function UsersView({ data, reload }: ViewProps) {
           </Table>
         </div>
       )}
+
+      <WindowsAccountsSection reload={reload} query={query} />
 
       <UserSheet
         user={selected}

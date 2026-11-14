@@ -272,6 +272,20 @@ Windows account of their own by default (a standard account in the "Portal RDP
 Users" group); deleting a user leaves the Windows account unless you tick the
 box.
 
+**Windows accounts on this computer** are listed under the portal's users:
+every local account, not only the portal's (Windows' built-in Administrator,
+Guest, DefaultAccount and WDAGUtilityAccount are hidden). Each can have its full
+name, description and password changed (portal users signing in as it get the
+new password too), be turned off or on, get the Full desktop switch, or be
+deleted, optionally with its files. The account Access Portal runs as and
+Windows administrator accounts can't be deleted; the former can't be turned off.
+
+That account, the computer **owner's**, is always listed first. Its **Open my
+desktop from the portal** switch makes a portal user that signs in as it (the
+Windows password is checked, then stored encrypted like the others), so the
+owner can sign in to the portal and use their own desktop from anywhere.
+Turning it off deletes that portal user only.
+
 **When and where they can sign in** (per user, `src/access.rs`): days of the
 week, a time window (this computer's clock; 22:00–06:00 works), network
 addresses or ranges (`203.0.113.0/24`) and countries (two-letter codes, from

@@ -148,6 +148,208 @@ async fn run(_action: &str, _win_username: &str, _password: Option<&str>) -> Res
     bail!("Windows accounts can only be changed when the portal runs on Windows.")
 }
 
+// ---------------------------------------------------------------------------
+// Every local Windows account, not only the portal's
+// ---------------------------------------------------------------------------
+
+/// The local Windows accounts on this computer, except Windows' built-in ones
+/// (Administrator, Guest, DefaultAccount, WDAGUtilityAccount). Each is
+/// `{name, full_name, description, enabled, is_admin, portal, me, microsoft,
+/// last_logon}`; `me` is the account the portal runs as (the computer's owner).
+pub async fn list_accounts() -> Result<Vec<serde_json::Value>> {
+    let out = run_accounts("list", "", &[]).await?;
+    Ok(out.get("accounts").and_then(|a| a.as_array()).cloned().unwrap_or_default())
+}
+
+/// Changes to one account; `None` leaves that detail as it is.
+#[derive(Default)]
+pub struct AccountChanges {
+    pub full_name: Option<String>,
+    pub description: Option<String>,
+    pub enabled: Option<bool>,
+    pub password: Option<String>,
+}
+
+/// Change an account's details. Built-in accounts are refused, and so is
+/// turning off the account the portal runs as.
+pub async fn update_account(name: &str, changes: &AccountChanges) -> Result<()> {
+    let mut set = Vec::new();
+    let mut env = Vec::new();
+    if let Some(v) = &changes.full_name {
+        set.push("full_name");
+        env.push(("AP_FULLNAME", v.clone()));
+    }
+    if let Some(v) = &changes.description {
+        set.push("description");
+        env.push(("AP_DESCRIPTION", v.clone()));
+    }
+    if let Some(v) = changes.enabled {
+        set.push("enabled");
+        env.push(("AP_ENABLED", if v { "1" } else { "0" }.to_string()));
+    }
+    if let Some(v) = &changes.password {
+        set.push("password");
+        env.push(("AP_PASSWORD", v.clone()));
+    }
+    env.push(("AP_SET", set.join(",")));
+    run_accounts("update", name, &env).await.map(|_| ())
+}
+
+/// Delete any local account except Windows administrators, built-in accounts
+/// and the account the portal runs as; with `files`, its profile folder too.
+/// Sessions it has open are signed out first (their unsaved work is lost).
+pub async fn delete_any_account(name: &str, files: bool) -> Result<()> {
+    // The script refuses the protected accounts before anything is touched.
+    run_accounts("can-delete", name, &[]).await?;
+    let who = name.to_string();
+    tokio::task::spawn_blocking(move || sign_out_blocking(&who)).await.ok();
+    run_accounts("delete", name, &[("AP_FILES", if files { "1" } else { "0" }.to_string())])
+        .await
+        .map(|_| ())?;
+    remember(name, Ok("missing".to_string())).map(|_| ())
+}
+
+/// Whether `password` is the account's Windows password. Only for local
+/// accounts; a Microsoft account's password can't be checked here.
+pub async fn check_password(name: &str, password: &str) -> Result<bool> {
+    let out = run_accounts("check", name, &[("AP_PASSWORD", password.to_string())]).await?;
+    Ok(out.get("valid").and_then(|v| v.as_bool()).unwrap_or(false))
+}
+
+#[cfg(windows)]
+async fn run_accounts(action: &str, name: &str, env: &[(&str, String)]) -> Result<serde_json::Value> {
+    use base64::Engine;
+    use std::time::Duration;
+
+    let _one_at_a_time = LOCK.lock().await;
+    let utf16: Vec<u8> = ACCOUNTS_SCRIPT.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = tokio::process::Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"])
+        .arg(encoded)
+        .env("AP_ACTION", action)
+        .env("AP_WINUSER", name)
+        .creation_flags(CREATE_NO_WINDOW)
+        .kill_on_drop(true);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let out = tokio::time::timeout(Duration::from_secs(60), command.output())
+        .await
+        .context("reading the Windows accounts took too long")?
+        .context("starting PowerShell")?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let last = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let result: serde_json::Value = serde_json::from_str(last.trim()).with_context(|| {
+        format!(
+            "unexpected answer from the account script: {}{}",
+            stdout.trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+    })?;
+    if result.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        Ok(result)
+    } else {
+        bail!(result.get("error").and_then(|e| e.as_str()).unwrap_or("the account script gave no answer").to_string())
+    }
+}
+
+#[cfg(not(windows))]
+async fn run_accounts(_action: &str, _name: &str, _env: &[(&str, String)]) -> Result<serde_json::Value> {
+    bail!("Windows accounts can only be changed when the portal runs on Windows.")
+}
+
+/// Lists, changes and deletes local accounts. Prints one JSON line.
+#[cfg(windows)]
+const ACCOUNTS_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Continue'
+function Finish($result) { ConvertTo-Json -InputObject $result -Compress -Depth 4; exit 0 }
+function GroupSids($group) {
+  @(([ADSI]"WinNT://./$group,group").psbase.Invoke('Members') | ForEach-Object {
+    (New-Object Security.Principal.SecurityIdentifier ([byte[]]$_.GetType().InvokeMember('objectSid', 'GetProperty', $null, $_, $null)), 0).Value
+  })
+}
+# Administrator, Guest, DefaultAccount, WDAGUtilityAccount.
+function Builtin($sid) { $sid -match '-(500|501|503|504)$' }
+
+try {
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $mySid = $me.User.Value
+  if (-not ([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'The portal is not running as an administrator, so it cannot read or change Windows accounts.'
+  }
+  $adminGroup = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+  $admins = GroupSids $adminGroup
+  $portalGroup = 'Portal RDP Users'
+  $portal = if (Get-LocalGroup -Name $portalGroup -ErrorAction SilentlyContinue) { GroupSids $portalGroup } else { @() }
+  $action = $env:AP_ACTION
+
+  if ($action -eq 'list') {
+    $list = @(Get-LocalUser | Where-Object { -not (Builtin $_.SID.Value) } | ForEach-Object {
+      $sid = $_.SID.Value
+      [ordered]@{
+        name = $_.Name; full_name = [string]$_.FullName; description = [string]$_.Description
+        enabled = [bool]$_.Enabled; is_admin = $admins -contains $sid; portal = $portal -contains $sid
+        me = $sid -eq $mySid; microsoft = ([string]$_.PrincipalSource) -eq 'MicrosoftAccount'
+        last_logon = $(if ($_.LastLogon) { [int64]([DateTimeOffset]$_.LastLogon).ToUnixTimeSeconds() } else { $null })
+      }
+    })
+    Finish @{ ok = $true; accounts = $list }
+  }
+
+  $user = Get-LocalUser -Name $env:AP_WINUSER -ErrorAction SilentlyContinue
+  if (-not $user) { throw "There is no Windows account named $($env:AP_WINUSER) on this computer." }
+  $sid = $user.SID.Value
+  $name = $user.Name
+  if (Builtin $sid) { throw "$name is one of Windows' built-in accounts; the portal leaves those alone." }
+
+  if ($action -eq 'check') {
+    Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+    $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext 'Machine'
+    try { $valid = $ctx.ValidateCredentials($name, $env:AP_PASSWORD) } finally { $ctx.Dispose() }
+    Finish @{ ok = $true; valid = [bool]$valid }
+  }
+
+  if ($action -eq 'update') {
+    $set = @($env:AP_SET -split ',' | Where-Object { $_ })
+    if ($set -contains 'enabled' -and $env:AP_ENABLED -ne '1' -and $sid -eq $mySid) {
+      throw "$name is the account Access Portal runs as; it can't be turned off."
+    }
+    if ($set -contains 'full_name') { Set-LocalUser -SID $sid -FullName $env:AP_FULLNAME -ErrorAction Stop }
+    if ($set -contains 'description') {
+      if ($env:AP_DESCRIPTION.Length -gt 48) { throw 'Windows allows at most 48 characters in a description.' }
+      Set-LocalUser -SID $sid -Description $env:AP_DESCRIPTION -ErrorAction Stop
+    }
+    if ($set -contains 'password') {
+      if ($user.PrincipalSource -eq 'MicrosoftAccount') { throw "$name signs in with a Microsoft account; change its password at account.microsoft.com." }
+      Set-LocalUser -SID $sid -Password (ConvertTo-SecureString $env:AP_PASSWORD -AsPlainText -Force) -ErrorAction Stop
+    }
+    if ($set -contains 'enabled') {
+      if ($env:AP_ENABLED -eq '1') { Enable-LocalUser -SID $sid -ErrorAction Stop } else { Disable-LocalUser -SID $sid -ErrorAction Stop }
+    }
+    Finish @{ ok = $true }
+  }
+
+  if ($action -eq 'can-delete' -or $action -eq 'delete') {
+    if ($sid -eq $mySid) { throw "$name is the account Access Portal runs as; it can't be deleted." }
+    if ($admins -contains $sid) { throw "$name is a Windows administrator account; the portal never deletes those." }
+    if ($action -eq 'delete') {
+      Remove-LocalUser -SID $sid -ErrorAction Stop
+      if ($env:AP_FILES -eq '1') {
+        Get-CimInstance Win32_UserProfile | Where-Object SID -eq $sid | Remove-CimInstance -ErrorAction SilentlyContinue
+      }
+    }
+    Finish @{ ok = $true }
+  }
+  throw "Unknown action $action."
+}
+catch {
+  Finish @{ ok = $false; error = $_.Exception.Message }
+}
+"#;
+
 /// Runs elevated inside the portal's process context. Prints one JSON line.
 #[cfg(windows)]
 const SCRIPT: &str = r#"
