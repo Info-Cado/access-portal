@@ -244,7 +244,9 @@ The window has four screens:
     mouse input (default 1 hour; a one-minute warning first; apps keep
     running); sign out Windows sessions left disconnected (default never;
     apps close; Windows administrator accounts never); ask before viewing a
-    user's screen (default on);
+    user's screen (default off — **View screen** and **Take control** start at
+    once, with nothing shown to the user; turn it on to have Windows ask them
+    first);
   - *Phone alerts* — a notification (ntfy app, free) when the computer goes
     offline, the public link is down for 10 minutes, sessions keep failing to
     start, Remote Desktop stops accepting connections or the disk is almost
@@ -269,8 +271,19 @@ After signing in, a user with only the desktop or only one app goes straight
 to it; one with neither sees "Nothing is assigned to you". Windows
 administrator accounts are never restricted. A change applies from the user's next session. New users get a
 Windows account of their own by default (a standard account in the "Portal RDP
-Users" group); deleting a user leaves the Windows account unless you tick the
-box.
+Users" group); deleting a user disconnects any session they have open and
+leaves the Windows account unless you tick the box. Several portal users can
+share one Windows account — from a Windows account under Users, **Add portal
+login** opens the new-user form tied to it; changing that account's password
+updates every portal user on it.
+
+**Disconnecting and blocking** (per open session, `src/api.rs`): **Disconnect
+only** drops the session but lets them reconnect at once; the other choices also
+block the user (5 minutes, 15 minutes, 1 hour, 8 hours, or until you unblock),
+end every session of theirs and sign them out of the portal so the block takes
+hold immediately. A blocked user can't sign in or open a session until it
+passes; **Unblock** in their panel lifts it early. This block is separate from
+the automatic lockout after wrong passwords.
 
 **Without the internet** (Settings, `src/network.rs`): besides the public link,
 people can open the portal at `http://<this computer's address>:8088` from the

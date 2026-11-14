@@ -169,6 +169,17 @@ pub async fn reset_failed_login(pool: &SqlitePool, user_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Block a user until a unix time, or clear the block with `None`. Separate from
+/// the automatic lockout after wrong passwords (`locked_until`).
+pub async fn set_block(pool: &SqlitePool, user_id: i64, until: Option<i64>) -> Result<()> {
+    sqlx::query("UPDATE users SET blocked_until = ? WHERE id = ?")
+        .bind(until)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 // ---- apps ----
 
 pub async fn list_apps(pool: &SqlitePool) -> Result<Vec<App>> {

@@ -112,7 +112,11 @@ fn client_country(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Whether `user` may use the portal now, from where this request came from.
+/// An administrator's block comes first, then the user's own access rules.
 fn allowed(user: &User, headers: &HeaderMap) -> Result<(), String> {
+    if let Some(why) = user.block_reason() {
+        return Err(why);
+    }
     let address = client_address(headers);
     let country = client_country(headers);
     user.rules().check(&access::Origin { address: &address, country: country.as_deref() })

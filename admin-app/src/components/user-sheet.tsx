@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { EyeIcon, MessageSquareTextIcon, MousePointer2Icon, Trash2Icon } from "lucide-react"
+import { ChevronDownIcon, EyeIcon, MessageSquareTextIcon, MousePointer2Icon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 
 import { AccessRulesEditor } from "@/components/access-rules"
@@ -8,6 +8,14 @@ import { MessageDialog, type MessageTarget } from "@/components/message-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Field,
   FieldContent,
@@ -20,16 +28,28 @@ import {
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetFooter,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet"
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { api, errorText, since, type PortalState, type PortalUser, type TotpSetup } from "@/lib/api"
+
+/** Blocks at or beyond this (unix seconds, ~year 3000) mean "until unblocked". */
+const FAR_FUTURE = 32_503_680_000
+
+/** How long a disconnect can block a user from reconnecting. -1 = until unblocked. */
+const BLOCK_CHOICES: [number, string][] = [
+  [5, "For 5 minutes"],
+  [15, "For 15 minutes"],
+  [60, "For 1 hour"],
+  [480, "For 8 hours"],
+  [-1, "Until I unblock"],
+]
 
 export function UserSheet({
   user,
@@ -51,8 +71,8 @@ export function UserSheet({
   }, [user])
 
   return (
-    <Sheet open={user !== null} onOpenChange={(open) => !open && onClose()}>
-      <SheetContent className="w-full gap-0 sm:max-w-md">
+    <Dialog open={user !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="flex max-h-[calc(100svh-3rem)] flex-col gap-0 p-0 sm:max-w-2xl">
         {shown && (
           <UserDetails
             key={shown.id}
@@ -63,8 +83,8 @@ export function UserSheet({
             onSecret={onSecret}
           />
         )}
-      </SheetContent>
-    </Sheet>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -241,17 +261,18 @@ function UserDetails({
 
   return (
     <>
-      <SheetHeader className="border-b">
-        <SheetTitle className="flex items-center gap-2">
+      <DialogHeader className="border-b p-5 text-left">
+        <DialogTitle className="flex items-center gap-2">
           {user.username}
           {user.locked && <Badge variant="destructive">Locked</Badge>}
-        </SheetTitle>
-        <SheetDescription>
+          {user.blocked_until && <Badge variant="destructive">Blocked</Badge>}
+        </DialogTitle>
+        <DialogDescription>
           Signs in as Windows account {user.win_username}
-        </SheetDescription>
-      </SheetHeader>
+        </DialogDescription>
+      </DialogHeader>
 
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="flex-1 overflow-y-auto p-5">
         <FieldGroup>
           <FieldSet>
             <FieldLegend variant="label">Apps this user can open</FieldLegend>
@@ -318,24 +339,52 @@ function UserDetails({
                           <MessageSquareTextIcon />
                           Message
                         </Button>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="ml-auto"
-                          disabled={busy}
-                          onClick={() =>
-                            change(() => api("POST", `/api/admin/connections/${s.id}/disconnect`), "Disconnected")
-                          }
-                        >
-                          Disconnect
-                        </Button>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button variant="outline" size="sm" className="ml-auto" disabled={busy}>
+                              Disconnect
+                              <ChevronDownIcon />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                              onSelect={() =>
+                                change(
+                                  () => api("POST", `/api/admin/connections/${s.id}/disconnect`, { block_minutes: 0 }),
+                                  "Disconnected",
+                                )
+                              }
+                            >
+                              Disconnect only
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+                              Disconnect and block from reconnecting
+                            </DropdownMenuLabel>
+                            {BLOCK_CHOICES.map(([minutes, label]) => (
+                              <DropdownMenuItem
+                                key={minutes}
+                                onSelect={() =>
+                                  change(
+                                    () =>
+                                      api("POST", `/api/admin/connections/${s.id}/disconnect`, { block_minutes: minutes }),
+                                    `Disconnected and blocked ${label.toLowerCase()}`,
+                                  )
+                                }
+                              >
+                                {label}
+                              </DropdownMenuItem>
+                            ))}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
                       </div>
                     </div>
                   ))}
                 </div>
                 <FieldDescription>
-                  Disconnecting leaves their apps running; they can connect again. To close their apps and
-                  stop them reconnecting with their current sign-in, sign them out instead.
+                  Disconnecting leaves their apps running. Without a block they can reconnect at once; with one,
+                  every session of theirs ends and they can’t sign back in until it passes. To close their apps too,
+                  sign them out instead.
                 </FieldDescription>
                 <Button
                   variant="destructive"
@@ -367,6 +416,30 @@ function UserDetails({
 
           <FieldSeparator />
           <AccessRulesEditor user={user} reload={reload} />
+
+          {user.blocked_until && (
+            <>
+              <FieldSeparator />
+              <Field orientation="horizontal">
+                <FieldContent>
+                  <FieldLabel>Blocked</FieldLabel>
+                  <FieldDescription>
+                    {user.blocked_until > FAR_FUTURE
+                      ? "Blocked from the portal until you unblock them."
+                      : `Blocked from the portal until ${new Date(user.blocked_until * 1000).toLocaleString()}.`}
+                  </FieldDescription>
+                </FieldContent>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={busy}
+                  onClick={() => change(() => api("POST", `${base}/unblock`), "Unblocked")}
+                >
+                  Unblock
+                </Button>
+              </Field>
+            </>
+          )}
 
           {(user.locked || user.failed_count > 0) && (
             <>
@@ -511,7 +584,7 @@ function UserDetails({
       </div>
 
       {(
-        <SheetFooter className="border-t">
+        <DialogFooter className="mx-0 mb-0 border-t sm:justify-start">
           <Button
             variant="destructive"
             disabled={busy}
@@ -538,7 +611,7 @@ function UserDetails({
             <Trash2Icon />
             Delete user
           </Button>
-        </SheetFooter>
+        </DialogFooter>
       )}
 
       <ConfirmDialog confirmation={confirmation} onClose={() => setConfirmation(null)} />

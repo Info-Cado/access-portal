@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react"
+import { useEffect, useState, type FormEvent } from "react"
 import { toast } from "sonner"
 
 import type { SecretToShow } from "@/components/dialogs"
@@ -37,23 +37,39 @@ const blank = {
   createWin: true,
 }
 
+/** Start the dialog with a Windows account chosen, to add another portal login
+ * that signs in as it (several portal users can share one Windows account). */
+export type NewUserPreset = { winUser: string; accountName: string }
+
 export function NewUserDialog({
   open,
   onOpenChange,
   apps,
   reload,
   onSecret,
+  preset,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   apps: PortalApp[]
   reload: () => Promise<void>
   onSecret: (secret: SecretToShow) => void
+  preset?: NewUserPreset | null
 }) {
   const [form, setForm] = useState(blank)
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
   const set = (patch: Partial<typeof blank>) => setForm((f) => ({ ...f, ...patch }))
+
+  // Opening with a preset ties the new login to an existing Windows account and
+  // needs its password, so "create a Windows account" is off and locked.
+  const locked = !!preset
+  useEffect(() => {
+    if (open) {
+      setForm(preset ? { ...blank, winUser: preset.winUser, createWin: false } : blank)
+      setError("")
+    }
+  }, [open, preset])
 
   const close = (next: boolean) => {
     if (busy) return
@@ -96,9 +112,11 @@ export function NewUserDialog({
       <DialogContent className="max-h-[calc(100svh-2rem)] overflow-y-auto sm:max-w-lg">
         <form onSubmit={submit} autoComplete="off" className="contents">
           <DialogHeader>
-            <DialogTitle>New user</DialogTitle>
+            <DialogTitle>{locked ? `New portal login for ${preset?.accountName}` : "New user"}</DialogTitle>
             <DialogDescription>
-              A portal account, the Windows account its sessions run as, and what it may open.
+              {locked
+                ? "Another portal account that signs in as this Windows account. Give it its own portal username and password."
+                : "A portal account, the Windows account its sessions run as, and what it may open."}
             </DialogDescription>
           </DialogHeader>
 
@@ -131,17 +149,19 @@ export function NewUserDialog({
 
             <FieldSet>
               <FieldLegend variant="label">Windows account on this computer</FieldLegend>
-              <Field orientation="horizontal">
-                <FieldContent>
-                  <FieldLabel htmlFor="nu-create-win">Create a Windows account for them</FieldLabel>
-                  <FieldDescription>
-                    {form.createWin
-                      ? "A new account with a random password nobody needs to know, restricted to the apps you assign."
-                      : "Use an account that already exists on this computer."}
-                  </FieldDescription>
-                </FieldContent>
-                <Switch id="nu-create-win" checked={form.createWin} onCheckedChange={(createWin) => set({ createWin })} />
-              </Field>
+              {!locked && (
+                <Field orientation="horizontal">
+                  <FieldContent>
+                    <FieldLabel htmlFor="nu-create-win">Create a Windows account for them</FieldLabel>
+                    <FieldDescription>
+                      {form.createWin
+                        ? "A new account with a random password nobody needs to know, restricted to the apps you assign."
+                        : "Use an account that already exists on this computer."}
+                    </FieldDescription>
+                  </FieldContent>
+                  <Switch id="nu-create-win" checked={form.createWin} onCheckedChange={(createWin) => set({ createWin })} />
+                </Field>
+              )}
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field>
                   <FieldLabel htmlFor="nu-win-user">Windows username</FieldLabel>
@@ -151,6 +171,7 @@ export function NewUserDialog({
                     onChange={(e) => set({ winUser: e.target.value })}
                     placeholder={form.username.trim() || "Same as username"}
                     spellCheck={false}
+                    readOnly={locked}
                   />
                 </Field>
                 {!form.createWin && (

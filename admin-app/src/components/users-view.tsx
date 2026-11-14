@@ -4,7 +4,7 @@ import { ChevronRightIcon, MessageSquareTextIcon, PlusIcon, SearchIcon, UserXIco
 import type { ViewProps } from "@/components/app-shell"
 import { SecretDialog, type SecretToShow } from "@/components/dialogs"
 import { MessageDialog, type MessageTarget } from "@/components/message-dialog"
-import { NewUserDialog } from "@/components/new-user-dialog"
+import { NewUserDialog, type NewUserPreset } from "@/components/new-user-dialog"
 import { UserSheet } from "@/components/user-sheet"
 import { WindowsAccountsSection } from "@/components/windows-accounts"
 import { Badge } from "@/components/ui/badge"
@@ -17,6 +17,7 @@ export function UsersView({ data, reload }: ViewProps) {
   const [query, setQuery] = useState("")
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [creating, setCreating] = useState(false)
+  const [preset, setPreset] = useState<NewUserPreset | null>(null)
   const [secret, setSecret] = useState<SecretToShow | null>(null)
   const [messageTo, setMessageTo] = useState<MessageTarget | null>(null)
   const connected = data.users.reduce((n, u) => n + u.sessions.length, 0)
@@ -51,7 +52,12 @@ export function UsersView({ data, reload }: ViewProps) {
           <MessageSquareTextIcon />
           Message everyone
         </Button>
-        <Button onClick={() => setCreating(true)}>
+        <Button
+          onClick={() => {
+            setPreset(null)
+            setCreating(true)
+          }}
+        >
           <PlusIcon />
           New user
         </Button>
@@ -136,7 +142,14 @@ export function UsersView({ data, reload }: ViewProps) {
         </div>
       )}
 
-      <WindowsAccountsSection reload={reload} query={query} />
+      <WindowsAccountsSection
+        reload={reload}
+        query={query}
+        onAddLogin={(winUser, accountName) => {
+          setPreset({ winUser, accountName })
+          setCreating(true)
+        }}
+      />
 
       <UserSheet
         user={selected}
@@ -147,10 +160,14 @@ export function UsersView({ data, reload }: ViewProps) {
       />
       <NewUserDialog
         open={creating}
-        onOpenChange={setCreating}
+        onOpenChange={(o) => {
+          setCreating(o)
+          if (!o) setPreset(null)
+        }}
         apps={data.apps}
         reload={reload}
         onSecret={setSecret}
+        preset={preset}
       />
       <SecretDialog secret={secret} onClose={() => setSecret(null)} />
       <MessageDialog target={messageTo} onClose={() => setMessageTo(null)} />

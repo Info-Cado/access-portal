@@ -14,7 +14,14 @@ pub struct User {
     pub created_at: i64,
     /// When and from where the user may sign in (JSON, see `access.rs`).
     pub access_rules: Option<String>,
+    /// Until when an administrator has blocked this user (unix seconds); past or
+    /// `None` means not blocked. `BLOCK_FOREVER` means until unblocked by hand.
+    pub blocked_until: Option<i64>,
 }
+
+/// A `blocked_until` far enough ahead to mean "until an administrator unblocks"
+/// (year 9999). Shown in the app as an indefinite block, not a date.
+pub const BLOCK_FOREVER: i64 = 253_402_300_799;
 
 impl User {
     pub fn rules(&self) -> crate::access::AccessRules {
@@ -25,6 +32,18 @@ impl User {
     }
     pub fn totp_enabled(&self) -> bool {
         self.totp_secret.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+    }
+    /// A reason to refuse the user now, if an administrator has blocked them.
+    pub fn block_reason(&self) -> Option<String> {
+        let until = self.blocked_until?;
+        if until <= crate::db::now() {
+            return None;
+        }
+        if until >= BLOCK_FOREVER {
+            Some("Your administrator has blocked your access to the portal.".to_string())
+        } else {
+            Some("Your administrator has paused your access to the portal. Try again later.".to_string())
+        }
     }
 }
 

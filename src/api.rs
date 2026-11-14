@@ -28,6 +28,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/users/:id/windows", put(set_windows_login))
         .route("/api/admin/users/:id/password", put(set_password))
         .route("/api/admin/users/:id/unlock", post(unlock))
+        .route("/api/admin/users/:id/unblock", post(unblock))
         .route("/api/admin/users/:id/totp", put(set_totp))
         .route("/api/admin/users/:id/desktop", get(desktop_mode).put(set_desktop_mode))
         .route("/api/admin/users/:id/windows-account", post(create_windows_account))
@@ -132,6 +133,7 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
             "totp": u.totp_enabled(),
             "win_username": u.win_username,
             "locked": u.locked_until.is_some_and(|until| until > now),
+            "blocked_until": u.blocked_until.filter(|until| *until > now),
             "failed_count": u.failed_count,
             "created_at": u.created_at,
             "app_ids": app_ids,
@@ -284,6 +286,10 @@ async fn delete_user(
     axum::extract::Query(options): axum::extract::Query<DeleteOptions>,
 ) -> ApiResult {
     let user = existing_user(&state, id).await?;
+    // Disconnect any session they have open now, so deleting the portal user
+    // ends their access at once even when the Windows account stays (it may be
+    // shared with other portal users).
+    state.presence.kick_user(id, crate::presence::DELETED);
     if options.windows == Some(1) {
         host::delete_account(&user.win_username).await.map_err(host_error)?;
     }
@@ -640,17 +646,61 @@ async fn disable_owner_access(State(state): State<AppState>, _: Admin) -> ApiRes
     Ok(Json(json!({})))
 }
 
-/// Disconnect one open session. The user's apps keep running in Windows and the
-/// user can connect again.
-async fn disconnect(State(state): State<AppState>, _: Admin, Path(id): Path<u64>) -> ApiResult {
-    let connection = state.presence.get(id);
-    if !state.presence.kick(id, crate::presence::DISCONNECTED) {
+#[derive(Deserialize)]
+struct DisconnectOptions {
+    /// Keep the user from reconnecting for this many minutes. 0 or absent: just
+    /// disconnect, they can reconnect at once. A negative value: block until an
+    /// administrator unblocks them.
+    #[serde(default)]
+    block_minutes: i64,
+}
+
+/// Disconnect one open session. The user's apps keep running in Windows. Without
+/// a block they can reconnect at once; with one, every session of theirs is
+/// disconnected and they can't sign in or connect again until it passes.
+async fn disconnect(
+    State(state): State<AppState>,
+    _: Admin,
+    Path(id): Path<u64>,
+    // Optional so a call with no body means a plain disconnect, no block.
+    options: Option<Json<DisconnectOptions>>,
+) -> ApiResult {
+    let options = options.map(|Json(o)| o).unwrap_or(DisconnectOptions { block_minutes: 0 });
+    let Some(connection) = state.presence.get(id) else {
         return Err(fail(StatusCode::NOT_FOUND, "That session already ended."));
+    };
+    let user = db::user_by_id(&state.pool, connection.user_id).await?;
+
+    if options.block_minutes != 0 {
+        let until = if options.block_minutes < 0 {
+            crate::models::BLOCK_FOREVER
+        } else {
+            db::now() + options.block_minutes * 60
+        };
+        db::set_block(&state.pool, connection.user_id, Some(until)).await?;
+        // End every session of theirs, not only the one clicked, and sign them
+        // out of the portal so the block takes hold right away.
+        state.presence.kick_user(connection.user_id, crate::presence::BLOCKED);
+        db::delete_sessions_for_user(&state.pool, connection.user_id).await?;
+        let how = if options.block_minutes < 0 {
+            "until unblocked".to_string()
+        } else {
+            format!("for {}", activity::duration(options.block_minutes * 60))
+        };
+        activity::admin(&state.pool, user.as_ref(), &format!("Disconnected and blocked them {how}")).await;
+        return Ok(Json(json!({ "blocked_until": until })));
     }
-    if let Some(c) = connection {
-        let user = db::user_by_id(&state.pool, c.user_id).await?;
-        activity::admin(&state.pool, user.as_ref(), &format!("Disconnected their {} session", c.app)).await;
-    }
+
+    state.presence.kick(id, crate::presence::DISCONNECTED);
+    activity::admin(&state.pool, user.as_ref(), &format!("Disconnected their {} session", connection.app)).await;
+    Ok(Json(json!({})))
+}
+
+/// Lift an administrator's block (not the automatic lockout; that is `unlock`).
+async fn unblock(State(state): State<AppState>, _: Admin, Path(id): Path<i64>) -> ApiResult {
+    let user = existing_user(&state, id).await?;
+    db::set_block(&state.pool, id, None).await?;
+    activity::admin(&state.pool, Some(&user), "Unblocked them").await;
     Ok(Json(json!({})))
 }
 
@@ -685,13 +735,13 @@ async fn shadow(
     };
     let ask = settings::sessions(&state.pool).await.shadow_consent;
     host::shadow(session.id, input.control, ask).map_err(host_error)?;
-    let (verb, what) = if input.control { ("is controlling", "Took control of") } else { ("is viewing", "Viewed") };
-    let note = if ask {
-        json!({"t": "note", "text": "Your administrator asked to see your screen. Windows will ask you to allow it."})
-    } else {
-        json!({"t": "note", "text": format!("Your administrator {verb} your screen.")})
-    };
-    state.presence.notify(|c| c.user_id == user.id, &note);
+    let what = if input.control { "Took control of" } else { "Viewed" };
+    // When consent is off the user is told nothing; with it on, Windows prompts
+    // them, so the browser explains why the prompt appeared.
+    if ask {
+        let note = json!({"t": "note", "text": "Your administrator asked to see your screen. Windows will ask you to allow it."});
+        state.presence.notify(|c| c.user_id == user.id, &note);
+    }
     activity::admin(&state.pool, Some(&user), &format!("{what} their screen")).await;
     Ok(Json(json!({ "session": session.id, "asked": ask })))
 }

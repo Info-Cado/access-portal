@@ -3,7 +3,7 @@
 // owner's own desktop from the portal.
 
 import { useCallback, useEffect, useState } from "react"
-import { ChevronRightIcon, MonitorIcon, RefreshCwIcon, Trash2Icon } from "lucide-react"
+import { ChevronRightIcon, MonitorIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import { ConfirmDialog, type Confirmation } from "@/components/dialogs"
@@ -28,7 +28,6 @@ import {
   FieldSet,
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -39,10 +38,13 @@ const path = (name: string) => `/api/admin/windows-accounts/${encodeURIComponent
 export function WindowsAccountsSection({
   reload,
   query,
+  onAddLogin,
 }: {
   /** Reload the portal's own data (users change when owner access does). */
   reload: () => Promise<void>
   query: string
+  /** Open the new-user dialog to add a portal login for a Windows account. */
+  onAddLogin: (winUser: string, accountName: string) => void
 }) {
   const [list, setList] = useState<WindowsAccounts | null>(null)
   const [error, setError] = useState("")
@@ -164,6 +166,7 @@ export function WindowsAccountsSection({
         ownerUserId={list?.owner_user_id ?? null}
         refresh={refreshAll}
         onClose={() => setSelected(null)}
+        onAddLogin={onAddLogin}
       />
     </section>
   )
@@ -174,21 +177,23 @@ function AccountSheet({
   ownerUserId,
   refresh,
   onClose,
+  onAddLogin,
 }: {
   account: WindowsAccount | null
   ownerUserId: number | null
   refresh: () => Promise<void>
   onClose: () => void
+  onAddLogin: (winUser: string, accountName: string) => void
 }) {
-  // Keep showing the last account while the sheet slides shut.
+  // Keep showing the last account while the dialog closes.
   const [shown, setShown] = useState(account)
   useEffect(() => {
     if (account) setShown(account)
   }, [account])
 
   return (
-    <Sheet open={account !== null} onOpenChange={(open) => !open && onClose()}>
-      <SheetContent className="w-full gap-0 sm:max-w-md">
+    <Dialog open={account !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="flex max-h-[calc(100svh-3rem)] flex-col gap-0 p-0 sm:max-w-2xl">
         {shown && (
           <AccountDetails
             key={shown.name}
@@ -196,10 +201,11 @@ function AccountSheet({
             ownerUserId={ownerUserId}
             refresh={refresh}
             onClose={onClose}
+            onAddLogin={onAddLogin}
           />
         )}
-      </SheetContent>
-    </Sheet>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -208,11 +214,13 @@ function AccountDetails({
   ownerUserId,
   refresh,
   onClose,
+  onAddLogin,
 }: {
   account: WindowsAccount
   ownerUserId: number | null
   refresh: () => Promise<void>
   onClose: () => void
+  onAddLogin: (winUser: string, accountName: string) => void
 }) {
   const base = path(account.name)
   const [busy, setBusy] = useState(false)
@@ -242,24 +250,55 @@ function AccountDetails({
 
   return (
     <>
-      <SheetHeader className="border-b">
-        <SheetTitle className="flex flex-wrap items-center gap-2">
+      <DialogHeader className="border-b p-5 text-left">
+        <DialogTitle className="flex flex-wrap items-center gap-2">
           {account.name}
           {account.me && <Badge>You</Badge>}
           {account.is_admin && <Badge variant="secondary">Administrator</Badge>}
           {!account.enabled && <Badge variant="destructive">Off</Badge>}
-        </SheetTitle>
-        <SheetDescription>
+        </DialogTitle>
+        <DialogDescription>
           {account.me
             ? "The account Access Portal runs as on this computer. It is always shown here."
             : account.portal_users.length
               ? `Portal users signing in as it: ${linked}.`
               : "No portal user signs in as this account."}
-        </SheetDescription>
-      </SheetHeader>
+        </DialogDescription>
+      </DialogHeader>
 
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="flex-1 overflow-y-auto p-5">
         <FieldGroup>
+          <FieldSet>
+            <FieldLegend variant="label">Portal logins</FieldLegend>
+            <FieldDescription>
+              {account.portal_users.length
+                ? "These portal users open a session as this Windows account. Several can share one account."
+                : "No portal user opens a session as this account yet. You can add one."}
+            </FieldDescription>
+            {account.portal_users.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {account.portal_users.map((u) => (
+                  <Badge key={u.id} variant="outline">
+                    {u.username}
+                  </Badge>
+                ))}
+              </div>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              className="self-start"
+              onClick={() => {
+                onClose()
+                onAddLogin(account.name, account.name)
+              }}
+            >
+              <UserPlusIcon />
+              Add portal login
+            </Button>
+          </FieldSet>
+          <FieldSeparator />
+
           {account.me && (
             <>
               <Field orientation="horizontal">
@@ -408,7 +447,7 @@ function AccountDetails({
         </FieldGroup>
       </div>
 
-      <SheetFooter className="border-t">
+      <DialogFooter className="mx-0 mb-0 border-t sm:justify-start">
         <Button
           variant="destructive"
           disabled={busy || !deletable}
@@ -448,7 +487,7 @@ function AccountDetails({
               : "Windows administrator accounts can't be deleted from here."}
           </p>
         )}
-      </SheetFooter>
+      </DialogFooter>
 
       <OwnerAccessDialog
         account={account}

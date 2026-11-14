@@ -25,7 +25,7 @@ impl Default for Sessions {
         // Disconnecting an idle browser loses nothing (the apps keep running);
         // signing out closes apps, so that one is off until chosen. Viewing a
         // screen asks the user first unless the admin turns that off.
-        Self { idle_minutes: 60, signout_hours: 0, shadow_consent: true }
+        Self { idle_minutes: 60, signout_hours: 0, shadow_consent: false }
     }
 }
 

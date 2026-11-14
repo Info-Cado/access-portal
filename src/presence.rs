@@ -48,6 +48,8 @@ impl Kick {
 
 pub const DISCONNECTED: &str = "Your administrator disconnected this session. Your apps are still running.";
 pub const SIGNED_OUT: &str = "Your administrator signed you out. Your apps were closed.";
+pub const DELETED: &str = "Your account has been removed. Ask your administrator.";
+pub const BLOCKED: &str = "Your administrator has paused your access to the portal.";
 
 /// Something to show in the user's browser while the session runs (a JSON
 /// message for the session page).

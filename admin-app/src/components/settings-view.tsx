@@ -253,7 +253,7 @@ function SessionsCard({ settings, reload }: { settings: SessionSettings; reload:
               <FieldDescription>
                 {settings.shadow_consent
                   ? "On. Windows asks the user to allow it each time you view or control their screen."
-                  : "Off. View screen and Take control start straight away; the user is told on their screen."}
+                  : "Off. View screen and Take control start straight away, with nothing shown to the user."}
               </FieldDescription>
             </FieldContent>
             <Switch

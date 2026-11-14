@@ -33,6 +33,8 @@ export type PortalUser = {
   totp: boolean
   win_username: string
   locked: boolean
+  /** When an administrator's block ends (unix seconds), or null if not blocked. */
+  blocked_until: number | null
   failed_count: number
   created_at: number
   app_ids: number[]
