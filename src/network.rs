@@ -1,21 +1,29 @@
 //! Where browsers can reach the portal.
 //!
-//! The public link (Cloudflare Tunnel) and `tailscale serve` connect to the
-//! portal on this computer (`BIND_ADDR`, `127.0.0.1:8088` by default). With
-//! "Local network" or "Tailscale" switched on in the app, the portal also
-//! listens on the computer's other addresses, on the same port, so people can
-//! open `http://<this computer's address>:8088` directly:
+//! The portal always serves plain HTTP on this computer only (`BIND_ADDR`,
+//! `127.0.0.1:8088` by default); the public link (Cloudflare Tunnel) and
+//! `tailscale serve` connect there.
+//!
+//! With "Local network" or "Tailscale" switched on in the app, the portal also
+//! serves **HTTPS** on every interface, on the TLS port (`8443` by default),
+//! with a self-signed certificate it generates once. Browsers only turn on the
+//! efficient H.264/AAC paths in a secure context (HTTPS or localhost), so the
+//! local addresses have to be HTTPS to match the public link's quality; the
+//! certificate is self-signed, so each device shows a one-time warning the
+//! first time. People open `https://<this computer's address>:8443`.
 //!
 //! - every connection is checked against the switches: loopback always, private
 //!   addresses (192.168.x.x, 10.x.x.x, ...) with Local network, Tailscale's
 //!   100.64.0.0/10 with Tailscale; anything else is refused;
-//! - a Windows Firewall rule lets exactly those in, for this program and port;
+//! - a Windows Firewall rule lets exactly those in, for this program and the
+//!   TLS port;
 //! - only connections from this computer itself may say, in headers, where the
 //!   browser really is (the tunnel does); for direct ones the portal uses the
 //!   connection's own address, so access rules and sign-in limits can't be
 //!   fooled.
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
@@ -24,27 +32,40 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
 
 use crate::settings::Reach;
 
+/// The HTTPS port for the local network and Tailscale (plain HTTP stays on
+/// loopback for the tunnel). Overridable with `TLS_PORT`.
+fn tls_port() -> u16 {
+    std::env::var("TLS_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8443)
+}
+
 pub struct Network {
-    /// `BIND_ADDR`: where the tunnel connects.
+    /// `BIND_ADDR`: the loopback HTTP address the tunnel connects to.
     bind: String,
+    tls_port: u16,
+    data_dir: PathBuf,
     reach: RwLock<Reach>,
-    /// The listener's address and its accept loop.
-    serving: Mutex<Option<(String, tokio::task::AbortHandle)>>,
     router: OnceLock<Router>,
+    /// The running HTTPS listener (its shutdown handle), or `None` when neither
+    /// switch is on.
+    tls: Mutex<Option<Handle>>,
     /// This computer's addresses, refreshed now and then: (kind, address).
     addresses: RwLock<Vec<(&'static str, String)>>,
 }
 
 impl Network {
-    pub fn new(bind: String, reach: Reach) -> Arc<Self> {
+    pub fn new(bind: String, reach: Reach, data_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             bind,
+            tls_port: tls_port(),
+            data_dir,
             reach: RwLock::new(reach),
-            serving: Mutex::new(None),
             router: OnceLock::new(),
+            tls: Mutex::new(None),
             addresses: RwLock::new(Vec::new()),
         })
     }
@@ -53,33 +74,36 @@ impl Network {
         *self.reach.read().unwrap()
     }
 
+    /// The HTTP port the tunnel connects to (loopback).
     pub fn port(&self) -> u16 {
         self.bind.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(8088)
     }
 
-    /// Where the listener should be for the current switches.
-    fn wanted(&self) -> String {
-        let reach = self.reach();
-        let host = self.bind.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
-        let loopback = host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) || host == "localhost";
-        if (reach.lan || reach.tailscale) && loopback {
-            format!("0.0.0.0:{}", self.port())
-        } else {
-            self.bind.clone()
-        }
-    }
-
-    /// Start serving `router` (the public pages) where the switches say.
+    /// Start serving `router` (the public pages): HTTP on loopback always, and
+    /// HTTPS on every interface while a switch is on.
     pub async fn start(self: &Arc<Self>, router: Router) -> Result<()> {
+        // rustls needs a process-wide crypto provider; harmless if already set.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
         let gated = router.layer(axum::middleware::from_fn_with_state(self.clone(), gate));
-        let _ = self.router.set(gated);
-        self.listen().await?;
+        let _ = self.router.set(gated.clone());
+
+        // The loopback HTTP listener never moves; it carries the tunnel.
+        let http_app = gated.into_make_service_with_connect_info::<SocketAddr>();
+        let listener = tokio::net::TcpListener::bind(&self.bind)
+            .await
+            .with_context(|| format!("listening on {} (is another copy of the portal running?)", self.bind))?;
+        tracing::info!("access-portal listening on http://{}", self.bind);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, http_app).await {
+                tracing::error!("the portal stopped serving: {e:#}");
+            }
+        });
+
+        self.apply().await;
+
         let me = self.clone();
         tokio::spawn(async move {
-            // The firewall rule follows the switches (and the program's place).
-            let reach = me.reach();
-            let port = me.port();
-            tokio::task::spawn_blocking(move || firewall(reach, port)).await.ok();
             let mut every = tokio::time::interval(std::time::Duration::from_secs(120));
             loop {
                 every.tick().await;
@@ -90,67 +114,100 @@ impl Network {
         Ok(())
     }
 
-    /// Change the switches: refuse or allow connections at once, and move the
-    /// listener and firewall rule. Open sessions are kept.
+    /// Change the switches: refuse or allow connections at once (the gate reads
+    /// them live), move the HTTPS listener and firewall rule to match. Open
+    /// sessions are kept.
     pub async fn set_reach(self: &Arc<Self>, reach: Reach) -> Result<()> {
         *self.reach.write().unwrap() = reach;
-        self.listen().await?;
-        let port = self.port();
-        tokio::task::spawn_blocking(move || firewall(reach, port)).await.ok();
+        self.apply().await;
         Ok(())
     }
 
-    /// (Re)bind the listener if it isn't where it should be.
-    async fn listen(&self) -> Result<()> {
-        let wanted = self.wanted();
-        {
-            let mut serving = self.serving.lock().unwrap();
-            if serving.as_ref().is_some_and(|(at, _)| *at == wanted) {
-                return Ok(());
+    /// Bring the HTTPS listener and firewall rule in line with the switches.
+    async fn apply(self: &Arc<Self>) {
+        let reach = self.reach();
+        let want_tls = reach.lan || reach.tailscale;
+
+        let running = self.tls.lock().unwrap().is_some();
+        if want_tls && !running {
+            match self.start_tls().await {
+                Ok(handle) => *self.tls.lock().unwrap() = Some(handle),
+                Err(e) => tracing::error!("could not start the local HTTPS listener: {e:#}"),
             }
-            // Stop accepting on the old address; connections already open
-            // (sessions) run on their own and keep going.
-            if let Some((_, task)) = serving.take() {
-                task.abort();
+        } else if !want_tls && running {
+            if let Some(handle) = self.tls.lock().unwrap().take() {
+                handle.shutdown();
             }
         }
-        let mut tries = 0;
-        let listener = loop {
-            match tokio::net::TcpListener::bind(&wanted).await {
-                Ok(l) => break l,
-                Err(_) if tries < 20 => {
-                    tries += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("listening on {wanted} (is another copy of the portal running?)"))
-                }
-            }
-        };
+
+        let port = self.tls_port;
+        tokio::task::spawn_blocking(move || firewall(reach, port)).await.ok();
+    }
+
+    /// Spawn the HTTPS listener on every interface and return its shutdown handle.
+    async fn start_tls(self: &Arc<Self>) -> Result<Handle> {
+        let config = self.tls_config().await?;
         let app = self.router.get().cloned().context("the portal's pages aren't ready")?;
-        let task = tokio::spawn(async move {
-            let service = app.into_make_service_with_connect_info::<SocketAddr>();
-            if let Err(e) = axum::serve(listener, service).await {
-                tracing::error!("the portal stopped serving: {e:#}");
+        let service = app.into_make_service_with_connect_info::<SocketAddr>();
+        let addr: SocketAddr = ([0, 0, 0, 0], self.tls_port).into();
+        let handle = Handle::new();
+        let h = handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = axum_server::bind_rustls(addr, config).handle(h).serve(service).await {
+                tracing::error!("the portal's HTTPS listener stopped: {e:#}");
             }
         });
-        tracing::info!("access-portal listening on http://{wanted}");
-        *self.serving.lock().unwrap() = Some((wanted, task.abort_handle()));
-        Ok(())
+        tracing::info!("access-portal listening on https://0.0.0.0:{}", self.tls_port);
+        Ok(handle)
+    }
+
+    /// The self-signed certificate for the local addresses, made once and kept
+    /// in the data folder so devices don't have to trust a new one each start.
+    async fn tls_config(&self) -> Result<RustlsConfig> {
+        let cert_path = self.data_dir.join("local-cert.pem");
+        let key_path = self.data_dir.join("local-key.pem");
+        if !cert_path.exists() || !key_path.exists() {
+            let (cert_pem, key_pem) = generate_cert().context("generating the local certificate")?;
+            std::fs::write(&cert_path, cert_pem).context("writing the local certificate")?;
+            std::fs::write(&key_path, key_pem).context("writing the local certificate key")?;
+        }
+        RustlsConfig::from_pem_file(&cert_path, &key_path)
+            .await
+            .context("loading the local certificate")
     }
 
     /// The addresses people can type, for the app: `[{kind, url}]`.
     pub fn urls(&self) -> Vec<serde_json::Value> {
         let reach = self.reach();
-        let port = self.port();
+        let port = self.tls_port;
         self.addresses
             .read()
             .unwrap()
             .iter()
             .filter(|(kind, _)| (*kind == "lan" && reach.lan) || (*kind == "tailscale" && reach.tailscale))
-            .map(|(kind, address)| serde_json::json!({ "kind": kind, "url": format!("http://{address}:{port}") }))
+            .map(|(kind, address)| serde_json::json!({ "kind": kind, "url": format!("https://{address}:{port}") }))
             .collect()
     }
+}
+
+/// A self-signed certificate (PEM cert, PEM key) covering this computer's local
+/// names and addresses. Self-signed, so browsers warn once per device whatever
+/// the names are; the names just keep the warning to a single click.
+fn generate_cert() -> Result<(String, String)> {
+    let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    for (_, address) in local_addresses() {
+        if !names.contains(&address) {
+            names.push(address);
+        }
+    }
+    let mut params = rcgen::CertificateParams::new(names)?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Access Portal (local)");
+    let key = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&key)?;
+    Ok((cert.pem(), key.serialize_pem()))
 }
 
 /// The kind of network a browser connects from, if the portal knows it.
@@ -210,6 +267,10 @@ async fn gate(State(network): State<Arc<Network>>, mut request: Request, next: N
         for name in FRONT_END_HEADERS {
             headers.remove(name);
         }
+        // HTTPS from the local network: tell the app so cookies are marked Secure.
+        if let Ok(v) = HeaderValue::from_str("https") {
+            headers.insert("x-forwarded-proto", v);
+        }
         if let Ok(v) = HeaderValue::from_str(&peer.ip().to_string()) {
             headers.insert("x-forwarded-for", v);
         }
@@ -266,7 +327,7 @@ fn local_addresses() -> Vec<(&'static str, String)> {
 }
 
 /// Keep the Windows Firewall rule in step with the switches: inbound TCP on the
-/// portal's port, for this program, from the local subnet and/or Tailscale.
+/// TLS port, for this program, from the local subnet and/or Tailscale.
 fn firewall(reach: Reach, port: u16) {
     #[cfg(windows)]
     {

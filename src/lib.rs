@@ -133,7 +133,7 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
     tokio::task::spawn_blocking(host::tune_remote_desktop);
 
     let address = config.bind_addr.clone();
-    let network = network::Network::new(address.clone(), settings::reach(&pool).await);
+    let network = network::Network::new(address.clone(), settings::reach(&pool).await, data_dir.to_path_buf());
     let state = AppState {
         pool,
         config: Arc::new(config),

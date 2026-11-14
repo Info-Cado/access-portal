@@ -286,16 +286,22 @@ passes; **Unblock** in their panel lifts it early. This block is separate from
 the automatic lockout after wrong passwords.
 
 **Without the internet** (Settings, `src/network.rs`): besides the public link,
-people can open the portal at `http://<this computer's address>:8088` from the
+people can open the portal at `https://<this computer's address>:8443` from the
 local network and, with Tailscale, from any device on the same tailnet (its
-100.x address or MagicDNS name). Both switches are on by default. Every
-connection is checked against them (anything that isn't loopback, a private
-address or Tailscale's 100.64.0.0/10 is refused), a Windows Firewall rule lets
-exactly those in for this program and port, and only connections from this
+100.x address or MagicDNS name). Both switches are on by default. Plain HTTP
+stays on `127.0.0.1:8088` for the tunnel; the local addresses are served over
+**HTTPS** because browsers only enable the efficient H.264/AAC paths in a secure
+context (HTTPS or localhost) — on plain HTTP they silently fall back to the
+heavier tile path, which made local connections slower than the public link.
+The certificate is self-signed (generated once with `rcgen`, kept as
+`local-cert.pem`/`local-key.pem` in the data folder, SANs for the current
+local/Tailscale IPs and MagicDNS name), so each device shows a one-time browser
+warning the first time. `TLS_PORT` overrides 8443. Every connection is checked
+against the switches (anything that isn't loopback, a private address or
+Tailscale's 100.64.0.0/10 is refused), a Windows Firewall rule lets exactly
+those in for this program and the TLS port, and only connections from this
 computer itself (the tunnel) may report a browser's address in headers, so
-sign-in rules and limits use the real address. These addresses are plain http,
-so browsers turn off what needs a secure page there: the microphone and camera,
-copying out of a session (pasting in works), and the H.264 and AAC paths.
+sign-in rules and limits use the real address.
 
 **Windows accounts on this computer** are listed under the portal's users:
 every local account, not only the portal's (Windows' built-in Administrator,

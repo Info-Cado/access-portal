@@ -140,9 +140,10 @@ function NetworkCard({ network, reload }: { network: NetworkReach; reload: () =>
           </Field>
           {(network.lan || network.tailscale) && (
             <FieldDescription>
-              These addresses use plain http, so browsers turn off a few extras there: the microphone and camera,
-              copying out of a session (pasting in still works) and the sharpest video mode. Everything else works;
-              the public link has all of them.
+              These addresses are <code>https</code> with the portal’s own certificate, so sessions run at the same
+              quality as the public link. The first time a device opens one, the browser shows a one-time “your
+              connection isn’t private” warning — click <strong>Advanced → Continue</strong>; it’s remembered after
+              that.
             </FieldDescription>
           )}
         </FieldGroup>
