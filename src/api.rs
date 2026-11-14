@@ -44,6 +44,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/settings/backups", put(set_backup_settings))
         .route("/api/admin/settings/alerts", put(set_alert_settings))
         .route("/api/admin/settings/updates", put(set_update_settings))
+        .route("/api/admin/settings/network", put(set_network_settings))
         .route("/api/admin/health", get(health))
         .route("/api/admin/auth/verify", post(verify_admin))
         .route("/api/admin/auth", put(change_admin))
@@ -157,6 +158,7 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
         },
         "admin": { "username": admin_name, "default_password": default_password },
         "owner_user_id": owner_user(&state).await?.map(|u| u.id),
+        "network": network_info(&state),
     })))
 }
 
@@ -848,6 +850,25 @@ async fn set_update_settings(State(state): State<AppState>, _: Admin, Json(input
     settings::set_updates(&state.pool, &input).await?;
     activity::admin(&state.pool, None, if input.auto { "Turned automatic updates on" } else { "Turned automatic updates off" }).await;
     Ok(Json(json!({ "updates": input })))
+}
+
+/// Let browsers on the local network and/or Tailscale open the portal directly.
+async fn set_network_settings(State(state): State<AppState>, _: Admin, Json(input): Json<settings::Reach>) -> ApiResult {
+    settings::set_reach(&state.pool, &input).await?;
+    state.network.set_reach(input).await.map_err(|e| fail(StatusCode::CONFLICT, &format!("{e:#}")))?;
+    let on = |b: bool| if b { "on" } else { "off" };
+    activity::admin(
+        &state.pool,
+        None,
+        &format!("Local network access {}, Tailscale access {}", on(input.lan), on(input.tailscale)),
+    )
+    .await;
+    Ok(Json(json!({ "network": network_info(&state) })))
+}
+
+fn network_info(state: &AppState) -> Value {
+    let reach = state.network.reach();
+    json!({ "lan": reach.lan, "tailscale": reach.tailscale, "port": state.network.port(), "urls": state.network.urls() })
 }
 
 #[derive(Deserialize)]

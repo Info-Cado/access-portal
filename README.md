@@ -272,6 +272,18 @@ Windows account of their own by default (a standard account in the "Portal RDP
 Users" group); deleting a user leaves the Windows account unless you tick the
 box.
 
+**Without the internet** (Settings, `src/network.rs`): besides the public link,
+people can open the portal at `http://<this computer's address>:8088` from the
+local network and, with Tailscale, from any device on the same tailnet (its
+100.x address or MagicDNS name). Both switches are on by default. Every
+connection is checked against them (anything that isn't loopback, a private
+address or Tailscale's 100.64.0.0/10 is refused), a Windows Firewall rule lets
+exactly those in for this program and port, and only connections from this
+computer itself (the tunnel) may report a browser's address in headers, so
+sign-in rules and limits use the real address. These addresses are plain http,
+so browsers turn off what needs a secure page there: the microphone and camera,
+copying out of a session (pasting in works), and the H.264 and AAC paths.
+
 **Windows accounts on this computer** are listed under the portal's users:
 every local account, not only the portal's (Windows' built-in Administrator,
 Guest, DefaultAccount and WDAGUtilityAccount are hidden). Each can have its full

@@ -122,7 +122,7 @@ export function AppShell({
         </SidebarContent>
 
         <SidebarFooter>
-          <PublicLinkFooter link={status.public} local={status.address} />
+          <PublicLinkFooter link={status.public} local={status.address} direct={data.network.urls} />
         </SidebarFooter>
         <SidebarRail />
       </Sidebar>

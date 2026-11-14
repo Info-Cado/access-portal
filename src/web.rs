@@ -90,8 +90,9 @@ impl LoginLimiter {
 }
 
 /// The browser's address as reported by the HTTPS front end in front of the
-/// portal (Cloudflare, then any other proxy); the portal itself only listens
-/// on this machine.
+/// portal (Cloudflare, then any other proxy). For browsers on the local network
+/// or Tailscale, which connect directly, `network.rs` replaces these headers
+/// with the connection's own address, so they can't be made up.
 fn client_address(headers: &HeaderMap) -> String {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
     header("cf-connecting-ip")

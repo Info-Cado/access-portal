@@ -25,7 +25,16 @@ const STATE: Record<PublicLink["state"], { label: string; dot: string; pulse?: b
 
 /** Bottom-left of the sidebar: the address people use to reach this portal,
  * whether it is up, and Copy / Open. */
-export function PublicLinkFooter({ link, local }: { link: PublicLink; local: string }) {
+export function PublicLinkFooter({
+  link,
+  local,
+  direct,
+}: {
+  link: PublicLink
+  local: string
+  /** Addresses on the local network and Tailscale. */
+  direct: { kind: "lan" | "tailscale"; url: string }[]
+}) {
   const [copied, setCopied] = useState(false)
   const state = STATE[link.state] ?? STATE.unavailable
   const host = link.url?.replace(/^https:\/\//, "")
@@ -76,6 +85,29 @@ export function PublicLinkFooter({ link, local }: { link: PublicLink; local: str
                   <ExternalLinkIcon />
                   Open in browser
                 </DropdownMenuItem>
+              </>
+            )}
+            {direct.length > 0 && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+                  On the local network and Tailscale
+                </DropdownMenuLabel>
+                {direct.map((d) => (
+                  <DropdownMenuItem
+                    key={d.url}
+                    onSelect={() =>
+                      navigator.clipboard
+                        .writeText(d.url)
+                        .then(() => toast.success("Address copied", { description: d.url }))
+                        .catch(() => toast.error("Could not copy."))
+                    }
+                  >
+                    <CopyIcon />
+                    <span className="truncate">{d.url.replace(/^http:\/\//, "")}</span>
+                    <span className="ml-auto text-xs text-muted-foreground">{d.kind === "lan" ? "Local" : "Tailscale"}</span>
+                  </DropdownMenuItem>
+                ))}
               </>
             )}
             <DropdownMenuSeparator />

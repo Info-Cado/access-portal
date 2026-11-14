@@ -1,4 +1,5 @@
 import { useState } from "react"
+import { CopyIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import type { ViewProps } from "@/components/app-shell"
@@ -17,7 +18,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { NativeSelect } from "@/components/ui/native-select"
 import { Switch } from "@/components/ui/switch"
-import { api, errorText, type SessionSettings } from "@/lib/api"
+import { api, errorText, type NetworkReach, type SessionSettings } from "@/lib/api"
 
 const IDLE_CHOICES: [number, string][] = [
   [0, "Never"],
@@ -49,11 +50,125 @@ export function SettingsView({ data, reload }: ViewProps) {
   return (
     <div className="flex max-w-2xl flex-col gap-4">
       <SetupCard />
+      <NetworkCard network={data.network} reload={reload} />
       <SessionsCard settings={data.settings} reload={reload} />
       <AlertsCard data={data} reload={reload} />
       <BackupsCard />
       <UpdatesCard data={data} reload={reload} />
       <AdminCard username={data.admin.username} isDefault={data.admin.default_password} reload={reload} />
+    </div>
+  )
+}
+
+/** Opening the portal straight from the local network or Tailscale, besides the public link. */
+function NetworkCard({ network, reload }: { network: NetworkReach; reload: () => Promise<void> }) {
+  const [busy, setBusy] = useState(false)
+
+  const save = async (next: { lan: boolean; tailscale: boolean }, done: string) => {
+    setBusy(true)
+    try {
+      await api("PUT", "/api/admin/settings/network", next)
+      await reload()
+      toast.success(done)
+    } catch (e) {
+      toast.error(errorText(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const copy = (url: string) =>
+    navigator.clipboard
+      .writeText(url)
+      .then(() => toast.success("Address copied", { description: url }))
+      .catch(() => toast.error("Could not copy. Select the address and copy it by hand."))
+
+  const lan = network.urls.filter((u) => u.kind === "lan")
+  const tailscale = network.urls.filter((u) => u.kind === "tailscale")
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Without the internet</CardTitle>
+        <CardDescription>
+          Besides the public link, people can open the portal straight from this computer’s address. They sign in the
+          same way, and every user’s sign-in rules still apply.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <FieldGroup>
+          <Field orientation="horizontal">
+            <FieldContent>
+              <FieldLabel htmlFor="reach-lan">Local network</FieldLabel>
+              <FieldDescription>
+                {network.lan
+                  ? "On. Devices on the same Wi-Fi or office network can use the address below."
+                  : "Off. Devices on the same network have to use the public link."}
+              </FieldDescription>
+              {network.lan && <Addresses urls={lan} copy={copy} empty="This computer isn't on a local network right now." />}
+            </FieldContent>
+            <Switch
+              id="reach-lan"
+              checked={network.lan}
+              disabled={busy}
+              onCheckedChange={(on) =>
+                save({ lan: on, tailscale: network.tailscale }, on ? "Local network access on" : "Local network access off")
+              }
+            />
+          </Field>
+          <FieldSeparator />
+          <Field orientation="horizontal">
+            <FieldContent>
+              <FieldLabel htmlFor="reach-tailscale">Tailscale</FieldLabel>
+              <FieldDescription>
+                {network.tailscale
+                  ? "On. Devices signed in to the same Tailscale network can use the address below, from anywhere."
+                  : "Off. Tailscale devices have to use the public link."}
+              </FieldDescription>
+              {network.tailscale && (
+                <Addresses urls={tailscale} copy={copy} empty="Tailscale isn't running on this computer." />
+              )}
+            </FieldContent>
+            <Switch
+              id="reach-tailscale"
+              checked={network.tailscale}
+              disabled={busy}
+              onCheckedChange={(on) =>
+                save({ lan: network.lan, tailscale: on }, on ? "Tailscale access on" : "Tailscale access off")
+              }
+            />
+          </Field>
+          {(network.lan || network.tailscale) && (
+            <FieldDescription>
+              These addresses use plain http, so browsers turn off a few extras there: the microphone and camera,
+              copying out of a session (pasting in still works) and the sharpest video mode. Everything else works;
+              the public link has all of them.
+            </FieldDescription>
+          )}
+        </FieldGroup>
+      </CardContent>
+    </Card>
+  )
+}
+
+function Addresses({
+  urls,
+  copy,
+  empty,
+}: {
+  urls: { url: string }[]
+  copy: (url: string) => void
+  empty: string
+}) {
+  if (urls.length === 0) return <FieldDescription>{empty}</FieldDescription>
+  return (
+    <div className="mt-1 flex flex-wrap gap-1.5">
+      {urls.map((u) => (
+        <Button key={u.url} variant="outline" size="sm" className="font-mono text-xs" onClick={() => copy(u.url)}>
+          <CopyIcon />
+          {u.url.replace(/^http:\/\//, "")}
+        </Button>
+      ))}
     </div>
   )
 }

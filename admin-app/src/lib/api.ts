@@ -81,6 +81,16 @@ export type PortalState = {
   alerts: { topic?: string | null; server: string }
   /** The portal user that opens the computer owner's own desktop, if any. */
   owner_user_id: number | null
+  network: NetworkReach
+}
+
+/** Opening the portal directly from the local network or Tailscale. */
+export type NetworkReach = {
+  lan: boolean
+  tailscale: boolean
+  port: number
+  /** Addresses people can type, for the networks that are on. */
+  urls: { kind: "lan" | "tailscale"; url: string }[]
 }
 
 export type BackupInfo = { name: string; at: number; size: number }

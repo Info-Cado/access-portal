@@ -20,6 +20,7 @@ mod gfx;
 mod error;
 mod host;
 mod models;
+mod network;
 mod presence;
 mod print;
 mod rdp;
@@ -56,6 +57,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// Recent problems, for the app's alerts.
     pub health: Arc<Health>,
+    /// Where browsers can reach the portal (local network, Tailscale).
+    pub network: Arc<network::Network>,
 }
 
 /// Sessions that could not be opened recently (unix time, why).
@@ -130,6 +133,7 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
     tokio::task::spawn_blocking(host::tune_remote_desktop);
 
     let address = config.bind_addr.clone();
+    let network = network::Network::new(address.clone(), settings::reach(&pool).await);
     let state = AppState {
         pool,
         config: Arc::new(config),
@@ -137,6 +141,7 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
         presence: Arc::default(),
         data_dir: data_dir.to_path_buf(),
         health: Arc::default(),
+        network: network.clone(),
     };
 
     // A backup a day (checked hourly, so a computer that was off catches up).
@@ -184,16 +189,8 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
         }
     });
 
-    let listener = tokio::net::TcpListener::bind(&address)
-        .await
-        .with_context(|| format!("listening on {address} (is another copy of the portal running?)"))?;
     let public = web::router(state.clone()).layer(TraceLayer::new_for_http());
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, public).await {
-            tracing::error!("the portal stopped serving: {e:#}");
-        }
-    });
-    tracing::info!("access-portal listening on http://{address}");
+    network.start(public).await?;
 
     Ok(Portal {
         admin: api::router().with_state(state),

@@ -92,6 +92,29 @@ pub async fn set_updates(pool: &SqlitePool, value: &Updates) -> Result<()> {
     set(pool, "updates", &serde_json::to_string(value)?).await
 }
 
+/// Where browsers may reach the portal besides its public link (see `network.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reach {
+    /// From the local network (private addresses such as 192.168.x.x).
+    pub lan: bool,
+    /// From devices on the computer's Tailscale network (100.64.0.0/10).
+    pub tailscale: bool,
+}
+
+impl Default for Reach {
+    fn default() -> Self {
+        Self { lan: true, tailscale: true }
+    }
+}
+
+pub async fn reach(pool: &SqlitePool) -> Reach {
+    get_json(pool, "reach").await
+}
+
+pub async fn set_reach(pool: &SqlitePool, value: &Reach) -> Result<()> {
+    set(pool, "reach", &serde_json::to_string(value)?).await
+}
+
 /// Phone alerts: sent to this topic on an ntfy server when set.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Alerts {
