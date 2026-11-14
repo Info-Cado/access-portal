@@ -39,6 +39,7 @@ dependencies = [
  "rand 0.8.8",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -54,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "access-portal-admin"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "access-portal",
  "anyhow",

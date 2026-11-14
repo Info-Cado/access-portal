@@ -163,6 +163,10 @@ impl Network {
 
     /// The self-signed certificate for the local addresses, made once and kept
     /// in the data folder so devices don't have to trust a new one each start.
+    ///
+    /// Serves **HTTP/1.1 only** (ALPN): HTTP/2 carries the host in the
+    /// `:authority` pseudo-header and sends no `Host` header, which the
+    /// cross-site check needs, so an h2 browser would be refused.
     async fn tls_config(&self) -> Result<RustlsConfig> {
         let cert_path = self.data_dir.join("local-cert.pem");
         let key_path = self.data_dir.join("local-key.pem");
@@ -171,9 +175,20 @@ impl Network {
             std::fs::write(&cert_path, cert_pem).context("writing the local certificate")?;
             std::fs::write(&key_path, key_pem).context("writing the local certificate key")?;
         }
-        RustlsConfig::from_pem_file(&cert_path, &key_path)
-            .await
-            .context("loading the local certificate")
+        let cert_bytes = std::fs::read(&cert_path).context("reading the local certificate")?;
+        let key_bytes = std::fs::read(&key_path).context("reading the local certificate key")?;
+        let certs = rustls_pemfile::certs(&mut &cert_bytes[..])
+            .collect::<Result<Vec<_>, _>>()
+            .context("parsing the local certificate")?;
+        let key = rustls_pemfile::private_key(&mut &key_bytes[..])
+            .context("parsing the local certificate key")?
+            .context("the local certificate key file has no private key")?;
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .context("building the TLS configuration")?;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(RustlsConfig::from_config(std::sync::Arc::new(config)))
     }
 
     /// The addresses people can type, for the app: `[{kind, url}]`.

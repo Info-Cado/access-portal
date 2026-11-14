@@ -39,6 +39,7 @@ dependencies = [
  "rand 0.8.8",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
