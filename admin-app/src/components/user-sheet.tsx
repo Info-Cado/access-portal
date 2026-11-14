@@ -70,7 +70,7 @@ export function UserSheet({
 
 type Mode = "app" | "full" | "missing"
 
-/** Full Windows desktop vs Miracle only. The setting lives on the Windows
+/** Full Windows desktop vs restricted to assigned apps. The setting lives on the Windows
  * account itself, so it is read from the host each time the panel opens. */
 function DesktopMode({ user, onMode }: { user: PortalUser; onMode: (mode: Mode | null) => void }) {
   const [mode, setModeState] = useState<Mode | null>(null)
@@ -101,7 +101,7 @@ function DesktopMode({ user, onMode }: { user: PortalUser; onMode: (mode: Mode |
       const r = await api<{ mode: Mode }>("POST", `/api/admin/users/${user.id}/windows-account`)
       setMode(r.mode)
       toast.success(`Windows account ${user.win_username} created`, {
-        description: "Limited to Miracle. Its password is random and stored by the portal.",
+        description: "Restricted to the apps assigned to them. Its password is random and stored by the portal.",
       })
     } catch (e) {
       toast.error(errorText(e))
@@ -115,7 +115,7 @@ function DesktopMode({ user, onMode }: { user: PortalUser; onMode: (mode: Mode |
     try {
       const r = await api<{ mode: Mode }>("PUT", path, { full })
       setMode(r.mode)
-      toast.success(full ? "Full desktop turned on" : "Limited to Miracle", {
+      toast.success(full ? "Full desktop turned on" : "Full desktop turned off", {
         description: "Applies from their next session.",
       })
     } catch (e) {
@@ -131,10 +131,11 @@ function DesktopMode({ user, onMode }: { user: PortalUser; onMode: (mode: Mode |
   else if (mode === "missing")
     description = `There is no Windows account named ${user.win_username} on this computer yet, so this user can't open a session.`
   else if (mode === "full")
-    description = "On. Sessions get the normal Windows desktop, Start menu and all programs."
+    description =
+      "On. They see Desktop in the portal (the normal Windows desktop, Start menu and all programs), next to any apps assigned to them."
   else
     description =
-      "Off. Sessions show only Miracle; the desktop, Start menu, Run, command prompt, Task Manager and drive C: are blocked."
+      "Off. They can open only the apps assigned to them; with none, the portal tells them nothing is assigned. Run, command prompt, Task Manager and drive C: are blocked."
 
   return (
     <Field orientation="horizontal">

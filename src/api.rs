@@ -402,8 +402,8 @@ fn host_error(e: anyhow::Error) -> ApiError {
     fail(StatusCode::CONFLICT, &format!("{e}"))
 }
 
-/// Whether the user's Windows account gets the full desktop or Miracle only:
-/// `{"mode": "app" | "full" | "missing"}`.
+/// Whether the user's Windows account gets the full desktop or is restricted to
+/// its assigned apps: `{"mode": "app" | "full" | "missing"}`.
 async fn desktop_mode(
     State(state): State<AppState>,
     _: Admin,
@@ -818,6 +818,9 @@ async fn create_app(
     }
     if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err(bad("The key may only contain letters, digits, '-' and '_'."));
+    }
+    if key.eq_ignore_ascii_case(crate::web::DESKTOP_KEY) {
+        return Err(bad("\"desktop\" is kept for the full desktop; choose another key."));
     }
     let port = match input.port.trim() {
         "" => "3389",

@@ -136,7 +136,7 @@ export function NewUserDialog({
                   <FieldLabel htmlFor="nu-create-win">Create a Windows account for them</FieldLabel>
                   <FieldDescription>
                     {form.createWin
-                      ? "A new account with a random password nobody needs to know, limited to Miracle."
+                      ? "A new account with a random password nobody needs to know, restricted to the apps you assign."
                       : "Use an account that already exists on this computer."}
                   </FieldDescription>
                 </FieldContent>

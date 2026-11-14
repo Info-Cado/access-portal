@@ -219,15 +219,29 @@ async fn dashboard(
     CurrentUser(user): CurrentUser,
 ) -> Result<Response, AppError> {
     let apps = db::apps_for_user(&state.pool, user.id).await?;
+    let desktop = full_desktop(&user).await;
 
-    // A regular user with exactly one app has nothing to choose: open it directly.
-    if !user.is_admin() && apps.len() == 1 {
-        return Ok(Redirect::to(&format!("/connect/{}", apps[0].key)).into_response());
+    // A regular user with only one thing to open has nothing to choose: open it directly.
+    if !user.is_admin() {
+        match (apps.as_slice(), desktop) {
+            ([], true) => return Ok(Redirect::to(&format!("/connect/{DESKTOP_KEY}")).into_response()),
+            ([app], false) => return Ok(Redirect::to(&format!("/connect/{}", app.key)).into_response()),
+            _ => {}
+        }
     }
 
     let mut list = String::new();
-    if apps.is_empty() {
-        list.push_str("<p class=\"muted\">No apps assigned yet. Ask your administrator.</p>");
+    if apps.is_empty() && !desktop {
+        list.push_str(
+            "<div class=\"card\"><strong>Nothing is assigned to you</strong>\
+             <p class=\"muted\">Ask your administrator to give you access to an app or the desktop.</p></div>",
+        );
+    }
+    if desktop {
+        list.push_str(&format!(
+            "<div class=\"card app\"><div><strong>Desktop</strong></div>\
+             <a class=\"btn\" href=\"/connect/{DESKTOP_KEY}\" target=\"_blank\" rel=\"noopener\">Open</a></div>"
+        ));
     }
     for app in &apps {
         list.push_str(&format!(
@@ -246,6 +260,50 @@ async fn dashboard(
         list
     );
     Ok(page("Your apps", &body).into_response())
+}
+
+/// The key under which a user with the full desktop opens it, in the same
+/// links as apps (`/connect/desktop`, `/ws/desktop`). No app may use it.
+pub const DESKTOP_KEY: &str = "desktop";
+
+/// Whether the user's Windows account has the full desktop switched on, so the
+/// portal offers them "Desktop". False when it can't be told (no account, or
+/// the portal is not running as an administrator).
+async fn full_desktop(user: &User) -> bool {
+    match crate::host::desktop_mode_cached(&user.win_username).await {
+        Ok(mode) => mode == "full",
+        Err(e) => {
+            tracing::warn!("could not read the desktop mode of {}: {e:#}", user.win_username);
+            false
+        }
+    }
+}
+
+/// The app `key` names, if `user` may open it: "Desktop" (this computer, see
+/// `DESKTOP_HOST`) when the key is [`DESKTOP_KEY`] and their account has the
+/// full desktop, else an app assigned to them.
+async fn allowed_app(state: &AppState, user: &User, key: &str) -> Result<Result<crate::models::App, StatusCode>, AppError> {
+    if key == DESKTOP_KEY {
+        if !full_desktop(user).await {
+            return Ok(Err(StatusCode::FORBIDDEN));
+        }
+        let (hostname, port) = state.config.desktop_host.clone();
+        return Ok(Ok(crate::models::App {
+            id: 0,
+            key: DESKTOP_KEY.to_string(),
+            name: "Desktop".to_string(),
+            hostname,
+            port,
+            created_at: 0,
+        }));
+    }
+    let Some(app) = db::app_by_key(&state.pool, key).await? else {
+        return Ok(Err(StatusCode::NOT_FOUND));
+    };
+    if !db::user_can_access(&state.pool, user.id, app.id).await? {
+        return Ok(Err(StatusCode::FORBIDDEN));
+    }
+    Ok(Ok(app))
 }
 
 // ---------------------------------------------------------------------------
@@ -442,18 +500,15 @@ async fn connect(
         );
         return Ok((StatusCode::FORBIDDEN, page("Not available", &body)).into_response());
     }
-    let Some(app) = db::app_by_key(&state.pool, &key).await? else {
-        return Ok((StatusCode::NOT_FOUND, Html("<h1>Unknown app</h1>".to_string()))
-            .into_response());
+    let app = match allowed_app(&state, &user, &key).await? {
+        Ok(app) => app,
+        Err(StatusCode::NOT_FOUND) => {
+            return Ok((StatusCode::NOT_FOUND, Html("<h1>Unknown app</h1>".to_string())).into_response())
+        }
+        Err(status) => {
+            return Ok((status, Html("<h1>You don't have access to this app</h1>".to_string())).into_response())
+        }
     };
-
-    if !db::user_can_access(&state.pool, user.id, app.id).await? {
-        return Ok((
-            StatusCode::FORBIDDEN,
-            Html("<h1>You don't have access to this app</h1>".to_string()),
-        )
-            .into_response());
-    }
 
     // The page below connects back over a WebSocket; the portal is the RDP client.
     let html = include_str!("session.html")
@@ -618,12 +673,16 @@ async fn connection_info(
     headers: &HeaderMap,
     link: &'static str,
 ) -> crate::presence::Connection {
-    let app = db::app_by_key(&state.pool, key)
-        .await
-        .ok()
-        .flatten()
-        .map(|a| a.name)
-        .unwrap_or_else(|| key.to_string());
+    let app = if key == DESKTOP_KEY {
+        "Desktop".to_string()
+    } else {
+        db::app_by_key(&state.pool, key)
+            .await
+            .ok()
+            .flatten()
+            .map(|a| a.name)
+            .unwrap_or_else(|| key.to_string())
+    };
     crate::presence::Connection {
         id: 0,
         user_id: user.id,
@@ -661,12 +720,10 @@ async fn session_target(
     viewport: &ViewportQuery,
     headers: &HeaderMap,
 ) -> Result<Result<rdp::Target, StatusCode>, AppError> {
-    let Some(app) = db::app_by_key(&state.pool, key).await? else {
-        return Ok(Err(StatusCode::NOT_FOUND));
+    let app = match allowed_app(state, user, key).await? {
+        Ok(app) => app,
+        Err(status) => return Ok(Err(status)),
     };
-    if !db::user_can_access(&state.pool, user.id, app.id).await? {
-        return Ok(Err(StatusCode::FORBIDDEN));
-    }
 
     let password = auth::decrypt_at_rest(&state.config.portal_secret, &user.win_password)?;
     // A fixed size (the default, 1920x1080) is scaled to fit by the browser;

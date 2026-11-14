@@ -200,7 +200,7 @@ function NewAppDialog({
                 <Input
                   id="na-name"
                   value={form.name}
-                  placeholder="Miracle"
+                  placeholder="Accounts"
                   required
                   onChange={(e) =>
                     setForm((f) => ({
@@ -216,7 +216,7 @@ function NewAppDialog({
                 <Input
                   id="na-key"
                   value={form.key}
-                  placeholder="miracle"
+                  placeholder="accounts"
                   spellCheck={false}
                   required
                   onChange={(e) => {

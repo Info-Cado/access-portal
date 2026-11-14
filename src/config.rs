@@ -37,6 +37,9 @@ pub struct Config {
     pub lockout_secs: i64,
     pub cookie_secure: bool,
 
+    /// Where "Desktop" sessions connect (host, port): this computer's Remote
+    /// Desktop, since the portal's Windows accounts live here.
+    pub desktop_host: (String, String),
 }
 
 fn var(key: &str, default: &str) -> String {
@@ -74,6 +77,13 @@ impl Config {
             max_failed: var("MAX_FAILED", "5").parse().unwrap_or(5),
             lockout_secs: var("LOCKOUT_SECS", "300").parse().unwrap_or(300),
             cookie_secure: var("COOKIE_SECURE", "false") == "true",
+            desktop_host: {
+                let v = var("DESKTOP_HOST", "127.0.0.1:3389");
+                match v.rsplit_once(':') {
+                    Some((host, port)) if port.parse::<u16>().is_ok() => (host.to_string(), port.to_string()),
+                    _ => (v, "3389".to_string()),
+                }
+            },
         })
     }
 }

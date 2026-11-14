@@ -74,6 +74,11 @@ rendering on the graphics card, and 60 frames a second (`tune_remote_desktop` in
 `src/host.rs`). Sessions already open keep their old setup until their user
 signs out, and the frame rate applies after a reboot.
 
+It also turns off Windows' "Don't display last signed-in" setting, so after a
+restart the sign-in screen shows the last account that signed in instead of
+an empty "Other user" box asking for a name. It only changes what that screen
+shows: no automatic sign-in, and no account, password or Remote Desktop change.
+
 Browsers that cannot decode H.264 (`?vd=2` is not sent) get the older path
 below, and `EGFX=off` turns the pipeline off.
 
@@ -181,7 +186,6 @@ Install it on the RDP host and open it. It must run as a Windows
   Windows build, fetched from the portal's update service first and then from
   community sources; after a Windows update breaks it, the same button fixes it;
 - the "Portal RDP Users" group and its permission to sign in over Remote Desktop;
-- the Miracle launcher (it finds `miracle.exe`);
 - Windows' PDF printer driver;
 - the Remote Desktop settings the portal is tuned for.
 
@@ -256,11 +260,14 @@ The window has four screens:
   - *App sign-in*.
 
 Each user also has a **Full desktop** switch (`src/host.rs`). It changes the
-user's Windows account on this machine: off, the account's shell is the Miracle
-launcher and Run, the command prompt, PowerShell, Task Manager, the registry
-editor, Control Panel and drive C: are blocked; on, exactly those settings are
-removed and sessions get the normal desktop. Windows administrator accounts are
-never limited. A change applies from the user's next session. New users get a
+user's Windows account on this machine: off, Run, the command prompt,
+PowerShell, Task Manager, the registry editor, Control Panel and drive C: are
+blocked and the user can open only the apps assigned to them; on, exactly those
+settings are removed and the portal also offers them **Desktop** (this
+computer's normal Windows desktop, `DESKTOP_HOST`, default `127.0.0.1:3389`).
+After signing in, a user with only the desktop or only one app goes straight
+to it; one with neither sees "Nothing is assigned to you". Windows
+administrator accounts are never restricted. A change applies from the user's next session. New users get a
 Windows account of their own by default (a standard account in the "Portal RDP
 Users" group); deleting a user leaves the Windows account unless you tick the
 box.
@@ -465,7 +472,7 @@ get around per-user Windows licensing.
 | `src/session.html` | the browser page for a session |
 | `src/web.rs` | router, auth extractors, pages, handlers, file transfer endpoints |
 | `src/api.rs` | admin API, called in-process by the app |
-| `src/host.rs` | Windows accounts: create/delete, Full desktop / Miracle-only switch, sign-out; Windows sessions (list, sign out, view); host tuning |
+| `src/host.rs` | Windows accounts: create/delete, Full desktop switch, sign-out; Windows sessions (list, sign out, view); host tuning |
 | `src/presence.rs` | who is connected now; disconnecting a session or messaging it from the app |
 | `src/print.rs` | the "Portal printer": print jobs saved as PDFs in the user's folder |
 | `src/sound.rs` | the session's sound, passed to the browser |

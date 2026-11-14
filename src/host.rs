@@ -3,15 +3,17 @@
 //! A portal user's sessions run as a local Windows account. That account is in
 //! one of two modes:
 //!
-//! - **app**: its desktop shell is the Miracle launcher, so a session shows
-//!   only Miracle and signs out when it closes; Run, the command prompt,
-//!   PowerShell, Task Manager, the registry editor, Control Panel and drive C:
-//!   are blocked by per-account policies;
-//! - **full**: a normal Windows desktop.
+//! - **app** (restricted): Run, the command prompt, PowerShell, Task Manager,
+//!   the registry editor, Control Panel and drive C: are blocked by
+//!   per-account policies, and the portal offers the user only the apps
+//!   assigned to them, never a desktop;
+//! - **full**: a normal Windows desktop, which the portal offers the user as
+//!   "Desktop" next to their apps.
 //!
 //! The mode lives in the account's own registry hive (HKCU of that account), so
-//! it is read and changed there; the portal keeps no copy. A change applies the
-//! next time a session starts; a session already open keeps its mode.
+//! it is read and changed there; the portal only keeps a short-lived copy (see
+//! [`desktop_mode_cached`]). A change applies the next time a session starts; a
+//! session already open keeps its mode.
 //!
 //! Changing another account's hive needs administrator rights, so the portal
 //! must run as an administrator for this to work.
@@ -25,26 +27,60 @@ static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// The account's mode: `"app"`, `"full"`, or `"missing"` when no local Windows
 /// account has that name.
 pub async fn desktop_mode(win_username: &str) -> Result<String> {
-    run("read", win_username, None).await
+    remember(win_username, run("read", win_username, None).await)
 }
 
-/// Switch the account to a full desktop (`true`) or to Miracle only (`false`).
+/// [`desktop_mode`], answered from memory when it was read in the last
+/// [`MODE_TTL`]. Reading it from Windows takes a second or two, too slow for
+/// every page a user opens; changes made through the portal update the copy at
+/// once.
+pub async fn desktop_mode_cached(win_username: &str) -> Result<String> {
+    let key = win_username.to_lowercase();
+    if let Some((mode, at)) = MODES.lock().unwrap().get(&key) {
+        if at.elapsed() < MODE_TTL {
+            return Ok(mode.clone());
+        }
+    }
+    desktop_mode(win_username).await
+}
+
+/// How long a desktop mode read from Windows is trusted.
+const MODE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+static MODES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn remember(win_username: &str, mode: Result<String>) -> Result<String> {
+    let key = win_username.to_lowercase();
+    let mut modes = MODES.lock().unwrap();
+    match &mode {
+        Ok(m) => {
+            modes.insert(key, (m.clone(), std::time::Instant::now()));
+        }
+        Err(_) => {
+            modes.remove(&key);
+        }
+    }
+    mode
+}
+
+/// Switch the account to a full desktop (`true`) or restrict it (`false`).
 /// Returns the mode now in effect.
 pub async fn set_desktop_mode(win_username: &str, full: bool) -> Result<String> {
-    run(if full { "full" } else { "app" }, win_username, None).await
+    remember(win_username, run(if full { "full" } else { "app" }, win_username, None).await)
 }
 
 /// Create a local Windows account for a portal user: a standard user in the
-/// "Portal RDP Users" group, password never expires, limited to Miracle.
+/// "Portal RDP Users" group, password never expires, restricted.
 pub async fn create_account(win_username: &str, password: &str) -> Result<()> {
     check_account_name(win_username)?;
-    run("create", win_username, Some(password)).await.map(|_| ())
+    remember(win_username, run("create", win_username, Some(password)).await).map(|_| ())
 }
 
 /// Delete a Windows account the portal manages (a member of "Portal RDP Users",
 /// never an administrator) and its profile folder.
 pub async fn delete_account(win_username: &str) -> Result<()> {
-    run("delete", win_username, None).await.map(|_| ())
+    remember(win_username, run("delete", win_username, None).await).map(|_| ())
 }
 
 /// Windows' rules for local account names.
@@ -120,8 +156,10 @@ function Finish($result) { $result | ConvertTo-Json -Compress; exit 0 }
 
 $name = $env:AP_WINUSER
 $action = $env:AP_ACTION
-$launcher = 'C:\Program Files\access-portal\miracle-shell.vbs'
-$shell = 'wscript.exe "' + $launcher + '"'
+# Older versions replaced a restricted account's desktop shell with a launcher
+# for one program; any such shell is removed when the mode is changed.
+$oldShell = '*\access-portal\*-shell.vbs*'
+$marker   = 'Software\AccessPortal'
 
 $winlogon = 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon'
 $explorer = 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
@@ -150,7 +188,7 @@ try {
     $secure = ConvertTo-SecureString $env:AP_PASSWORD -AsPlainText -Force
     $user = New-LocalUser -Name $name -Password $secure -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -Description 'access-portal RDP user' -ErrorAction Stop
     Add-LocalGroupMember -Group $portalGroup -Member $name -ErrorAction Stop
-    $action = 'app'   # new accounts start limited to Miracle
+    $action = 'app'   # new accounts start restricted
   }
 
   if (-not $user) { Finish @{ ok = $true; mode = 'missing' } }
@@ -171,9 +209,8 @@ try {
   }
 
   if ($action -eq 'app') {
-    # Never lock an administrator account into one app.
-    if ($isAdmin) { throw "$name is a Windows administrator account; it can't be limited to one app." }
-    if (-not (Test-Path -LiteralPath $launcher)) { throw "The Miracle launcher is missing ($launcher)." }
+    # Never lock down an administrator account.
+    if ($isAdmin) { throw "$name is a Windows administrator account; it can't be restricted." }
   }
 
   $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
@@ -199,8 +236,12 @@ try {
 
   $hku = [Microsoft.Win32.Registry]::Users
   try {
+    if ($action -eq 'app' -or $action -eq 'full') {
+      $k = $hku.OpenSubKey("$hive\$winlogon", $true)
+      if ($k) { if ([string]$k.GetValue('Shell') -like $oldShell) { $k.DeleteValue('Shell', $false) }; $k.Dispose() }
+    }
     if ($action -eq 'app') {
-      $k = $hku.CreateSubKey("$hive\$winlogon"); $k.SetValue('Shell', $shell, 'String'); $k.Dispose()
+      $k = $hku.CreateSubKey("$hive\$marker"); $k.SetValue('Restricted', 1, 'DWord'); $k.Dispose()
       $k = $hku.CreateSubKey("$hive\$explorer")
       foreach ($v in 'NoRun','NoControlPanel','NoWinKeys','NoViewContextMenu','DisallowRun') { $k.SetValue($v, 1, 'DWord') }
       $k.SetValue('NoDrives', 4, 'DWord'); $k.SetValue('NoViewOnDrive', 4, 'DWord'); $k.Dispose()
@@ -212,7 +253,7 @@ try {
     elseif ($action -eq 'full') {
       # Remove exactly what 'app' sets; other settings of the account stay.
       $remove = @{
-        $winlogon = @('Shell')
+        $marker   = @('Restricted')
         $explorer = @('NoRun','NoControlPanel','NoWinKeys','NoViewContextMenu','DisallowRun','NoDrives','NoViewOnDrive')
         $system   = @('DisableTaskMgr','DisableRegistryTools')
         $cmdPol   = @('DisableCMD')
@@ -225,10 +266,14 @@ try {
       if ($k) { $k.DeleteSubKeyTree('DisallowRun', $false); $k.Dispose() }
     }
 
-    $k = $hku.OpenSubKey("$hive\$winlogon")
-    $current = if ($k) { [string]$k.GetValue('Shell') } else { '' }
+    $k = $hku.OpenSubKey("$hive\$marker")
+    $restricted = $k -and ($k.GetValue('Restricted') -eq 1)
     if ($k) { $k.Dispose() }
-    $mode = if ($current -like '*miracle-shell.vbs*') { 'app' } else { 'full' }
+    $k = $hku.OpenSubKey("$hive\$winlogon")
+    $shell = if ($k) { [string]$k.GetValue('Shell') } else { '' }
+    if ($k) { $k.Dispose() }
+    # Accounts restricted by older versions have the old shell but no marker.
+    $mode = if ($restricted -or $shell -like $oldShell) { 'app' } else { 'full' }
   }
   finally {
     if ($loaded) {
@@ -253,7 +298,8 @@ catch {
 /// - encode Windows' H.264 on the graphics card when there is one;
 /// - render sessions on the graphics card instead of in software;
 /// - let sessions run at 60 frames a second (Windows' default is 30);
-/// - skip the privacy-settings screen a new account sees at its first sign-in.
+/// - skip the privacy-settings screen a new account sees at its first sign-in;
+/// - show the last signed-in account at the Windows sign-in screen (not "Other user").
 ///
 /// Already-open sessions keep their old setup until their user signs out; the
 /// frame rate applies once the Remote Desktop service restarts (a reboot).
@@ -271,6 +317,10 @@ pub fn tune_remote_desktop() {
             (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableAudioCapture", 0),
             (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableCam", 0),
             (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableCameraRedir", 0),
+            // Show the last signed-in account on the sign-in screen instead of
+            // a blank "Other user" box asking for a name. Only changes what the
+            // screen shows: no automatic sign-in, no account or RDP changes.
+            (r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "dontdisplaylastusername", 0),
         ];
         for (key, name, value) in settings {
             let current = std::process::Command::new("reg")

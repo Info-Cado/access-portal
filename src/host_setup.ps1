@@ -22,8 +22,6 @@ $iniSources += @(
   'https://raw.githubusercontent.com/affinityv/INI-RDPWRAP/master/rdpwrap.ini'
 )
 $portalGroup = 'Portal RDP Users'
-$launcherDir = 'C:\Program Files\access-portal'
-$launcher = Join-Path $launcherDir 'miracle-shell.vbs'
 $ts = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
 $rdpTcp = "$ts\WinStations\RDP-Tcp"
 $policies = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
@@ -73,13 +71,6 @@ function WinStationSd {
 function HasAce($sid) {
   $sd = WinStationSd; if (-not $sd) { return $false }
   [bool]($sd.DiscretionaryAcl | Where-Object { $_.SecurityIdentifier -eq $sid -and ($_.AccessMask -band 0x121) -eq 0x121 })
-}
-function FindMiracle {
-  foreach ($pattern in 'C:\Miracle*\miracle.exe', "$env:ProgramFiles\Miracle*\miracle.exe", "${env:ProgramFiles(x86)}\Miracle*\miracle.exe") {
-    $f = Get-ChildItem $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($f) { return $f.FullName }
-  }
-  $null
 }
 function PolicyValue($path, $name) { (Get-ItemProperty $path -ErrorAction SilentlyContinue).$name }
 $wanted = @(
@@ -157,23 +148,6 @@ function Fix($id) {
         Set-ItemProperty $rdpTcp Security $out -Type Binary
       }
     }
-    'launcher' {
-      $exe = FindMiracle
-      if (-not $exe) { throw 'Miracle is not installed on this computer (no miracle.exe in C:\Miracle* or Program Files).' }
-      $dir = Split-Path $exe
-      New-Item -ItemType Directory -Force $launcherDir | Out-Null
-      $vbs = @"
-' access-portal: runs as the desktop shell for portal accounts.
-' Starts Miracle, waits for it to close, then signs the account out.
-Set sh = CreateObject("WScript.Shell")
-sh.CurrentDirectory = "$dir"
-On Error Resume Next
-sh.Run """$exe""", 3, True
-On Error GoTo 0
-sh.Run "shutdown.exe /l /f", 0, False
-"@
-      [IO.File]::WriteAllText($launcher, ($vbs -replace "`r?`n", "`r`n") + "`r`n")
-    }
     'pdf' {
       Enable-WindowsOptionalFeature -Online -FeatureName 'Printing-PrintToPDFServices-Features' -NoRestart -ErrorAction Stop | Out-Null
     }
@@ -222,12 +196,6 @@ function Checks {
   $list += [ordered]@{ id = 'group'; label = "The '$portalGroup' group may sign in over Remote Desktop"; ok = $groupOk
     detail = $(if ($groupOk) { "Yes ($members account(s) in it)." } elseif (-not $sid) { 'The group does not exist yet.' } else { 'The group exists but is missing the Remote Desktop sign-in permission.' })
     fix = 'Create the group and give it permission to sign in over Remote Desktop.'; restarts = $false }
-
-  $exe = FindMiracle
-  $launcherOk = (Test-Path $launcher) -and $exe
-  $list += [ordered]@{ id = 'launcher'; label = 'Miracle-only sessions can start'; ok = [bool]$launcherOk
-    detail = $(if ($launcherOk) { "Launcher ready for $exe." } elseif (-not $exe) { 'Miracle is not installed on this computer.' } else { 'The launcher that starts Miracle is missing.' })
-    fix = 'Write the launcher that starts Miracle and signs the session out when it closes.'; restarts = $false }
 
   $pdf = [bool](Get-PrinterDriver -Name 'Microsoft Print To PDF' -ErrorAction SilentlyContinue)
   $list += [ordered]@{ id = 'pdf'; label = 'Printing to the browser works'; ok = $pdf
