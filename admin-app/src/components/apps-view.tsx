@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react"
-import { AppWindowIcon, PencilIcon, PlusIcon, Trash2Icon } from "lucide-react"
+import { AppWindowIcon, FileIcon, FolderOpenIcon, PencilIcon, PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 
 import type { ViewProps } from "@/components/app-shell"
@@ -25,7 +25,7 @@ import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/c
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, errorText, type PortalApp } from "@/lib/api"
+import { api, errorText, pickFolder, pickProgram, readShortcut, type PortalApp } from "@/lib/api"
 
 export function AppsView({ data, reload }: ViewProps) {
   const [creating, setCreating] = useState(false)
@@ -211,6 +211,33 @@ function NewAppDialog({
     onOpenChange(next)
   }
 
+  // Choosing a Miracle shortcut also fills in the data folder it opens.
+  const browseProgram = async () => {
+    try {
+      const path = await pickProgram()
+      if (!path) return
+      setForm((f) => ({ ...f, program: path }))
+      if (path.toLowerCase().endsWith(".lnk")) {
+        const link = await readShortcut(path)
+        if (link.data_folder) {
+          setForm((f) => ({ ...f, work_dir: link.data_folder ?? f.work_dir }))
+          toast.success("Data folder filled in from the shortcut")
+        }
+      }
+    } catch (e) {
+      setError(errorText(e))
+    }
+  }
+
+  const browseFolder = async () => {
+    try {
+      const path = await pickFolder("Choose the folder with this user’s company files", form.work_dir || "C:\\")
+      if (path) setForm((f) => ({ ...f, work_dir: path }))
+    } catch (e) {
+      setError(errorText(e))
+    }
+  }
+
   const submit = async (ev: FormEvent) => {
     ev.preventDefault()
     setBusy(true)
@@ -300,13 +327,19 @@ function NewAppDialog({
             </div>
             <Field>
               <FieldLabel htmlFor="na-program">Program (optional)</FieldLabel>
-              <Input
-                id="na-program"
-                value={form.program}
-                placeholder={"C:\\Miracle\\installation\\miracle.exe — or a Miracle shortcut (.lnk)"}
-                spellCheck={false}
-                onChange={(e) => setForm((f) => ({ ...f, program: e.target.value }))}
-              />
+              <div className="flex gap-2">
+                <Input
+                  id="na-program"
+                  value={form.program}
+                  placeholder="Choose a Miracle shortcut or a program"
+                  spellCheck={false}
+                  onChange={(e) => setForm((f) => ({ ...f, program: e.target.value }))}
+                />
+                <Button type="button" variant="outline" onClick={browseProgram} disabled={busy}>
+                  <FileIcon />
+                  Browse…
+                </Button>
+              </div>
               <FieldDescription>
                 Leave blank for the Windows desktop. Set it to a program, or to a shortcut
                 Miracle made for a company folder, and the user opens just that on a black
@@ -316,13 +349,19 @@ function NewAppDialog({
             </Field>
             <Field>
               <FieldLabel htmlFor="na-workdir">Data folder</FieldLabel>
-              <Input
-                id="na-workdir"
-                value={form.work_dir}
-                placeholder={"C:\\Miracle\\Companies\\Kelvin"}
-                spellCheck={false}
-                onChange={(e) => setForm((f) => ({ ...f, work_dir: e.target.value }))}
-              />
+              <div className="flex gap-2">
+                <Input
+                  id="na-workdir"
+                  value={form.work_dir}
+                  placeholder="Choose the folder with this user’s company files"
+                  spellCheck={false}
+                  onChange={(e) => setForm((f) => ({ ...f, work_dir: e.target.value }))}
+                />
+                <Button type="button" variant="outline" onClick={browseFolder} disabled={busy}>
+                  <FolderOpenIcon />
+                  Browse…
+                </Button>
+              </div>
               <FieldDescription>
                 The folder with this user’s company files (for a Miracle shortcut, the folder
                 it opens). Only users given this app can reach it — not the program’s own

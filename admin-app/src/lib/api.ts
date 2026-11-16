@@ -193,6 +193,25 @@ export function restartApp(): Promise<void> {
   return invoke("restart_app")
 }
 
+/** Choose a program or shortcut (a shortcut stays a shortcut). Null if cancelled. */
+export function pickProgram(): Promise<string | null> {
+  return invoke("pick_program")
+}
+
+/** Choose a folder. Null if cancelled. */
+export async function pickFolder(title: string, start?: string): Promise<string | null> {
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const chosen = await open({ directory: true, multiple: false, title, defaultPath: start || undefined })
+  return typeof chosen === "string" ? chosen : null
+}
+
+export type Shortcut = { target: string; args: string; work_dir: string; data_folder: string | null }
+
+/** What a shortcut runs, and the folder it opens (for a Miracle company shortcut). */
+export function readShortcut(path: string): Promise<Shortcut> {
+  return invoke("read_shortcut", { path })
+}
+
 export function testAlert(server: string, topic: string): Promise<void> {
   return invoke("test_alert", { server, topic })
 }

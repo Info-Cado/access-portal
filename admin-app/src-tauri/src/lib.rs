@@ -7,6 +7,7 @@
 //! on this computer and cannot be reached over the network.
 
 mod alerts;
+mod pickers;
 mod tunnel;
 mod updates;
 
@@ -262,6 +263,8 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec![HIDDEN_ARG])))
         .plugin(tauri_plugin_opener::init())
+        // File and folder pickers (an app's program and data folder).
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().pubkey(updates::PUBKEY).build())
         .setup(|app| {
             let dir = data_dir();
@@ -337,7 +340,9 @@ pub fn run() {
             test_alert,
             restart_app,
             update_status,
-            update_check
+            update_check,
+            pickers::pick_program,
+            pickers::read_shortcut
         ])
         .build(tauri::generate_context!())
         .expect("starting Access Portal")
