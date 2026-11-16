@@ -197,24 +197,65 @@ pub async fn app_by_key(pool: &SqlitePool, key: &str) -> Result<Option<App>> {
     Ok(a)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_app(
     pool: &SqlitePool,
     key: &str,
     name: &str,
     hostname: &str,
     port: &str,
+    program: Option<&str>,
+    work_dir: Option<&str>,
 ) -> Result<i64> {
     let res = sqlx::query(
-        "INSERT INTO apps (key, name, hostname, port, created_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO apps (key, name, hostname, port, program, work_dir, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(key)
     .bind(name)
     .bind(hostname)
     .bind(port)
+    .bind(program)
+    .bind(work_dir)
     .bind(now())
     .execute(pool)
     .await?;
     Ok(res.last_insert_rowid())
+}
+
+/// Change an existing app's fields (not its key).
+#[allow(clippy::too_many_arguments)]
+pub async fn update_app(
+    pool: &SqlitePool,
+    id: i64,
+    name: &str,
+    hostname: &str,
+    port: &str,
+    program: Option<&str>,
+    work_dir: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE apps SET name = ?, hostname = ?, port = ?, program = ?, work_dir = ? WHERE id = ?",
+    )
+    .bind(name)
+    .bind(hostname)
+    .bind(port)
+    .bind(program)
+    .bind(work_dir)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Every data folder (and the Windows accounts allowed in it) for apps a given
+/// user may open: used to scope that user's NTFS access on the host.
+pub async fn app_by_id(pool: &SqlitePool, id: i64) -> Result<Option<App>> {
+    let a = sqlx::query_as::<_, App>("SELECT * FROM apps WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(a)
 }
 
 pub async fn delete_app(pool: &SqlitePool, id: i64) -> Result<()> {

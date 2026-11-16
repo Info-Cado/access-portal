@@ -55,5 +55,11 @@ pub struct App {
     /// RDP host the portal connects to for this app.
     pub hostname: String,
     pub port: String,
+    /// When set, the session runs this program on a black screen (RDP alternate
+    /// shell) instead of the Windows desktop; the session ends when it closes.
+    pub program: Option<String>,
+    /// The program's working folder, and the only data folder the user's Windows
+    /// account is granted on the host (see `host::scope_folder`).
+    pub work_dir: Option<String>,
     pub created_at: i64,
 }

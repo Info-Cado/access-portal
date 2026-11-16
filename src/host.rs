@@ -27,7 +27,7 @@ static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// The account's mode: `"app"`, `"full"`, or `"missing"` when no local Windows
 /// account has that name.
 pub async fn desktop_mode(win_username: &str) -> Result<String> {
-    remember(win_username, run("read", win_username, None).await)
+    remember(win_username, run("read", win_username, None, None, None).await)
 }
 
 /// [`desktop_mode`], answered from memory when it was read in the last
@@ -66,21 +66,30 @@ fn remember(win_username: &str, mode: Result<String>) -> Result<String> {
 
 /// Switch the account to a full desktop (`true`) or restrict it (`false`).
 /// Returns the mode now in effect.
-pub async fn set_desktop_mode(win_username: &str, full: bool) -> Result<String> {
-    remember(win_username, run(if full { "full" } else { "app" }, win_username, None).await)
+pub async fn set_desktop_mode(
+    win_username: &str,
+    full: bool,
+    program: Option<&str>,
+    work_dir: Option<&str>,
+) -> Result<String> {
+    let (program, work_dir) = if full { (None, None) } else { (program, work_dir) };
+    remember(
+        win_username,
+        run(if full { "full" } else { "app" }, win_username, None, program, work_dir).await,
+    )
 }
 
 /// Create a local Windows account for a portal user: a standard user in the
 /// "Portal RDP Users" group, password never expires, restricted.
 pub async fn create_account(win_username: &str, password: &str) -> Result<()> {
     check_account_name(win_username)?;
-    remember(win_username, run("create", win_username, Some(password)).await).map(|_| ())
+    remember(win_username, run("create", win_username, Some(password), None, None).await).map(|_| ())
 }
 
 /// Delete a Windows account the portal manages (a member of "Portal RDP Users",
 /// never an administrator) and its profile folder.
 pub async fn delete_account(win_username: &str) -> Result<()> {
-    remember(win_username, run("delete", win_username, None).await).map(|_| ())
+    remember(win_username, run("delete", win_username, None, None, None).await).map(|_| ())
 }
 
 /// Windows' rules for local account names.
@@ -100,7 +109,13 @@ struct ScriptResult {
 }
 
 #[cfg(windows)]
-async fn run(action: &str, win_username: &str, password: Option<&str>) -> Result<String> {
+async fn run(
+    action: &str,
+    win_username: &str,
+    password: Option<&str>,
+    program: Option<&str>,
+    work_dir: Option<&str>,
+) -> Result<String> {
     use base64::Engine;
     use std::time::Duration;
 
@@ -119,6 +134,8 @@ async fn run(action: &str, win_username: &str, password: Option<&str>) -> Result
         .env("AP_WINUSER", win_username)
         .env("AP_ACTION", action)
         .env("AP_PASSWORD", password.unwrap_or(""))
+        .env("AP_PROGRAM", program.unwrap_or(""))
+        .env("AP_WORKDIR", work_dir.unwrap_or(""))
         .creation_flags(CREATE_NO_WINDOW)
         .kill_on_drop(true)
         .output();
@@ -144,7 +161,13 @@ async fn run(action: &str, win_username: &str, password: Option<&str>) -> Result
 }
 
 #[cfg(not(windows))]
-async fn run(_action: &str, _win_username: &str, _password: Option<&str>) -> Result<String> {
+async fn run(
+    _action: &str,
+    _win_username: &str,
+    _password: Option<&str>,
+    _program: Option<&str>,
+    _work_dir: Option<&str>,
+) -> Result<String> {
     bail!("Windows accounts can only be changed when the portal runs on Windows.")
 }
 
@@ -358,10 +381,42 @@ function Finish($result) { $result | ConvertTo-Json -Compress; exit 0 }
 
 $name = $env:AP_WINUSER
 $action = $env:AP_ACTION
-# Older versions replaced a restricted account's desktop shell with a launcher
-# for one program; any such shell is removed when the mode is changed.
+# A restricted account can run one program on a black screen instead of the
+# desktop: its shell is a small launcher (below) that starts the program the
+# portal chose for it and signs the session out when the program closes. Windows
+# Home delivers but refuses to launch an RDP "alternate shell", so the launch is
+# done here, through the account's own shell, which Home does run.
 $oldShell = '*\access-portal\*-shell.vbs*'
 $marker   = 'Software\AccessPortal'
+# Not in the portal's data folder: that one is admins-only (it holds the
+# database). This folder is readable by every user and writable only by admins.
+$launcher = Join-Path $env:ProgramData 'AccessPortal-Shell\app-shell.vbs'
+# The launcher reads the program and its folder from the account's own settings
+# (written below) so one launcher file serves every account.
+$launcherVbs = @'
+Option Explicit
+Dim sh, prog, args, work
+Set sh = CreateObject("WScript.Shell")
+prog = ""
+args = ""
+work = ""
+On Error Resume Next
+prog = sh.RegRead("HKCU\Software\AccessPortal\Program")
+args = sh.RegRead("HKCU\Software\AccessPortal\Args")
+work = sh.RegRead("HKCU\Software\AccessPortal\WorkDir")
+On Error GoTo 0
+If prog = "" Then
+  sh.Run "explorer.exe"
+Else
+  If work <> "" Then sh.CurrentDirectory = work
+  If args <> "" Then
+    sh.Run """" & prog & """ " & args, 1, True
+  Else
+    sh.Run """" & prog & """", 1, True
+  End If
+  sh.Run "shutdown.exe /l", 0, False
+End If
+'@
 
 $winlogon = 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon'
 $explorer = 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
@@ -440,7 +495,11 @@ try {
   try {
     if ($action -eq 'app' -or $action -eq 'full') {
       $k = $hku.OpenSubKey("$hive\$winlogon", $true)
-      if ($k) { if ([string]$k.GetValue('Shell') -like $oldShell) { $k.DeleteValue('Shell', $false) }; $k.Dispose() }
+      if ($k) {
+        $cur = [string]$k.GetValue('Shell')
+        if ($cur -like $oldShell -or $cur -like '*\app-shell.vbs*') { $k.DeleteValue('Shell', $false) }
+        $k.Dispose()
+      }
     }
     if ($action -eq 'app') {
       $k = $hku.CreateSubKey("$hive\$marker"); $k.SetValue('Restricted', 1, 'DWord'); $k.Dispose()
@@ -451,11 +510,46 @@ try {
       $i = 1; foreach ($exe in $blocked) { $k.SetValue([string]$i, $exe, 'String'); $i++ }; $k.Dispose()
       $k = $hku.CreateSubKey("$hive\$system"); $k.SetValue('DisableTaskMgr', 1, 'DWord'); $k.SetValue('DisableRegistryTools', 1, 'DWord'); $k.Dispose()
       $k = $hku.CreateSubKey("$hive\$cmdPol"); $k.SetValue('DisableCMD', 2, 'DWord'); $k.Dispose()
+      # With a program, the account's shell becomes the launcher (black screen,
+      # just that program). Without one, no custom shell: a plain locked desktop.
+      $wl = $hku.CreateSubKey("$hive\$winlogon")
+      if ($env:AP_PROGRAM) {
+        # A shortcut (such as one Miracle makes for a company folder) is opened
+        # here, as administrator, so the account needs no access to wherever the
+        # shortcut file lives; its target, arguments and folder are what it runs.
+        $prog = $env:AP_PROGRAM.Trim().Trim('"')
+        $progArgs = ''
+        $progDir = ''
+        if ($prog -like '*.lnk') {
+          if (-not (Test-Path -LiteralPath $prog)) { throw "The shortcut '$prog' does not exist." }
+          $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($prog)
+          $prog = $lnk.TargetPath
+          $progArgs = [string]$lnk.Arguments
+          $progDir = [string]$lnk.WorkingDirectory
+        }
+        if (-not (Test-Path -LiteralPath $prog)) { throw "The program '$prog' does not exist." }
+        if (-not $progDir) { $progDir = Split-Path $prog }
+        $launcherDir = Split-Path $launcher
+        New-Item -ItemType Directory -Path $launcherDir -Force | Out-Null
+        # Users may read and run the launcher but never change it.
+        & icacls $launcherDir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null
+        Set-Content -LiteralPath $launcher -Value $launcherVbs -Encoding ASCII
+        $m = $hku.CreateSubKey("$hive\$marker")
+        $m.SetValue('Program', $prog, 'String')
+        $m.SetValue('Args', $progArgs, 'String')
+        $m.SetValue('WorkDir', $progDir, 'String')
+        $m.Dispose()
+        $wl.SetValue('Shell', 'wscript.exe "' + $launcher + '"', 'String')
+      } else {
+        $m = $hku.OpenSubKey("$hive\$marker", $true)
+        if ($m) { foreach ($v in 'Program','Args','WorkDir') { $m.DeleteValue($v, $false) }; $m.Dispose() }
+      }
+      $wl.Dispose()
     }
     elseif ($action -eq 'full') {
       # Remove exactly what 'app' sets; other settings of the account stay.
       $remove = @{
-        $marker   = @('Restricted')
+        $marker   = @('Restricted','Program','Args','WorkDir')
         $explorer = @('NoRun','NoControlPanel','NoWinKeys','NoViewContextMenu','DisallowRun','NoDrives','NoViewOnDrive')
         $system   = @('DisableTaskMgr','DisableRegistryTools')
         $cmdPol   = @('DisableCMD')
@@ -605,6 +699,112 @@ $n
         0
     }
 }
+
+/// Give a Windows account exclusive access to one data folder: the account (and
+/// administrators) may use it, and the folder stops inheriting the computer's
+/// default "Users can read" access, so no other portal account can see inside.
+/// The account keeps its normal read access to Windows and installed programs,
+/// which is what lets the program run; it just cannot reach other data folders.
+/// Idempotent, and additive across accounts (two accounts can share a folder).
+pub async fn grant_folder(win_username: &str, dir: &str) -> anyhow::Result<()> {
+    folder_acl(win_username, dir, "grant").await
+}
+
+/// Undo [`grant_folder`] for one account: remove its access to the folder. Other
+/// accounts' access and the folder itself are left alone. Kept for when a folder
+/// is unassigned; assignment today only grants.
+#[allow(dead_code)]
+pub async fn revoke_folder(win_username: &str, dir: &str) -> anyhow::Result<()> {
+    folder_acl(win_username, dir, "revoke").await
+}
+
+#[cfg(windows)]
+async fn folder_acl(win_username: &str, dir: &str, action: &str) -> anyhow::Result<()> {
+    let (u, d, a) = (win_username.to_owned(), dir.to_owned(), action.to_owned());
+    let out = tokio::task::spawn_blocking(move || {
+        powershell_blocking(FOLDER_ACL_SCRIPT, &[("AP_WINUSER", &u), ("AP_DIR", &d), ("AP_ACTION", &a)])
+    })
+    .await??;
+    #[derive(serde::Deserialize)]
+    struct R {
+        ok: bool,
+        #[serde(default)]
+        error: Option<String>,
+    }
+    let line = out.trim().lines().last().unwrap_or("").trim();
+    let r: R = serde_json::from_str(line)
+        .unwrap_or(R { ok: false, error: Some(format!("unexpected output: {out}")) });
+    if r.ok {
+        tracing::info!("folder access {action} for {win_username}: {dir}");
+        Ok(())
+    } else {
+        anyhow::bail!(r.error.unwrap_or_else(|| "changing folder permissions failed".into()))
+    }
+}
+
+#[cfg(not(windows))]
+async fn folder_acl(win_username: &str, dir: &str, _action: &str) -> anyhow::Result<()> {
+    let _ = (win_username, dir);
+    Ok(())
+}
+
+/// Grants or removes one account's exclusive access to one data folder with
+/// `icacls`. Refuses drive roots and the Windows / program / profile regions so
+/// a mistyped folder can never lock the operating system.
+#[cfg(windows)]
+const FOLDER_ACL_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+function Finish($r) { $r | ConvertTo-Json -Compress; exit 0 }
+$user = $env:AP_WINUSER
+$dir = $env:AP_DIR
+$action = $env:AP_ACTION
+try {
+  if ([string]::IsNullOrWhiteSpace($dir)) { throw 'No folder was given.' }
+  if (-not (Test-Path -LiteralPath $dir -PathType Container)) { throw "The folder '$dir' does not exist on this computer." }
+  $full = (Resolve-Path -LiteralPath $dir).Path.TrimEnd('\')
+  $lower = $full.ToLower()
+  if ($full.Length -le 3) { throw "Refusing to change permissions on a drive root ($full)." }
+  $prot = @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, (Join-Path $env:SystemDrive 'Users')) |
+    Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\').ToLower() }
+  foreach ($p in $prot) {
+    if ($lower -eq $p -or $p.StartsWith($lower + '\')) {
+      throw "Refusing to change permissions on a system folder ($full)."
+    }
+  }
+  $admins = '*S-1-5-32-544'   # BUILTIN\Administrators
+  $system = '*S-1-5-18'       # NT AUTHORITY\SYSTEM
+  if ($action -eq 'grant') {
+    # Inheritable rights on the folder itself, then stop it inheriting from its
+    # parent (the computer's default "Users" read). Everything inside inherits
+    # from this folder, so it all follows. Only the top folder is changed: doing
+    # this to every file (/T) leaves files with no permissions at all.
+    & icacls $full /grant "${admins}:(OI)(CI)F" "${system}:(OI)(CI)F" "${user}:(OI)(CI)M" /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not grant $user access to $full (icacls $LASTEXITCODE)." }
+    & icacls $full /inheritance:r /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not lock $full to its users (icacls $LASTEXITCODE)." }
+    # Repair anything an earlier version left without permissions.
+    Get-ChildItem -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+      $acl = Get-Acl -LiteralPath $_.FullName -ErrorAction SilentlyContinue
+      if ($acl -and $acl.Access.Count -eq 0) {
+        & icacls $_.FullName /reset /C /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          & takeown /F $_.FullName /A | Out-Null
+          & icacls $_.FullName /reset /C /Q | Out-Null
+        }
+      }
+    }
+    Finish @{ ok = $true }
+  }
+  elseif ($action -eq 'revoke') {
+    & icacls $full /remove:g "$user" /C /Q | Out-Null
+    Finish @{ ok = $true }
+  }
+  else { throw "Unknown action $action." }
+}
+catch {
+  Finish @{ ok = $false; error = $_.Exception.Message }
+}
+"#;
 
 /// Run a PowerShell script (hidden window) with some environment variables and
 /// return what it printed.

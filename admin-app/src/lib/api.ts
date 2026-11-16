@@ -70,6 +70,10 @@ export type PortalApp = {
   name: string
   hostname: string
   port: string
+  /** When set, the app opens just this program on a black screen (no desktop). */
+  program: string | null
+  /** The program's folder, and the only folder the user's account is granted. */
+  work_dir: string | null
 }
 
 export type PortalState = {

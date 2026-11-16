@@ -54,7 +54,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/windows-accounts/:name/desktop", get(account_desktop_mode).put(set_account_desktop_mode))
         .route("/api/admin/owner-access", post(enable_owner_access).delete(disable_owner_access))
         .route("/api/admin/apps", post(create_app))
-        .route("/api/admin/apps/:id", delete(delete_app))
+        .route("/api/admin/apps/:id", put(update_app).delete(delete_app))
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
     let apps: Vec<Value> = db::list_apps(&state.pool)
         .await?
         .into_iter()
-        .map(|a| json!({ "id": a.id, "key": a.key, "name": a.name, "hostname": a.hostname, "port": a.port }))
+        .map(|a| json!({ "id": a.id, "key": a.key, "name": a.name, "hostname": a.hostname, "port": a.port, "program": a.program, "work_dir": a.work_dir }))
         .collect();
     let (admin_name, default_password) = settings::admin_account(&state.pool).await?;
     Ok(Json(json!({
@@ -264,6 +264,8 @@ async fn create_user(
     if let Some(user) = db::user_by_id(&state.pool, id).await? {
         let how = if input.create_windows_account { " with a new Windows account" } else { "" };
         activity::admin(&state.pool, Some(&user), &format!("Created the user{how}")).await;
+        // New accounts start restricted: set up their black-screen program now.
+        apply_app_access(&state, &user).await?;
     }
 
     Ok(Json(json!({
@@ -326,9 +328,49 @@ async fn set_apps(
     Path(id): Path<i64>,
     Json(input): Json<AppIds>,
 ) -> ApiResult {
-    existing_user(&state, id).await?;
+    let user = existing_user(&state, id).await?;
     db::set_user_apps(&state.pool, id, &input.app_ids).await?;
+    apply_app_access(&state, &user).await?;
     Ok(Json(json!({})))
+}
+
+/// Bring a user's Windows account in line with their apps: access to the data
+/// folder of each black-screen app (repeated each time, so a changed folder is
+/// picked up), and, when the account is restricted, the launcher for its
+/// program. Run after anything that changes a user's apps. Access is only ever
+/// added here: several portal users can share one Windows account.
+async fn apply_app_access(state: &AppState, user: &User) -> Result<(), ApiError> {
+    let apps = db::apps_for_user(&state.pool, user.id).await?;
+    let mut folders: Vec<String> = apps
+        .iter()
+        .filter(|a| a.program.as_deref().is_some_and(|p| !p.trim().is_empty()))
+        .filter_map(|a| a.work_dir.as_deref().map(str::trim).filter(|d| !d.is_empty()).map(str::to_owned))
+        .collect();
+    folders.sort();
+    folders.dedup();
+    if folders.is_empty() && pick_launch(apps.clone()).is_none() {
+        return Ok(());
+    }
+    let mode = host::desktop_mode(&user.win_username).await.unwrap_or_default();
+    if mode == "missing" {
+        return Ok(()); // no such Windows account (yet): nothing to set up
+    }
+    for dir in &folders {
+        crate::host::grant_folder(&user.win_username, dir)
+            .await
+            .map_err(|e| fail(StatusCode::BAD_GATEWAY, &format!("The apps were saved, but {} couldn't be given the folder {dir}: {e:#}", user.win_username)))?;
+    }
+    if mode == "app" {
+        let launch = pick_launch(apps);
+        let (program, work_dir) = match &launch {
+            Some((p, d)) => (Some(p.as_str()), d.as_deref()),
+            None => (None, None),
+        };
+        host::set_desktop_mode(&user.win_username, false, program, work_dir)
+            .await
+            .map_err(|e| fail(StatusCode::BAD_GATEWAY, &format!("The apps were saved, but the program couldn't be set up for {}: {e:#}", user.win_username)))?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -439,7 +481,15 @@ async fn set_desktop_mode(
     Json(input): Json<DesktopSwitch>,
 ) -> ApiResult {
     let user = existing_user(&state, id).await?;
-    let mode = host::set_desktop_mode(&user.win_username, input.full)
+    // One black-screen program per person: the assigned app that has one. When
+    // restricted, the account opens just this program; its folder is the only
+    // one the account may reach.
+    let launch = pick_launch(db::apps_for_user(&state.pool, id).await?);
+    let (program, work_dir) = match &launch {
+        Some((p, d)) => (Some(p.as_str()), d.as_deref()),
+        None => (None, None),
+    };
+    let mode = host::set_desktop_mode(&user.win_username, input.full, program, work_dir)
         .await
         .map_err(host_error)?;
     if mode == "missing" {
@@ -447,6 +497,15 @@ async fn set_desktop_mode(
             StatusCode::CONFLICT,
             &format!("There is no Windows account named {} on this computer.", user.win_username),
         ));
+    }
+    // Lock the account to its data folder when it is a restricted single-program
+    // account (standard-user rights still run Windows and the program itself).
+    if mode == "app" {
+        if let Some((_, Some(dir))) = &launch {
+            if let Err(e) = crate::host::grant_folder(&user.win_username, dir).await {
+                tracing::warn!("could not scope folder {dir} for {}: {e:#}", user.win_username);
+            }
+        }
     }
     tracing::info!(
         "windows account {} of portal user {} set to {mode}",
@@ -567,10 +626,48 @@ async fn account_desktop_mode(_: Admin, Path(name): Path<String>) -> ApiResult {
     Ok(Json(json!({ "mode": mode })))
 }
 
-async fn set_account_desktop_mode(_: Admin, Path(name): Path<String>, Json(input): Json<DesktopSwitch>) -> ApiResult {
-    let mode = host::set_desktop_mode(&name, input.full).await.map_err(host_error)?;
+/// The one black-screen program (and its folder) for a user's assigned apps.
+fn pick_launch(apps: Vec<crate::models::App>) -> Option<(String, Option<String>)> {
+    apps.into_iter().find_map(|a| {
+        let program = a.program.filter(|p| !p.trim().is_empty())?;
+        Some((program, a.work_dir.filter(|d| !d.trim().is_empty())))
+    })
+}
+
+/// The program configured for any portal user that signs in as this Windows
+/// account (several may share it; the first with a program wins).
+async fn account_launch(state: &AppState, name: &str) -> Result<Option<(String, Option<String>)>, ApiError> {
+    for user in db::list_users(&state.pool).await? {
+        if user.win_username.eq_ignore_ascii_case(name) {
+            if let Some(found) = pick_launch(db::apps_for_user(&state.pool, user.id).await?) {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn set_account_desktop_mode(
+    State(state): State<AppState>,
+    _: Admin,
+    Path(name): Path<String>,
+    Json(input): Json<DesktopSwitch>,
+) -> ApiResult {
+    let launch = account_launch(&state, &name).await?;
+    let (program, work_dir) = match &launch {
+        Some((p, d)) => (Some(p.as_str()), d.as_deref()),
+        None => (None, None),
+    };
+    let mode = host::set_desktop_mode(&name, input.full, program, work_dir).await.map_err(host_error)?;
     if mode == "missing" {
         return Err(fail(StatusCode::CONFLICT, &format!("There is no Windows account named {name} on this computer.")));
+    }
+    if mode == "app" {
+        if let Some((_, Some(dir))) = &launch {
+            if let Err(e) = crate::host::grant_folder(&name, dir).await {
+                tracing::warn!("could not scope folder {dir} for {name}: {e:#}");
+            }
+        }
     }
     Ok(Json(json!({ "mode": mode })))
 }
@@ -1071,6 +1168,34 @@ struct NewApp {
     hostname: String,
     #[serde(default)]
     port: String,
+    /// When set, the app opens this program on a black screen (not the desktop).
+    #[serde(default)]
+    program: String,
+    /// The program's working folder, and the only data folder the user's Windows
+    /// account is granted on the host.
+    #[serde(default)]
+    work_dir: String,
+}
+
+/// Trim a field; empty becomes `None` (no program / no folder set).
+fn opt(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+/// A data folder inside a Windows profile (C:\Users\...) can't be used by other
+/// accounts: Windows keeps them out of each profile, so the program falls back
+/// to its own folder. Say so instead of letting it silently misbehave.
+fn check_data_folder(work_dir: &str) -> Result<(), ApiError> {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let users = format!("{}\\users\\", drive.to_lowercase());
+    if work_dir.trim().to_lowercase().replace('/', "\\").starts_with(&users) {
+        return Err(bad(&format!(
+            "Put the data folder outside {drive}\\Users (for example {drive}\\Miracle-Companies\\Kelvin): \
+             other Windows accounts can't open folders inside someone's profile, such as their Desktop."
+        )));
+    }
+    Ok(())
 }
 
 async fn create_app(
@@ -1096,8 +1221,66 @@ async fn create_app(
     if db::app_by_key(&state.pool, key).await?.is_some() {
         return Err(fail(StatusCode::CONFLICT, "That key is already used by another app."));
     }
-    let id = db::create_app(&state.pool, key, name, hostname, port).await?;
+    if opt(&input.program).is_none() && opt(&input.work_dir).is_some() {
+        return Err(bad("A black-screen app needs a program as well as a folder."));
+    }
+    if let Some(dir) = opt(&input.work_dir) {
+        check_data_folder(dir)?;
+    }
+    let id = db::create_app(
+        &state.pool, key, name, hostname, port, opt(&input.program), opt(&input.work_dir),
+    )
+    .await?;
     Ok(Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+struct EditApp {
+    name: String,
+    hostname: String,
+    #[serde(default)]
+    port: String,
+    #[serde(default)]
+    program: String,
+    #[serde(default)]
+    work_dir: String,
+}
+
+async fn update_app(
+    State(state): State<AppState>,
+    _: Admin,
+    Path(id): Path<i64>,
+    Json(input): Json<EditApp>,
+) -> ApiResult {
+    let (name, hostname) = (input.name.trim(), input.hostname.trim());
+    if name.is_empty() || hostname.is_empty() {
+        return Err(bad("Name and host are required."));
+    }
+    let port = match input.port.trim() {
+        "" => "3389",
+        p if p.parse::<u16>().is_ok() => p,
+        _ => return Err(bad("The port must be a number between 1 and 65535.")),
+    };
+    if opt(&input.program).is_none() && opt(&input.work_dir).is_some() {
+        return Err(bad("A black-screen app needs a program as well as a folder."));
+    }
+    if let Some(dir) = opt(&input.work_dir) {
+        check_data_folder(dir)?;
+    }
+    if db::app_by_id(&state.pool, id).await?.is_none() {
+        return Err(fail(StatusCode::NOT_FOUND, "That app no longer exists."));
+    }
+    db::update_app(
+        &state.pool, id, name, hostname, port, opt(&input.program), opt(&input.work_dir),
+    )
+    .await?;
+    // Users who have this app get the new program and folder.
+    for user in db::list_users(&state.pool).await? {
+        if db::apps_for_user(&state.pool, user.id).await?.iter().any(|a| a.id == id) {
+            apply_app_access(&state, &user).await?;
+        }
+    }
+    Ok(Json(json!({})))
 }
 
 async fn delete_app(

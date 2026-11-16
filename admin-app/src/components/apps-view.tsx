@@ -1,5 +1,5 @@
-import { useState, type FormEvent } from "react"
-import { AppWindowIcon, PlusIcon, Trash2Icon } from "lucide-react"
+import { useEffect, useState, type FormEvent } from "react"
+import { AppWindowIcon, PencilIcon, PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 
 import type { ViewProps } from "@/components/app-shell"
@@ -25,10 +25,11 @@ import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/c
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, errorText } from "@/lib/api"
+import { api, errorText, type PortalApp } from "@/lib/api"
 
 export function AppsView({ data, reload }: ViewProps) {
   const [creating, setCreating] = useState(false)
+  const [editing, setEditing] = useState<PortalApp | null>(null)
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null)
 
   const newAppButton = (
@@ -69,7 +70,7 @@ export function AppsView({ data, reload }: ViewProps) {
                   <TableHead>Key</TableHead>
                   <TableHead>RDP host</TableHead>
                   <TableHead>Users</TableHead>
-                  <TableHead className="w-10" />
+                  <TableHead className="w-20" />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -82,12 +83,32 @@ export function AppsView({ data, reload }: ViewProps) {
                         <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{app.key}</code>
                       </TableCell>
                       <TableCell className="text-muted-foreground">
-                        {app.hostname}:{app.port}
+                        <div>
+                          {app.hostname}:{app.port}
+                        </div>
+                        {app.program && (
+                          <div className="text-xs">
+                            Black screen: <span className="font-mono">{app.program}</span>
+                          </div>
+                        )}
                       </TableCell>
                       <TableCell className="text-muted-foreground tabular-nums">
                         {count === 1 ? "1 user" : `${count} users`}
                       </TableCell>
-                      <TableCell>
+                      <TableCell className="whitespace-nowrap">
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              aria-label={`Edit ${app.name}`}
+                              onClick={() => setEditing(app)}
+                            >
+                              <PencilIcon />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Edit app</TooltipContent>
+                        </Tooltip>
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <Button
@@ -125,12 +146,18 @@ export function AppsView({ data, reload }: ViewProps) {
       )}
 
       <NewAppDialog open={creating} onOpenChange={setCreating} reload={reload} />
+      <NewAppDialog
+        open={editing !== null}
+        editing={editing}
+        onOpenChange={(next) => !next && setEditing(null)}
+        reload={reload}
+      />
       <ConfirmDialog confirmation={confirmation} onClose={() => setConfirmation(null)} />
     </>
   )
 }
 
-const blank = { name: "", key: "", hostname: "127.0.0.1", port: "" }
+const blank = { name: "", key: "", hostname: "127.0.0.1", port: "", program: "", work_dir: "" }
 
 /** "Tally Prime" -> "tally-prime": a starting point for the link key. */
 function keyFrom(name: string) {
@@ -145,15 +172,34 @@ function NewAppDialog({
   open,
   onOpenChange,
   reload,
+  editing = null,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   reload: () => Promise<void>
+  /** The app being changed; none for a new app. */
+  editing?: PortalApp | null
 }) {
   const [form, setForm] = useState(blank)
   const [keyTyped, setKeyTyped] = useState(false)
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
+
+  // Opening the dialog for an app fills in what it has now.
+  useEffect(() => {
+    if (open && editing) {
+      setForm({
+        name: editing.name,
+        key: editing.key,
+        hostname: editing.hostname,
+        port: editing.port === "3389" ? "" : editing.port,
+        program: editing.program ?? "",
+        work_dir: editing.work_dir ?? "",
+      })
+      setKeyTyped(true)
+      setError("")
+    }
+  }, [open, editing])
 
   const close = (next: boolean) => {
     if (busy) return
@@ -170,9 +216,13 @@ function NewAppDialog({
     setBusy(true)
     setError("")
     try {
-      await api("POST", "/api/admin/apps", form)
+      if (editing) {
+        await api("PUT", `/api/admin/apps/${editing.id}`, form)
+      } else {
+        await api("POST", "/api/admin/apps", form)
+      }
       await reload()
-      toast.success(`${form.name.trim()} created`)
+      toast.success(`${form.name.trim()} ${editing ? "saved" : "created"}`)
       setForm(blank)
       setKeyTyped(false)
       onOpenChange(false)
@@ -188,7 +238,7 @@ function NewAppDialog({
       <DialogContent>
         <form onSubmit={submit} autoComplete="off" className="contents">
           <DialogHeader>
-            <DialogTitle>New app</DialogTitle>
+            <DialogTitle>{editing ? `Edit ${editing.name}` : "New app"}</DialogTitle>
             <DialogDescription>
               An RDP connection to a host, opened as the user’s Windows account.
             </DialogDescription>
@@ -219,6 +269,7 @@ function NewAppDialog({
                   placeholder="accounts"
                   spellCheck={false}
                   required
+                  disabled={editing !== null}
                   onChange={(e) => {
                     setKeyTyped(true)
                     setForm((f) => ({ ...f, key: e.target.value }))
@@ -247,6 +298,37 @@ function NewAppDialog({
                 />
               </Field>
             </div>
+            <Field>
+              <FieldLabel htmlFor="na-program">Program (optional)</FieldLabel>
+              <Input
+                id="na-program"
+                value={form.program}
+                placeholder={"C:\\Miracle\\installation\\miracle.exe — or a Miracle shortcut (.lnk)"}
+                spellCheck={false}
+                onChange={(e) => setForm((f) => ({ ...f, program: e.target.value }))}
+              />
+              <FieldDescription>
+                Leave blank for the Windows desktop. Set it to a program, or to a shortcut
+                Miracle made for a company folder, and the user opens just that on a black
+                screen — no desktop — signing out when it closes. Needs the user’s Windows
+                account set to restricted.
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="na-workdir">Data folder</FieldLabel>
+              <Input
+                id="na-workdir"
+                value={form.work_dir}
+                placeholder={"C:\\Miracle\\Companies\\Kelvin"}
+                spellCheck={false}
+                onChange={(e) => setForm((f) => ({ ...f, work_dir: e.target.value }))}
+              />
+              <FieldDescription>
+                The folder with this user’s company files (for a Miracle shortcut, the folder
+                it opens). Only users given this app can reach it — not the program’s own
+                folder, which everyone needs.
+              </FieldDescription>
+            </Field>
             {error && <FieldError>{error}</FieldError>}
           </FieldGroup>
           <DialogFooter>
@@ -254,7 +336,7 @@ function NewAppDialog({
               Cancel
             </Button>
             <Button type="submit" disabled={busy}>
-              {busy ? "Creating…" : "Create app"}
+              {busy ? "Saving…" : editing ? "Save" : "Create app"}
             </Button>
           </DialogFooter>
         </form>

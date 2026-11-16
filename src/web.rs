@@ -299,6 +299,9 @@ async fn allowed_app(state: &AppState, user: &User, key: &str) -> Result<Result<
             name: "Desktop".to_string(),
             hostname,
             port,
+            // The Desktop entry is the full Windows desktop, never a kiosk app.
+            program: None,
+            work_dir: None,
             created_at: 0,
         }));
     }

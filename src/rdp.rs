@@ -459,6 +459,10 @@ fn config(target: &Target) -> Config {
         bitmap: None,
         dig_product_id: String::new(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
+        // A black-screen single-program session is done with the account's shell
+        // (see host::set_desktop_mode), not the RDP alternate shell: Windows Home
+        // delivers an alternate shell but refuses to launch it ("Access is
+        // denied"), the same way it refuses RemoteApp.
         alternate_shell: String::new(),
         work_dir: String::new(),
         remote_application_mode: false,
