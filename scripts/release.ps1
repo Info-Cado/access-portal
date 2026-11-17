@@ -7,13 +7,19 @@
 # committed; installs only accept updates signed with it) and a token with
 # Account > Workers R2 Storage > Edit. Also publishes this computer's RDP
 # Wrapper settings, so new installs get settings that work on this Windows build.
+#
+# Then makes a GitHub Release (tag v<Version> on the pushed HEAD commit) in
+# $Repo with the notes, installer and signature, using the `gh` CLI. Commit and
+# push the version first; -SkipGitHub leaves GitHub alone.
 param(
   [Parameter(Mandatory)] [string] $Version,
   [string] $Notes = "",
   [Parameter(Mandatory)] [string] $TokenFile,
   [string] $Zone = "infocado.in",
   [string] $Bucket = "access-portal-updates",
-  [switch] $SkipBuild
+  [string] $Repo = "Info-Cado/access-portal",
+  [switch] $SkipBuild,
+  [switch] $SkipGitHub
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -73,3 +79,20 @@ try { [IO.File]::WriteAllText($tmp, $latest); Put-Object "latest.json" $tmp "app
 $ini = "C:\Program Files\RDP Wrapper\rdpwrap.ini"
 if (Test-Path $ini) { Put-Object "rdpwrap.ini" $ini "text/plain" }
 "Published $Version ($([math]::Round($installer.Length / 1MB, 1)) MB). Installs update within 6 hours, when nobody is connected."
+
+# 4. The public GitHub Release, with the installer under the same name as the update service uses.
+if (-not $SkipGitHub) {
+  $commit = (git -C $root rev-parse HEAD).Trim()
+  git -C $root fetch -q origin
+  if (-not (git -C $root branch -r --contains $commit)) { throw "Push $commit first: GitHub needs the commit to tag it." }
+  $dir = Join-Path $env:TEMP "access-portal-release-$Version"
+  New-Item -ItemType Directory -Force $dir | Out-Null
+  try {
+    Copy-Item $installer.FullName (Join-Path $dir $file)
+    Copy-Item "$($installer.FullName).sig" (Join-Path $dir "$file.sig")
+    $body = if ($Notes) { "$Notes`n`nInstalled copies update by themselves." } else { "Installed copies update by themselves." }
+    gh release create "v$Version" --repo $Repo --target $commit --title "Access Portal $Version" --notes $body (Join-Path $dir $file) (Join-Path $dir "$file.sig")
+    if ($LASTEXITCODE -ne 0) { throw "Creating the GitHub Release failed." }
+  } finally { Remove-Item $dir -Recurse -Force }
+  "GitHub Release: https://github.com/$Repo/releases/tag/v$Version"
+}

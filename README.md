@@ -198,6 +198,10 @@ it asks first). A banner in the app points here while anything is missing.
 installs only accept updates signed with it) and publishes to the update
 service. Installed copies check every 6 hours and install when nobody is
 connected (Settings → Updates; `"Access Portal.exe" --update` installs at once).
+Commit and push the version first: the script then also makes a public GitHub
+Release (`v<version>`, with the installer) on
+[Releases](https://github.com/Info-Cado/access-portal/releases). `-SkipGitHub`
+leaves GitHub alone.
 
 ## Where things live
 
