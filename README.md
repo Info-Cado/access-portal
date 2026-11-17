@@ -174,15 +174,23 @@ npm run dev        # or run it straight from source
 ```
 
 Install it on the RDP host and open it. It must run as a Windows
-**administrator** (it changes Windows accounts and Remote Desktop settings).
+**administrator** (it changes Windows accounts and Remote Desktop settings),
+so its desktop and Start menu shortcuts are marked "Run as administrator".
+Started without those rights, it shows **Restart as administrator** at the top
+of the window. Once it has run as administrator it registers two scheduled
+tasks (`Access Portal\Start as administrator`, and one for starting in the
+tray) that copies started without the rights (Windows sign-in, the updater
+after an update) use to come back with them, without asking
+(`admin-app/src-tauri/src/elevation.rs`).
 
 **Setting up a new computer:** open **Settings → This computer** and click
 **Fix everything** (`src/host_setup.ps1`). It checks and, where needed, sets up:
 
 - Remote Desktop on, with network-level sign-in;
 - RDP Wrapper, so several people can be connected at once on Windows Home or
-  Pro (the official v1.6.2 release, checked against its known checksum, with a
-  Microsoft Defender exclusion for its folder) and its settings for this
+  Pro (the official v1.6.2 release, checked against its known checksum, with
+  Microsoft Defender exclusions for its folder and for the folder it is
+  downloaded to, `C:\ProgramData\AccessPortaldpwrap-setup`) and its settings for this
   Windows build, fetched from the portal's update service first and then from
   community sources; after a Windows update breaks it, the same button fixes it;
 - the "Portal RDP Users" group and its permission to sign in over Remote Desktop;
@@ -191,13 +199,25 @@ Install it on the RDP host and open it. It must run as a Windows
 
 Fixing RDP Wrapper restarts Remote Desktop (connected users drop for a moment;
 it asks first). A banner in the app points here while anything is missing.
+Every check and fix result also goes to `portal.log`. **Repair** on the RDP
+Wrapper row reinstalls it from scratch even when it looks fine (antivirus
+exclusions first, its settings for this build kept), for when an antivirus
+removed part of it.
+
+**Problem reports:** **Send report** on the same card (after a confirmation)
+sends the checks, Windows version, Remote Desktop and antivirus details, the
+app's recent admin actions and the end of `portal.log` to the sign-up service,
+and shows the report's number (e.g. `261117-1043-ab12`). Nothing is sent
+otherwise. Read them with `.\scriptseports.ps1 -TokenFile <Cloudflare token>`
+(latest 20) and `-Id <number>` (one in full).
 
 **Releasing an update:** `.\scripts\release.ps1 -Version 0.2.1 -Notes "..."
 -TokenFile <Cloudflare token>` builds, signs (with
 `admin-app/src-tauri/updater.key`, not committed: keep a copy somewhere safe,
 installs only accept updates signed with it) and publishes to the update
-service. Installed copies check every 6 hours and install when nobody is
-connected (Settings → Updates; `"Access Portal.exe" --update` installs at once).
+service. Installed copies check every 2 minutes and install a new version
+straight away, whoever is connected, then restart into it; this can't be turned
+off (`"Access Portal.exe" --update` installs at once).
 Commit and push the version first: the script then also makes a public GitHub
 Release (`v<version>`, with the installer) on
 [Releases](https://github.com/Info-Cado/access-portal/releases). `-SkipGitHub`
@@ -262,7 +282,7 @@ The window has four screens:
     second folder (another drive, OneDrive…); **Back up now**; **Restore** puts
     one back and restarts the app (what was there is saved first). Users'
     files aren't included;
-  - *Updates* — the version, **Check now**, and automatic installation;
+  - *Updates* — the version and **Check now** (updates always install by themselves);
   - *App sign-in*.
 
 Each user also has a **Full desktop** switch (`src/host.rs`). It changes the

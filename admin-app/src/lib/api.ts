@@ -146,8 +146,8 @@ export type PublicLink = {
 }
 
 export type ServerStatus =
-  | { running: true; address: string; data_dir: string; public: PublicLink; locked: boolean }
-  | { running: false; error: string; data_dir: string; public: PublicLink; locked: boolean }
+  | { running: true; address: string; data_dir: string; public: PublicLink; locked: boolean; elevated: boolean }
+  | { running: false; error: string; data_dir: string; public: PublicLink; locked: boolean; elevated: boolean }
 
 /** Authenticator setup details; the portal hands these out once. */
 export type TotpSetup = { secret: string; uri: string }
@@ -221,6 +221,24 @@ export function readShortcut(path: string): Promise<Shortcut> {
 
 export function testAlert(server: string, topic: string): Promise<void> {
   return invoke("test_alert", { server, topic })
+}
+
+/** Restart the app with administrator rights (Windows may ask); this copy then quits. */
+export async function restartAsAdmin(): Promise<void> {
+  try {
+    await invoke("restart_as_admin")
+  } catch (e) {
+    throw new ApiError(String(e))
+  }
+}
+
+/** Send a problem report about this computer to Access Portal support; answers its number. */
+export async function sendReport(): Promise<string> {
+  try {
+    return await invoke("send_report")
+  } catch (e) {
+    throw new ApiError(String(e))
+  }
 }
 
 export function updateStatus(): Promise<UpdateStatus> {

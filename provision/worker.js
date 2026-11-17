@@ -13,11 +13,13 @@
 //   ("offline") and again when they resume;
 // - serves app updates (latest.json and installers in the R2 bucket UPDATES)
 //   in the format Tauri's updater expects;
-// - serves known-good RDP Wrapper settings (rdpwrap.ini in UPDATES).
+// - serves known-good RDP Wrapper settings (rdpwrap.ini in UPDATES);
+// - keeps problem reports an install's admin chooses to send (table reports;
+//   read them with scripts/reports.ps1, never through this service).
 //
 // Bindings: ACCOUNT_ID, ZONE_ID, ZONE_NAME (plain text);
 //           CF_API_TOKEN, PROVISION_KEY (secrets);
-//           DB (D1: table installs), UPDATES (R2 bucket).
+//           DB (D1: tables installs, reports), UPDATES (R2 bucket).
 
 const API = "https://api.cloudflare.com/client/v4";
 
@@ -30,6 +32,9 @@ const RESERVED = new Set([
 
 /** The ntfy server when an install names none (ntfy.sh rate-limits Cloudflare's shared addresses). */
 const DEFAULT_NTFY = "https://ntfy.envs.net";
+
+/** The largest problem report kept (D1 rows hold up to 2 MB). */
+const MAX_REPORT_BYTES = 1024 * 1024;
 
 /** How long without a heartbeat before an install counts as offline. */
 const OFFLINE_AFTER_SECS = 15 * 60;
@@ -48,6 +53,7 @@ export default {
     }
     try {
       if (url.pathname === "/v1/heartbeat" && request.method === "POST") return await heartbeat(request, env);
+      if (url.pathname === "/v1/report" && request.method === "POST") return await saveReport(request, env);
       // The offline check on demand (normally run by the cron trigger), for testing.
       if (url.pathname === "/v1/check-offline" && request.method === "POST") return reply(await checkOffline(env));
 
@@ -144,6 +150,40 @@ async function ntfy(server, topic, title, message, tags, priority = "default") {
     console.log(`ntfy failed: ${e}`);
     return 0;
   }
+}
+
+// ---------------------------------------------------------------- problem reports
+
+async function saveReport(request, env) {
+  const text = await request.text();
+  if (text.length > MAX_REPORT_BYTES) return reply({ error: "The report is too large." }, 413);
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return reply({ error: "Expected JSON." }, 400);
+  }
+  const installId = String(body.install_id || "");
+  if (!/^[0-9a-f]{32}$/.test(installId)) return reply({ error: "Bad install id." }, 400);
+  // Short enough to read out over the phone: date, time and 4 random letters.
+  const now = new Date();
+  const stamp = now.toISOString().replace(/[-:]/g, "").slice(2, 13).replace("T", "-");
+  const id = `${stamp}-${randomHex(2)}`;
+  const system = body.system || {};
+  const failing = Array.isArray(body.checks) ? body.checks.filter((c) => !c.ok).map((c) => c.id).join(",") : "";
+  await env.DB.prepare(
+    `INSERT INTO reports (id, install_id, name, version, os, failing, created, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+  ).bind(
+    id,
+    installId,
+    String(body.name || "").slice(0, 100),
+    String(body.version || "").slice(0, 20),
+    `${system.os || ""} ${system.display_version || ""} ${system.build || ""}`.trim().slice(0, 120),
+    failing.slice(0, 200),
+    Math.floor(now.getTime() / 1000),
+    text,
+  ).run();
+  return reply({ id });
 }
 
 // ---------------------------------------------------------------- updates

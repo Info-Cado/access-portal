@@ -54,7 +54,7 @@ export function SettingsView({ data, reload }: ViewProps) {
       <SessionsCard settings={data.settings} reload={reload} />
       <AlertsCard data={data} reload={reload} />
       <BackupsCard />
-      <UpdatesCard data={data} reload={reload} />
+      <UpdatesCard />
       <AdminCard username={data.admin.username} isDefault={data.admin.default_password} reload={reload} />
     </div>
   )

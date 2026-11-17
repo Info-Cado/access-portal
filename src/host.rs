@@ -1211,11 +1211,50 @@ pub fn set_shadow_policy(ask: bool) {
 /// What this computer needs to serve portal sessions, checked (and with `fix`,
 /// repaired) by `host_setup.ps1`: one JSON object per check.
 pub fn setup_blocking(fix: &[String]) -> anyhow::Result<Vec<serde_json::Value>> {
+    let action = if fix.is_empty() { "check" } else { "fix" };
+    let result = run_setup_script(action, fix, '[').and_then(|v| match v {
+        serde_json::Value::Array(list) => Ok(list),
+        other => bail!("unexpected answer from the setup script: {other}"),
+    });
+    // Into portal.log too, so a problem report shows what happened.
+    match &result {
+        Ok(checks) => {
+            for c in checks {
+                let id = c["id"].as_str().unwrap_or("?");
+                let detail = c["detail"].as_str().unwrap_or("");
+                if let Some(error) = c.get("error").and_then(|e| e.as_str()) {
+                    tracing::warn!("setup {action} {id}: failed: {error} (now: {detail})");
+                } else if fix.iter().any(|f| f.trim_end_matches("-repair") == id) {
+                    tracing::info!("setup {action} {id}: ok={} ({detail})", c["ok"]);
+                } else if c["ok"] != serde_json::Value::Bool(true) {
+                    tracing::info!("setup {action} {id}: not ok ({detail})");
+                }
+            }
+        }
+        Err(e) => tracing::warn!("setup {action} {}: {e:#}", fix.join(",")),
+    }
+    result
+}
+
+/// Windows, Remote Desktop and antivirus facts for a problem report
+/// (`host_setup.ps1` with `AP_ACTION=info`).
+pub fn system_info_blocking() -> anyhow::Result<serde_json::Value> {
+    run_setup_script("info", &[], '{')
+}
+
+/// Run `host_setup.ps1` and parse the last line of its output that starts with `open`.
+fn run_setup_script(action: &str, fix: &[String], open: char) -> anyhow::Result<serde_json::Value> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static RUN: AtomicU32 = AtomicU32::new(0);
         // Too long for -EncodedCommand (the command line limit), so run it as a file.
-        let path = std::env::temp_dir().join(format!("access-portal-setup-{}.ps1", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "access-portal-setup-{}-{}.ps1",
+            std::process::id(),
+            RUN.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::write(&path, include_str!("host_setup.ps1")).context("writing the setup script")?;
         let ini_urls = std::env::var("ACCESS_PORTAL_SERVICE_URL")
             .map(|base| format!("{}/v1/rdpwrap.ini", base.trim_end_matches('/')))
@@ -1223,7 +1262,7 @@ pub fn setup_blocking(fix: &[String]) -> anyhow::Result<Vec<serde_json::Value>> 
         let out = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&path)
-            .env("AP_ACTION", if fix.is_empty() { "check" } else { "fix" })
+            .env("AP_ACTION", action)
             .env("AP_FIX", fix.join(","))
             .env("AP_INI_URLS", ini_urls)
             .creation_flags(0x0800_0000)
@@ -1231,14 +1270,14 @@ pub fn setup_blocking(fix: &[String]) -> anyhow::Result<Vec<serde_json::Value>> 
         let _ = std::fs::remove_file(&path);
         let out = out.context("starting PowerShell")?;
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let last = stdout.lines().rev().find(|l| l.trim_start().starts_with('[')).unwrap_or("");
+        let last = stdout.lines().rev().find(|l| l.trim_start().starts_with(open)).unwrap_or("");
         serde_json::from_str(last.trim()).with_context(|| {
             format!("unexpected answer from the setup script: {}{}", stdout.trim(), String::from_utf8_lossy(&out.stderr).trim())
         })
     }
     #[cfg(not(windows))]
     {
-        let _ = fix;
+        let _ = (action, fix, open);
         bail!("Setting up the computer needs Windows.")
     }
 }

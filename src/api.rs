@@ -1085,7 +1085,8 @@ struct SetupFix {
 }
 
 async fn setup_fix(State(state): State<AppState>, _: Admin, Json(input): Json<SetupFix>) -> ApiResult {
-    const KNOWN: [&str; 6] = ["rdp", "wrapper", "group", "launcher", "pdf", "policies"];
+    // "wrapper-repair" reinstalls RDP Wrapper even when it looks fine.
+    const KNOWN: [&str; 7] = ["rdp", "wrapper", "wrapper-repair", "group", "launcher", "pdf", "policies"];
     let fix: Vec<String> = input.fix.into_iter().filter(|f| KNOWN.contains(&f.as_str())).collect();
     if fix.is_empty() {
         return Err(bad("Nothing to fix."));

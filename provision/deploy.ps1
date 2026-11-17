@@ -3,18 +3,23 @@
 #
 #   .\provision\deploy.ps1 -TokenFile <file holding a Cloudflare API token> -Zone infocado.in
 #
+# -KeepSecrets updates the code and settings but leaves the Worker's stored
+# token and key as they are (for redeploying with a token that only needs
+# Workers Scripts > Edit, D1 > Edit and Zone > Read).
+#
 # The token needs: Account > Cloudflare Tunnel > Edit, Account > Workers Scripts
 # > Edit, Account > D1 > Edit, Account > Workers R2 Storage > Edit, Zone > DNS >
 # Edit and Zone > Zone > Read (for the zone). It is stored as a secret of the
 # Worker; nothing secret is written to the repository.
 #
 # Also creates (once) the D1 database "access-portal" (install heartbeats, for
-# offline alerts) and the R2 bucket "access-portal-updates" (app updates and
+# offline alerts, and problem reports) and the R2 bucket "access-portal-updates" (app updates and
 # RDP Wrapper settings), and runs the Worker every 5 minutes.
 param(
   [Parameter(Mandatory)] [string] $TokenFile,
   [Parameter(Mandatory)] [string] $Zone,
-  [string] $WorkerName = "access-portal-provision"
+  [string] $WorkerName = "access-portal-provision",
+  [switch] $KeepSecrets
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -47,6 +52,9 @@ if (-not $db) {
 }
 $schema = "CREATE TABLE IF NOT EXISTS installs (install_id TEXT PRIMARY KEY, name TEXT, topic TEXT, last_seen INTEGER NOT NULL, down INTEGER NOT NULL DEFAULT 0)"
 Invoke-RestMethod -Method Post "$api/accounts/$account/d1/database/$($db.uuid)/query" -Headers $h -ContentType "application/json" -Body (@{ sql = $schema } | ConvertTo-Json) | Out-Null
+# Problem reports installs send when their admin asks (read with scripts/reports.ps1).
+$reports = "CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, install_id TEXT NOT NULL, name TEXT, version TEXT, os TEXT, failing TEXT, created INTEGER NOT NULL, body TEXT NOT NULL)"
+Invoke-RestMethod -Method Post "$api/accounts/$account/d1/database/$($db.uuid)/query" -Headers $h -ContentType "application/json" -Body (@{ sql = $reports } | ConvertTo-Json) | Out-Null
 # Added later: which ntfy server each install's alerts go to.
 try {
   Invoke-RestMethod -Method Post "$api/accounts/$account/d1/database/$($db.uuid)/query" -Headers $h -ContentType "application/json" -Body (@{ sql = "ALTER TABLE installs ADD COLUMN server TEXT" } | ConvertTo-Json) | Out-Null
@@ -57,19 +65,23 @@ if (-not ($buckets | Where-Object name -eq $bucket)) {
   Invoke-RestMethod -Method Post "$api/accounts/$account/r2/buckets" -Headers $h -ContentType "application/json" -Body (@{ name = $bucket } | ConvertTo-Json) | Out-Null
 }
 
-$meta = @{
-  main_module = "worker.js"
-  compatibility_date = "2025-01-01"
-  bindings = @(
-    @{ type = "plain_text"; name = "ACCOUNT_ID"; text = $account },
-    @{ type = "plain_text"; name = "ZONE_ID"; text = $zoneInfo.id },
-    @{ type = "plain_text"; name = "ZONE_NAME"; text = $Zone },
-    @{ type = "secret_text"; name = "CF_API_TOKEN"; text = $token },
-    @{ type = "secret_text"; name = "PROVISION_KEY"; text = $key },
-    @{ type = "d1"; name = "DB"; id = $db.uuid },
-    @{ type = "r2_bucket"; name = "UPDATES"; bucket_name = $bucket }
-  )
-} | ConvertTo-Json -Depth 5
+$bindings = @(
+  @{ type = "plain_text"; name = "ACCOUNT_ID"; text = $account },
+  @{ type = "plain_text"; name = "ZONE_ID"; text = $zoneInfo.id },
+  @{ type = "plain_text"; name = "ZONE_NAME"; text = $Zone },
+  @{ type = "d1"; name = "DB"; id = $db.uuid },
+  @{ type = "r2_bucket"; name = "UPDATES"; bucket_name = $bucket }
+)
+$meta = @{ main_module = "worker.js"; compatibility_date = "2025-01-01" }
+if ($KeepSecrets) {
+  # New code only: the Worker keeps the token and key it already has.
+  $meta.keep_bindings = @("secret_text")
+} else {
+  $bindings += @{ type = "secret_text"; name = "CF_API_TOKEN"; text = $token }
+  $bindings += @{ type = "secret_text"; name = "PROVISION_KEY"; text = $key }
+}
+$meta.bindings = $bindings
+$meta = $meta | ConvertTo-Json -Depth 5
 
 # Multipart upload with curl; the metadata (holding the secrets) only ever sits
 # in a temporary file that is removed straight after.

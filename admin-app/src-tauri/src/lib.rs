@@ -7,7 +7,9 @@
 //! on this computer and cannot be reached over the network.
 
 mod alerts;
+mod elevation;
 mod pickers;
+mod report;
 mod tunnel;
 mod updates;
 
@@ -81,8 +83,8 @@ fn status(server: State<'_, Server>, tunnel: State<'_, Option<tunnel::Tunnel>>, 
     let public = tunnel.inner().as_ref().map(|t| t.status().to_json()).unwrap_or(json!({ "state": "unavailable" }));
     let locked = !lock.is_unlocked();
     match server.inner() {
-        Server::Running(p) => json!({ "running": true, "address": p.address, "data_dir": dir, "public": public, "locked": locked }),
-        Server::Failed(e) => json!({ "running": false, "error": e, "data_dir": dir, "public": public, "locked": locked }),
+        Server::Running(p) => json!({ "running": true, "address": p.address, "data_dir": dir, "public": public, "locked": locked, "elevated": elevation::is_elevated() }),
+        Server::Failed(e) => json!({ "running": false, "error": e, "data_dir": dir, "public": public, "locked": locked, "elevated": elevation::is_elevated() }),
     }
 }
 
@@ -131,6 +133,35 @@ async fn test_alert(app: AppHandle, lock: State<'_, AppLock>, server: String, to
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Send a problem report (see `report.rs`); answers its number.
+#[tauri::command]
+async fn send_report(app: AppHandle, server: State<'_, Server>, lock: State<'_, AppLock>) -> Result<String, String> {
+    if !lock.is_unlocked() {
+        return Err("The app is locked.".into());
+    }
+    let portal = match server.inner() {
+        Server::Running(p) => Some(p),
+        Server::Failed(_) => None,
+    };
+    report::send(&app, portal, &data_dir()).await
+}
+
+/// Restart the app with administrator rights (asking Windows if needed); this
+/// copy quits once the new one is on its way.
+#[tauri::command]
+fn restart_as_admin(app: AppHandle, lock: State<'_, AppLock>) -> Result<(), String> {
+    if !lock.is_unlocked() {
+        return Err("The app is locked.".into());
+    }
+    if elevation::is_elevated() {
+        return Err("The app already runs as administrator.".into());
+    }
+    elevation::restart_as_admin(false)?;
+    tracing::info!("restarting as administrator");
+    app.exit(0);
+    Ok(())
 }
 
 /// Restart the app (and the portal in it), e.g. to restore a backup.
@@ -244,6 +275,8 @@ fn build_tray(app: &AppHandle, tooltip: &str) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Without administrator rights, hand over to a copy that has them (see elevation.rs).
+    elevation::early_start(std::env::args().any(|a| a == HIDDEN_ARG));
     tauri::Builder::default()
         // A second launch just brings the running copy to the front (two copies
         // would fight over the portal's port).
@@ -257,7 +290,7 @@ pub fn run() {
                         tracing::warn!("update on request: {e}");
                     }
                 });
-            } else {
+            } else if !args.iter().any(|a| a == HIDDEN_ARG) {
                 show_window(app)
             }
         }))
@@ -301,6 +334,13 @@ pub fn run() {
             app.manage(updates::UpdateState::default());
             alerts::start(app.handle().clone());
             updates::start(app.handle().clone());
+            // Shortcuts that run as administrator, and the tasks that let later
+            // copies get administrator rights without asking.
+            std::thread::spawn(|| {
+                tracing::info!("running as administrator: {}", elevation::is_elevated());
+                elevation::fix_shortcuts();
+                elevation::register_tasks();
+            });
 
             // Start with Windows by default, once; after that the tray setting
             // rules. While it is on, re-register on every start so the entry
@@ -338,6 +378,8 @@ pub fn run() {
             lock,
             save_download,
             test_alert,
+            send_report,
+            restart_as_admin,
             restart_app,
             update_status,
             update_check,

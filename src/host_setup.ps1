@@ -1,17 +1,24 @@
 # Access Portal: checks (and fixes) what this computer needs to serve portal
 # sessions. Run by the portal (src/host.rs) as administrator.
 #
-#   AP_ACTION = check | fix
+#   AP_ACTION = check | fix | info
 #   AP_FIX    = comma-separated check ids to fix (with AP_ACTION=fix)
 #   AP_INI_URLS = extra places to look for RDP Wrapper settings, tried first
 #
-# Prints one JSON line: [{ id, label, ok, detail, fix, restarts }...]
+# check and fix print one JSON line: [{ id, label, ok, detail, fix, restarts }...]
+# info prints one JSON object about Windows, Remote Desktop and antivirus (for
+# the problem report the app can send).
+#
+# Keep this file ASCII: Windows PowerShell 5.1 reads it in the ANSI code page.
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $wrapDir = 'C:\Program Files\RDP Wrapper'
+# Where RDP Wrapper is downloaded and unpacked. Excluded from Microsoft Defender
+# like $wrapDir: Defender removes RDP Wrapper from anywhere else (%TEMP% too).
+$wrapStage = Join-Path $env:ProgramData 'AccessPortal\rdpwrap-setup'
 $wrapZip = 'https://github.com/stascorp/rdpwrap/releases/download/v1.6.2/RDPWrap-v1.6.2.zip'
 $wrapZipSha256 = '35A9481DDBED5177431A9EA4BD09468FE987797D7B1231D64942D17EB54EC269'
 $iniSources = @()
@@ -99,6 +106,71 @@ function Restart-RemoteDesktop {
   for ($i = 0; $i -lt 30 -and -not (Listening); $i++) { Start-Sleep -Milliseconds 500 }
 }
 
+# RDP Wrapper: install it if it's missing (with $force: reinstall it from
+# scratch, e.g. after an antivirus removed parts of it), then make sure its
+# settings cover this Windows build.
+function Install-Wrapper($force) {
+  $version = TermsrvVersion
+  $params = 'HKLM:\SYSTEM\CurrentControlSet\Services\TermService\Parameters'
+  $registered = (Get-ItemProperty $params).ServiceDll -like '*rdpwrap.dll'
+  $present = Test-Path "$wrapDir\rdpwrap.dll"
+  if ($force -or -not $registered -or -not $present) {
+    # Microsoft Defender flags RDP Wrapper as a hacking tool and removes it,
+    # so its folder and the download folder are excluded first.
+    $excluded = $true
+    foreach ($dir in @($wrapDir, $wrapStage)) {
+      try { Add-MpPreference -ExclusionPath $dir -ErrorAction Stop } catch { $excluded = $false }
+    }
+    $hint = if ($excluded) {
+      'Microsoft Defender or another antivirus program removed it. Allow RDP Wrapper in the antivirus (or pause it for a minute) and click Repair.'
+    } else {
+      "Access Portal could not add a Microsoft Defender exclusion, so the antivirus removed it. In Windows Security (or the other antivirus) add exclusions for '$wrapDir' and '$wrapStage', then click Repair."
+    }
+    # Settings that cover this build are kept (the installer brings old ones).
+    $savedIni = if (Test-Path "$wrapDir\rdpwrap.ini") { Get-Content "$wrapDir\rdpwrap.ini" -Raw } else { '' }
+    Start-Sleep -Seconds 1
+    $tmp = Join-Path $wrapStage ([guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory $tmp -Force | Out-Null
+    try {
+      try { Invoke-WebRequest $wrapZip -OutFile "$tmp\rdpwrap.zip" -UseBasicParsing -TimeoutSec 120 }
+      catch {
+        if ("$_" -match 'virus|unwanted software|malware') { throw "The RDP Wrapper download was blocked. $hint" }
+        throw "Could not download RDP Wrapper from GitHub: $_"
+      }
+      if (-not (Test-Path "$tmp\rdpwrap.zip")) { throw "The RDP Wrapper download disappeared. $hint" }
+      if ((Get-FileHash "$tmp\rdpwrap.zip" -Algorithm SHA256).Hash -ne $wrapZipSha256) { throw 'The RDP Wrapper download did not match the expected file.' }
+      Expand-Archive "$tmp\rdpwrap.zip" "$tmp\x" -Force
+      $setup = "$tmp\x\RDPWInst.exe"
+      if (-not (Test-Path $setup)) { throw "RDP Wrapper's installer disappeared after unpacking. $hint" }
+      # Its installer does nothing while Remote Desktop is still registered to
+      # RDP Wrapper, so that registration is cleared first.
+      if ($registered -and $present) {
+        # A working copy (Repair): uninstall it properly, which also unloads it.
+        Start-Process $setup -ArgumentList '-u' -Wait -WindowStyle Hidden | Out-Null
+      }
+      if ((Get-ItemProperty $params).ServiceDll -like '*rdpwrap.dll') {
+        # Its files are gone (usually an antivirus): point Remote Desktop back at Windows' own file.
+        Stop-Service TermService -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty $params ServiceDll '%SystemRoot%\System32\termsrv.dll' -Type ExpandString
+      }
+      $p = Start-Process $setup -ArgumentList '-i' -Wait -PassThru -WindowStyle Hidden
+      if (-not (Test-Path "$wrapDir\rdpwrap.dll") -or (Get-ItemProperty $params).ServiceDll -notlike '*rdpwrap.dll') {
+        throw "RDP Wrapper did not install (its installer ended with code $($p.ExitCode)). $hint"
+      }
+      if ($savedIni.Contains("[$version]")) { [IO.File]::WriteAllText("$wrapDir\rdpwrap.ini", $savedIni) }
+    } finally { Remove-Item $wrapStage -Recurse -Force -ErrorAction SilentlyContinue }
+  }
+  $ini = "$wrapDir\rdpwrap.ini"
+  $current = if (Test-Path $ini) { Get-Content $ini -Raw } else { '' }
+  if (-not $current.Contains("[$version]")) {
+    $text = Fetch-Ini $version
+    if (-not $text) { throw "No published RDP Wrapper settings support this Windows build ($version) yet. Try again in a few days." }
+    if (Test-Path $ini) { Copy-Item $ini ("$ini.bak-" + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
+    [IO.File]::WriteAllText($ini, $text)
+  }
+  Restart-RemoteDesktop
+}
+
 # ---------------------------------------------------------------- fixes
 function Fix($id) {
   switch ($id) {
@@ -109,32 +181,8 @@ function Fix($id) {
       Set-Service TermService -StartupType Automatic -ErrorAction SilentlyContinue
       Start-Service TermService -ErrorAction SilentlyContinue
     }
-    'wrapper' {
-      $version = TermsrvVersion
-      $dll = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\TermService\Parameters').ServiceDll
-      if ($dll -notlike '*rdpwrap.dll' -or -not (Test-Path "$wrapDir\rdpwrap.dll")) {
-        # Microsoft Defender flags RDP Wrapper as a hacking tool and removes it.
-        try { Add-MpPreference -ExclusionPath $wrapDir -ErrorAction Stop } catch {}
-        $tmp = Join-Path $env:TEMP ('ap-rdpwrap-' + [guid]::NewGuid())
-        New-Item -ItemType Directory $tmp | Out-Null
-        try {
-          Invoke-WebRequest $wrapZip -OutFile "$tmp\rdpwrap.zip" -UseBasicParsing -TimeoutSec 120
-          if ((Get-FileHash "$tmp\rdpwrap.zip" -Algorithm SHA256).Hash -ne $wrapZipSha256) { throw 'The RDP Wrapper download did not match the expected file.' }
-          Expand-Archive "$tmp\rdpwrap.zip" "$tmp\x" -Force
-          $p = Start-Process "$tmp\x\RDPWInst.exe" -ArgumentList '-i' -Wait -PassThru -WindowStyle Hidden
-          if (-not (Test-Path "$wrapDir\rdpwrap.dll")) { throw 'RDP Wrapper did not install (Microsoft Defender may have removed it).' }
-        } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
-      }
-      $ini = "$wrapDir\rdpwrap.ini"
-      $current = if (Test-Path $ini) { Get-Content $ini -Raw } else { '' }
-      if (-not $current.Contains("[$version]")) {
-        $text = Fetch-Ini $version
-        if (-not $text) { throw "No published RDP Wrapper settings support this Windows build ($version) yet. Try again in a few days." }
-        if (Test-Path $ini) { Copy-Item $ini ("$ini.bak-" + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
-        [IO.File]::WriteAllText($ini, $text)
-      }
-      Restart-RemoteDesktop
-    }
+    'wrapper' { Install-Wrapper $false }
+    'wrapper-repair' { Install-Wrapper $true }
     'group' {
       if (-not (GroupSid)) { New-LocalGroup -Name $portalGroup -Description 'Access Portal Remote Desktop users' -ErrorAction Stop | Out-Null }
       $sid = GroupSid
@@ -165,7 +213,7 @@ function Checks {
   $list = @()
   $admin = Test-Admin
   $list += [ordered]@{ id = 'admin'; label = 'Access Portal runs as administrator'; ok = $admin
-    detail = $(if ($admin) { 'Yes.' } else { 'No. Close Access Portal from its tray icon and open it with "Run as administrator".' }); fix = ''; restarts = $false }
+    detail = $(if ($admin) { 'Yes.' } else { 'No. Click "Restart as administrator" in Access Portal.' }); fix = ''; restarts = $false }
 
   $os = (Get-CimInstance Win32_OperatingSystem).Caption
   $deny = PolicyValue $ts 'fDenyTSConnections'
@@ -177,11 +225,13 @@ function Checks {
 
   $version = TermsrvVersion
   $dll = PolicyValue 'HKLM:\SYSTEM\CurrentControlSet\Services\TermService\Parameters' 'ServiceDll'
-  $wrapped = $dll -like '*rdpwrap.dll' -and (Test-Path "$wrapDir\rdpwrap.dll")
+  $registered = $dll -like '*rdpwrap.dll'
+  $wrapped = $registered -and (Test-Path "$wrapDir\rdpwrap.dll")
   $iniOk = $wrapped -and (Test-Path "$wrapDir\rdpwrap.ini") -and (Get-Content "$wrapDir\rdpwrap.ini" -Raw).Contains("[$version]")
   $listen = Listening
   $wrapOk = $wrapped -and $iniOk -and $listen
   $detail = if ($wrapOk) { "Installed and supports this Windows build ($version)." }
+    elseif ($registered) { 'Installed, but its files are gone (usually an antivirus removed them). Remote Desktop may not work at all until it is repaired.' }
     elseif (-not $wrapped) { "Not installed. Windows lets only one person use Remote Desktop at a time without it." }
     elseif (-not $iniOk) { "Installed, but its settings don't cover this Windows build ($version), usually after a Windows update." }
     else { 'Installed, but Remote Desktop is not accepting connections.' }
@@ -218,12 +268,53 @@ function Checks {
   $list
 }
 
+# ---------------------------------------------------------------- info
+function Info {
+  $os = Get-CimInstance Win32_OperatingSystem
+  $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+  $mp = try { Get-MpComputerStatus -ErrorAction Stop } catch { $null }
+  $pref = try { Get-MpPreference -ErrorAction Stop } catch { $null }
+  $av = try { @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop | ForEach-Object { $_.displayName }) } catch { @() }
+  $threats = try {
+    # Only RDP Wrapper and Access Portal ones: the rest is none of our business.
+    @(Get-MpThreatDetection -ErrorAction Stop | Sort-Object InitialDetectionTime -Descending |
+      Where-Object { ($_.Resources -join ' ') -match 'rdpwrap|RDP Wrapper|RDPWInst|AccessPortal|access-portal' } | Select-Object -First 5 |
+      ForEach-Object { $r = "$($_.InitialDetectionTime.ToString('s')) $($_.Resources -join ', ')"; $r.Substring(0, [Math]::Min(300, $r.Length)) })
+  } catch { @() }
+  $svc = Get-Service TermService -ErrorAction SilentlyContinue
+  [ordered]@{
+    os = $os.Caption
+    version = $os.Version
+    display_version = $cv.DisplayVersion
+    build = "$($cv.CurrentBuildNumber).$($cv.UBR)"
+    edition = $cv.EditionID
+    architecture = $os.OSArchitecture
+    language = (Get-Culture).Name
+    last_boot = $os.LastBootUpTime.ToString('s')
+    admin = Test-Admin
+    termsrv = TermsrvVersion
+    termservice = $(if ($svc) { "$($svc.Status)" } else { 'missing' })
+    service_dll = PolicyValue 'HKLM:\SYSTEM\CurrentControlSet\Services\TermService\Parameters' 'ServiceDll'
+    rdp_listening = Listening
+    wrapper_files = @(Get-ChildItem $wrapDir -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    antivirus = $av
+    defender = $(if ($mp) { [ordered]@{ antivirus = $mp.AntivirusEnabled; realtime = $mp.RealTimeProtectionEnabled; tamper_protected = $mp.IsTamperProtected } } else { $null })
+    defender_exclusions = $(if ($pref) { @($pref.ExclusionPath | Where-Object { $_ -like '*RDP Wrapper*' -or $_ -like '*AccessPortal*' }) } else { @() })
+    defender_threats = $threats
+  }
+}
+if ($env:AP_ACTION -eq 'info') {
+  ConvertTo-Json -InputObject (Info) -Compress -Depth 4
+  return
+}
+
 $errors = @{}
 if ($env:AP_ACTION -eq 'fix') {
   if (-not (Test-Admin)) { $errors['admin'] = 'Access Portal is not running as administrator.' }
   else {
     foreach ($id in ($env:AP_FIX -split ',' | Where-Object { $_ })) {
-      try { Fix $id } catch { $errors[$id] = $_.Exception.Message }
+      # A repair reports on the check it repairs ('wrapper-repair' -> 'wrapper').
+      try { Fix $id } catch { $errors[($id -replace '-repair$', '')] = $_.Exception.Message }
     }
   }
 }

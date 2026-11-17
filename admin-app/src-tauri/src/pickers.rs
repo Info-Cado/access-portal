@@ -98,7 +98,7 @@ fn folder_in_args(args: &str) -> Option<String> {
 }
 
 #[cfg(windows)]
-mod imp {
+pub(crate) mod imp {
     use windows::core::{w, Interface, HSTRING, PCWSTR};
     use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
     use windows::Win32::System::Com::{

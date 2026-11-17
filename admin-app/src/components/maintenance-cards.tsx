@@ -27,7 +27,7 @@ function ago(unix: number | null) {
   return new Date(unix * 1000).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
 }
 
-export function UpdatesCard({ data, reload }: { data: PortalState; reload: () => Promise<void> }) {
+export function UpdatesCard() {
   const [status, setStatus] = useState<UpdateStatus | null>(null)
   const [busy, setBusy] = useState(false)
   useEffect(() => {
@@ -44,14 +44,6 @@ export function UpdatesCard({ data, reload }: { data: PortalState; reload: () =>
       toast.error(errorText(e))
     } finally {
       setBusy(false)
-    }
-  }
-  const setAuto = async (auto: boolean) => {
-    try {
-      await api("PUT", "/api/admin/settings/updates", { auto })
-      await reload()
-    } catch (e) {
-      toast.error(errorText(e))
     }
   }
 
@@ -75,8 +67,8 @@ export function UpdatesCard({ data, reload }: { data: PortalState; reload: () =>
           {status?.available && (
             <div className="flex items-center gap-3 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
               <span className="flex-1">
-                Version {status.available} is available{status.notes ? `: ${status.notes}` : "."}{" "}
-                {data.updates.auto ? "It installs by itself when nobody is connected." : ""}
+                Version {status.available} is available{status.notes ? `: ${status.notes}` : "."} It is being
+                installed now.
               </span>
               <Button size="sm" disabled={busy} onClick={() => check(true)}>
                 Install now
@@ -84,16 +76,10 @@ export function UpdatesCard({ data, reload }: { data: PortalState; reload: () =>
             </div>
           )}
           {status?.error && <FieldDescription className="text-destructive">{status.error}</FieldDescription>}
-          <Field orientation="horizontal">
-            <FieldContent>
-              <FieldLabel htmlFor="auto-update">Install updates automatically</FieldLabel>
-              <FieldDescription>
-                Checked every 6 hours. An update waits until nobody is connected, then the app restarts into the new
-                version (about 15 seconds).
-              </FieldDescription>
-            </FieldContent>
-            <Switch id="auto-update" checked={data.updates.auto} onCheckedChange={setAuto} />
-          </Field>
+          <FieldDescription>
+            Checked every 2 minutes. A new version installs straight away and the app restarts into it (about 15
+            seconds). People connected keep their Windows sessions; their pages reconnect by themselves.
+          </FieldDescription>
         </FieldGroup>
       </CardContent>
     </Card>

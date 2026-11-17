@@ -5,6 +5,7 @@ import {
   LockIcon,
   MonitorSmartphoneIcon,
   RefreshCwIcon,
+  ShieldIcon,
   SettingsIcon,
   TriangleAlertIcon,
   UsersIcon,
@@ -35,7 +36,7 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar"
 import { PublicLinkFooter } from "@/components/public-link"
-import { api, errorText, type PortalState, type PublicLink } from "@/lib/api"
+import { api, errorText, restartAsAdmin, type PortalState, type PublicLink } from "@/lib/api"
 
 type View = "users" | "apps" | "activity" | "settings"
 
@@ -48,7 +49,7 @@ export function AppShell({
   status,
   reload,
   onLock,
-}: ViewProps & { status: { address: string; public: PublicLink }; onLock: () => void }) {
+}: ViewProps & { status: { address: string; public: PublicLink; elevated: boolean }; onLock: () => void }) {
   const [view, setView] = useState<View>("users")
   const [refreshing, setRefreshing] = useState(false)
   // Is this computer fully set up? Checked once when the app is opened.
@@ -58,6 +59,17 @@ export function AppShell({
       .then((r) => setSetupProblems(r.checks.filter((c) => !c.ok && c.fix).length))
       .catch(() => {})
   }, [view])
+
+  const [elevating, setElevating] = useState(false)
+  const elevate = async () => {
+    setElevating(true)
+    try {
+      await restartAsAdmin()
+    } catch (e) {
+      toast.error(errorText(e))
+      setElevating(false)
+    }
+  }
 
   const refresh = async () => {
     setRefreshing(true)
@@ -148,6 +160,18 @@ export function AppShell({
           </Button>
         </header>
         <div className="flex flex-1 flex-col gap-4 p-4 lg:p-6">
+          {!status.elevated && (
+            <div className="flex items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
+              <ShieldIcon className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <span className="flex-1">
+                Access Portal isn’t running as administrator, so it can’t change Windows accounts or Remote Desktop
+                settings.
+              </span>
+              <Button size="sm" disabled={elevating} onClick={elevate}>
+                {elevating ? "Restarting…" : "Restart as administrator"}
+              </Button>
+            </div>
+          )}
           {setupProblems > 0 && view !== "settings" && (
             <div className="flex items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
               <TriangleAlertIcon className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />

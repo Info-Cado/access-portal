@@ -1,9 +1,9 @@
 //! Updates: new versions are published to the sign-up service (an R2 bucket
 //! behind `provision/worker.js`, by `scripts/release.ps1`), signed with the
-//! project's updater key. The app checks a few minutes after it starts and
-//! every 6 hours. With automatic updates on (the default), a new version is
-//! installed as soon as nobody is connected, so no session is cut off; the app
-//! restarts into the new version by itself.
+//! project's updater key. The app checks shortly after it starts and then
+//! every 2 minutes. A new version is always installed straight away, whoever
+//! is connected (their Windows sessions keep running and their pages
+//! reconnect), and the app restarts into it by itself. There is no opting out.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::{tunnel, Server};
+use crate::tunnel;
 
 /// The public half of the updater key; installers must be signed with the other half.
 pub const PUBKEY: &str = include_str!("../updater.key.pub");
@@ -95,47 +95,22 @@ pub async fn check(app: &AppHandle, install: bool) -> Result<Value, String> {
     result.map(|_| status_json(app))
 }
 
-/// Check every 6 hours; install automatically when allowed and nobody is connected.
+/// How often to look for a new version.
+const CHECK_EVERY: Duration = Duration::from_secs(2 * 60);
+
+/// Check every 2 minutes and install whatever is found at once.
 pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3 * 60)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        // The same failure every 2 minutes goes in the log once.
+        let mut last_error = None;
         loop {
-            let auto = auto_install_allowed(&app).await;
-            if let Err(e) = check(&app, false).await {
-                tracing::warn!("update check: {e}");
+            let error = check(&app, true).await.err();
+            if error.is_some() && error != last_error {
+                tracing::warn!("update check: {}", error.as_deref().unwrap_or(""));
             }
-            let available = app.state::<UpdateState>().0.lock().unwrap().available.is_some();
-            if available && auto {
-                // Wait for a moment when nobody is connected (checked every 5 minutes).
-                for _ in 0..72 {
-                    if nobody_connected(&app).await {
-                        if let Err(e) = check(&app, true).await {
-                            tracing::warn!("automatic update: {e}");
-                        }
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(5 * 60)).await;
-                }
-                continue;
-            }
-            tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+            last_error = error;
+            tokio::time::sleep(CHECK_EVERY).await;
         }
     });
-}
-
-async fn portal_state(app: &AppHandle) -> Option<Value> {
-    let Server::Running(portal) = app.state::<Server>().inner() else { return None };
-    let (status, state) = portal.admin("GET", "/api/admin/state", None).await;
-    (status == 200).then_some(state)
-}
-
-async fn auto_install_allowed(app: &AppHandle) -> bool {
-    portal_state(app).await.map(|s| s["updates"]["auto"].as_bool().unwrap_or(true)).unwrap_or(false)
-}
-
-async fn nobody_connected(app: &AppHandle) -> bool {
-    portal_state(app)
-        .await
-        .and_then(|s| s["users"].as_array().map(|users| users.iter().all(|u| u["sessions"].as_array().is_none_or(|v| v.is_empty()))))
-        .unwrap_or(false)
 }

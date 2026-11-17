@@ -97,6 +97,16 @@ pub struct Portal {
 /// Name of the settings file inside the data folder.
 pub const SETTINGS_FILE: &str = "portal.env";
 
+/// What this computer looks like, for a problem report: the setup checks
+/// (`checks`) and facts about Windows, Remote Desktop and antivirus (`system`).
+/// A part that can't be read holds `{"error": "..."}`. Blocks for a few seconds.
+pub fn diagnostics_blocking() -> serde_json::Value {
+    let checks = host::setup_blocking(&[]).map(serde_json::Value::from);
+    let system = host::system_info_blocking();
+    let part = |r: anyhow::Result<serde_json::Value>| r.unwrap_or_else(|e| serde_json::json!({ "error": format!("{e:#}") }));
+    serde_json::json!({ "checks": part(checks), "system": part(system) })
+}
+
 /// Start the portal with everything kept in `data_dir`: the settings file
 /// (`portal.env`, created on first start with a fresh secret), the database
 /// (`portal.db`) and the per-user transfer folders (`files/`).

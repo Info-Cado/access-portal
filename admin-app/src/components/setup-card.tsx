@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useState } from "react"
-import { CircleAlertIcon, CircleCheckIcon, LoaderCircleIcon, WrenchIcon } from "lucide-react"
+import { CircleAlertIcon, CircleCheckIcon, LifeBuoyIcon, LoaderCircleIcon, WrenchIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import { ConfirmDialog, type Confirmation } from "@/components/dialogs"
 import { Button } from "@/components/ui/button"
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
-import { api, errorText } from "@/lib/api"
+import { api, errorText, restartAsAdmin, sendReport } from "@/lib/api"
 
 export type SetupCheck = {
   id: string
@@ -19,6 +19,9 @@ export type SetupCheck = {
   restarts: boolean
   error?: string
 }
+
+/** The check a fix id works on: "wrapper-repair" repairs "wrapper". */
+const checkOf = (id: string) => id.replace(/-repair$/, "")
 
 /** Checks (and fixes) what this computer needs to serve portal sessions. */
 export function SetupCard({ onChecked }: { onChecked?: (checks: SetupCheck[]) => void }) {
@@ -42,7 +45,7 @@ export function SetupCard({ onChecked }: { onChecked?: (checks: SetupCheck[]) =>
       const r = await api<{ checks: SetupCheck[] }>("POST", "/api/admin/setup", { fix: ids })
       setChecks(r.checks)
       onChecked?.(r.checks)
-      const failed = r.checks.filter((c) => ids.includes(c.id) && (c.error || !c.ok))
+      const failed = r.checks.filter((c) => ids.map(checkOf).includes(c.id) && (c.error || !c.ok))
       if (failed.length) toast.error(failed.map((c) => `${c.label}: ${c.error ?? c.detail}`).join("\n"))
       else toast.success("Done")
     } catch (e) {
@@ -64,6 +67,32 @@ export function SetupCard({ onChecked }: { onChecked?: (checks: SetupCheck[]) =>
     })
   }
 
+  // Reinstall RDP Wrapper from scratch, even when it looks fine (e.g. an antivirus removed part of it).
+  const repairWrapper = () =>
+    setConfirmation({
+      title: "Repair RDP Wrapper?",
+      description:
+        "This downloads RDP Wrapper again and reinstalls it, adding antivirus exclusions for it first, then restarts Remote Desktop. Everyone connected right now is disconnected for a moment; their apps keep running and their pages reconnect.",
+      action: "Repair and restart",
+      run: () => run(["wrapper-repair"]),
+    })
+
+  const report = () =>
+    setConfirmation({
+      title: "Send a problem report?",
+      description:
+        "Sends Access Portal support what this card shows, this computer's Windows version, Remote Desktop and antivirus settings, the app's recent actions and the end of its log (which names users and the addresses they connected from). Passwords are never in it. Nothing is sent unless you click Send.",
+      action: "Send",
+      run: async () => {
+        try {
+          const id = await sendReport()
+          toast.success(`Report sent. Its number is ${id}: mention it when you get in touch.`, { duration: 60_000 })
+        } catch (e) {
+          toast.error(errorText(e))
+        }
+      },
+    })
+
   const fixable = checks?.filter((c) => !c.ok && c.fix) ?? []
 
   return (
@@ -71,7 +100,11 @@ export function SetupCard({ onChecked }: { onChecked?: (checks: SetupCheck[]) =>
       <CardHeader>
         <CardTitle>This computer</CardTitle>
         <CardDescription>What it needs to serve portal sessions. Everything here can be set up with one click.</CardDescription>
-        <CardAction>
+        <CardAction className="flex gap-2">
+          <Button size="sm" variant="outline" disabled={busy !== null || checks === null} onClick={report}>
+            <LifeBuoyIcon />
+            Send report
+          </Button>
           {fixable.length > 1 && (
             <Button size="sm" disabled={busy !== null} onClick={() => fix(fixable.map((c) => c.id))}>
               <WrenchIcon />
@@ -91,7 +124,7 @@ export function SetupCard({ onChecked }: { onChecked?: (checks: SetupCheck[]) =>
           <ul className="flex flex-col divide-y">
             {checks.map((c) => (
               <li key={c.id} className="flex items-start gap-3 py-2.5 first:pt-0 last:pb-0">
-                {busy?.split(",").includes(c.id) ? (
+                {busy?.split(",").map(checkOf).includes(c.id) ? (
                   <LoaderCircleIcon className="mt-0.5 size-4 shrink-0 animate-spin text-muted-foreground" />
                 ) : c.ok ? (
                   <CircleCheckIcon className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
@@ -107,6 +140,20 @@ export function SetupCard({ onChecked }: { onChecked?: (checks: SetupCheck[]) =>
                 {!c.ok && c.fix && (
                   <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => fix([c.id])}>
                     Fix
+                  </Button>
+                )}
+                {c.id === "wrapper" && (
+                  <Button size="sm" variant="outline" disabled={busy !== null} onClick={repairWrapper}>
+                    Repair
+                  </Button>
+                )}
+                {!c.ok && c.id === "admin" && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => restartAsAdmin().catch((e) => toast.error(errorText(e)))}
+                  >
+                    Restart as administrator
                   </Button>
                 )}
               </li>
