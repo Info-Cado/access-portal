@@ -31,7 +31,8 @@ async fn main() -> anyhow::Result<()> {
             let p = p.clone();
             async move {
                 let method = req.method().to_string();
-                let path = req.uri().path().to_string();
+                // Keep the query (e.g. ?force=1): the app's own requests carry it too.
+                let path = req.uri().path_and_query().map_or_else(|| req.uri().path().to_string(), |p| p.to_string());
                 let bytes = axum::body::to_bytes(req.into_body(), 1 << 20).await.unwrap_or_default();
                 let body = serde_json::from_slice(&bytes).ok();
                 let (status, value) = p.admin(&method, &path, body).await;

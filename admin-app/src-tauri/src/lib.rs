@@ -342,7 +342,8 @@ pub fn run() {
             update_status,
             update_check,
             pickers::pick_program,
-            pickers::read_shortcut
+            pickers::read_shortcut,
+            pickers::find_miracle
         ])
         .build(tauri::generate_context!())
         .expect("starting Access Portal")

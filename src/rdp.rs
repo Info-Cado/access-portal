@@ -1258,8 +1258,25 @@ async fn session(
                 let events = match msg {
                     None => continue,
                     Some(ClientMsg::SignOut) => {
+                        // A black-screen program is closed the safe way and never
+                        // forced; a desktop is signed out as before.
                         let user = extras.win_username.clone();
-                        tokio::task::spawn_blocking(move || crate::host::sign_out_blocking(&user)).await.ok();
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            match crate::host::close_safely_blocking(&user, Duration::from_secs(40)) {
+                                crate::host::SafeClose::NotKiosk => {
+                                    crate::host::sign_out_blocking(&user);
+                                    crate::host::SafeClose::Closed
+                                }
+                                other => other,
+                            }
+                        })
+                        .await
+                        .unwrap_or(crate::host::SafeClose::Busy);
+                        if outcome == crate::host::SafeClose::Busy {
+                            return Ok("Your app still has a window with unsaved work open, so it was left running. \
+                                       Sign in again, save and close that window, then sign out."
+                                .to_owned());
+                        }
                         return Ok("You signed out of Windows. Your apps were closed.".to_owned());
                     }
                     Some(ClientMsg::FrameAck { id }) => {

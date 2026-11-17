@@ -206,10 +206,11 @@ pub async fn create_app(
     port: &str,
     program: Option<&str>,
     work_dir: Option<&str>,
+    profile: Option<&str>,
 ) -> Result<i64> {
     let res = sqlx::query(
-        "INSERT INTO apps (key, name, hostname, port, program, work_dir, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO apps (key, name, hostname, port, program, work_dir, profile, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(key)
     .bind(name)
@@ -217,6 +218,7 @@ pub async fn create_app(
     .bind(port)
     .bind(program)
     .bind(work_dir)
+    .bind(profile)
     .bind(now())
     .execute(pool)
     .await?;
@@ -233,15 +235,17 @@ pub async fn update_app(
     port: &str,
     program: Option<&str>,
     work_dir: Option<&str>,
+    profile: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE apps SET name = ?, hostname = ?, port = ?, program = ?, work_dir = ? WHERE id = ?",
+        "UPDATE apps SET name = ?, hostname = ?, port = ?, program = ?, work_dir = ?, profile = ? WHERE id = ?",
     )
     .bind(name)
     .bind(hostname)
     .bind(port)
     .bind(program)
     .bind(work_dir)
+    .bind(profile)
     .bind(id)
     .execute(pool)
     .await?;

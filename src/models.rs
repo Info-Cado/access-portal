@@ -61,5 +61,8 @@ pub struct App {
     /// The program's working folder, and the only data folder the user's Windows
     /// account is granted on the host (see `host::scope_folder`).
     pub work_dir: Option<String>,
+    /// The kind of program: "miracle" (opened on its company folder and closed
+    /// the Miracle way) or generic (`None`/"generic").
+    pub profile: Option<String>,
     pub created_at: i64,
 }

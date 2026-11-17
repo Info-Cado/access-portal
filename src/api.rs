@@ -145,7 +145,7 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
     let apps: Vec<Value> = db::list_apps(&state.pool)
         .await?
         .into_iter()
-        .map(|a| json!({ "id": a.id, "key": a.key, "name": a.name, "hostname": a.hostname, "port": a.port, "program": a.program, "work_dir": a.work_dir }))
+        .map(|a| json!({ "id": a.id, "key": a.key, "name": a.name, "hostname": a.hostname, "port": a.port, "program": a.program, "work_dir": a.work_dir, "profile": a.profile }))
         .collect();
     let (admin_name, default_password) = settings::admin_account(&state.pool).await?;
     Ok(Json(json!({
@@ -293,6 +293,13 @@ async fn delete_user(
     // shared with other portal users).
     state.presence.kick_user(id, crate::presence::DELETED);
     if options.windows == Some(1) {
+        // Close their program safely first; never delete over unsaved work.
+        if close_safely(&user.win_username).await == host::SafeClose::Busy {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                &format!("{} Then delete the user again.", busy_message(&user)),
+            ));
+        }
         host::delete_account(&user.win_username).await.map_err(host_error)?;
     }
     db::delete_user(&state.pool, id).await?;
@@ -362,11 +369,7 @@ async fn apply_app_access(state: &AppState, user: &User) -> Result<(), ApiError>
     }
     if mode == "app" {
         let launch = pick_launch(apps);
-        let (program, work_dir) = match &launch {
-            Some((p, d)) => (Some(p.as_str()), d.as_deref()),
-            None => (None, None),
-        };
-        host::set_desktop_mode(&user.win_username, false, program, work_dir)
+        host::set_desktop_mode(&user.win_username, false, launch.as_ref())
             .await
             .map_err(|e| fail(StatusCode::BAD_GATEWAY, &format!("The apps were saved, but the program couldn't be set up for {}: {e:#}", user.win_username)))?;
     }
@@ -485,11 +488,7 @@ async fn set_desktop_mode(
     // restricted, the account opens just this program; its folder is the only
     // one the account may reach.
     let launch = pick_launch(db::apps_for_user(&state.pool, id).await?);
-    let (program, work_dir) = match &launch {
-        Some((p, d)) => (Some(p.as_str()), d.as_deref()),
-        None => (None, None),
-    };
-    let mode = host::set_desktop_mode(&user.win_username, input.full, program, work_dir)
+    let mode = host::set_desktop_mode(&user.win_username, input.full, launch.as_ref())
         .await
         .map_err(host_error)?;
     if mode == "missing" {
@@ -501,7 +500,7 @@ async fn set_desktop_mode(
     // Lock the account to its data folder when it is a restricted single-program
     // account (standard-user rights still run Windows and the program itself).
     if mode == "app" {
-        if let Some((_, Some(dir))) = &launch {
+        if let Some(dir) = launch.as_ref().and_then(|l| l.work_dir.as_deref()) {
             if let Err(e) = crate::host::grant_folder(&user.win_username, dir).await {
                 tracing::warn!("could not scope folder {dir} for {}: {e:#}", user.win_username);
             }
@@ -615,6 +614,14 @@ async fn delete_windows_account(
     axum::extract::Query(options): axum::extract::Query<AccountDelete>,
 ) -> ApiResult {
     let files = options.files == Some(1);
+    // Close its black-screen program safely first; never delete over unsaved work.
+    if close_safely(&name).await == host::SafeClose::Busy {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            &format!("{name}'s app has a window with unsaved work open, so the account was left alone. \
+                      Ask them to save and close it, then delete the account again."),
+        ));
+    }
     host::delete_any_account(&name, files).await.map_err(host_error)?;
     let with = if files { " and its files" } else { "" };
     activity::admin(&state.pool, None, &format!("Deleted Windows account {name}{with}")).await;
@@ -627,16 +634,20 @@ async fn account_desktop_mode(_: Admin, Path(name): Path<String>) -> ApiResult {
 }
 
 /// The one black-screen program (and its folder) for a user's assigned apps.
-fn pick_launch(apps: Vec<crate::models::App>) -> Option<(String, Option<String>)> {
+fn pick_launch(apps: Vec<crate::models::App>) -> Option<host::Launch> {
     apps.into_iter().find_map(|a| {
         let program = a.program.filter(|p| !p.trim().is_empty())?;
-        Some((program, a.work_dir.filter(|d| !d.trim().is_empty())))
+        Some(host::Launch {
+            program,
+            work_dir: a.work_dir.filter(|d| !d.trim().is_empty()),
+            profile: a.profile.filter(|p| !p.trim().is_empty()),
+        })
     })
 }
 
 /// The program configured for any portal user that signs in as this Windows
 /// account (several may share it; the first with a program wins).
-async fn account_launch(state: &AppState, name: &str) -> Result<Option<(String, Option<String>)>, ApiError> {
+async fn account_launch(state: &AppState, name: &str) -> Result<Option<host::Launch>, ApiError> {
     for user in db::list_users(&state.pool).await? {
         if user.win_username.eq_ignore_ascii_case(name) {
             if let Some(found) = pick_launch(db::apps_for_user(&state.pool, user.id).await?) {
@@ -654,16 +665,12 @@ async fn set_account_desktop_mode(
     Json(input): Json<DesktopSwitch>,
 ) -> ApiResult {
     let launch = account_launch(&state, &name).await?;
-    let (program, work_dir) = match &launch {
-        Some((p, d)) => (Some(p.as_str()), d.as_deref()),
-        None => (None, None),
-    };
-    let mode = host::set_desktop_mode(&name, input.full, program, work_dir).await.map_err(host_error)?;
+    let mode = host::set_desktop_mode(&name, input.full, launch.as_ref()).await.map_err(host_error)?;
     if mode == "missing" {
         return Err(fail(StatusCode::CONFLICT, &format!("There is no Windows account named {name} on this computer.")));
     }
     if mode == "app" {
-        if let Some((_, Some(dir))) = &launch {
+        if let Some(dir) = launch.as_ref().and_then(|l| l.work_dir.as_deref()) {
             if let Err(e) = crate::host::grant_folder(&name, dir).await {
                 tracing::warn!("could not scope folder {dir} for {name}: {e:#}");
             }
@@ -1145,16 +1152,59 @@ async fn change_admin(State(state): State<AppState>, _: Admin, Json(input): Json
 
 /// Sign a user out completely: disconnect their sessions, end their portal
 /// sign-ins and sign their Windows account out (their apps close).
-async fn sign_out_user(State(state): State<AppState>, _: Admin, Path(id): Path<i64>) -> ApiResult {
+/// A black-screen program is closed safely first; if it has unsaved work it is
+/// left open (409) unless `?force=1`, which signs Windows out regardless.
+async fn sign_out_user(
+    State(state): State<AppState>,
+    _: Admin,
+    Path(id): Path<i64>,
+    axum::extract::Query(options): axum::extract::Query<ForceOption>,
+) -> ApiResult {
     let user = existing_user(&state, id).await?;
     let disconnected = state.presence.kick_user(id, crate::presence::SIGNED_OUT);
     db::delete_sessions_for_user(&state.pool, id).await?;
-    activity::admin(&state.pool, Some(&user), "Signed them out of Windows").await;
     // Give the sessions a moment to close before Windows signs the account out.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let force = options.force == Some(1);
+    if !force {
+        match close_safely(&user.win_username).await {
+            host::SafeClose::Busy => {
+                activity::admin(&state.pool, Some(&user), "Sign-out stopped: their app has unsaved work open").await;
+                return Err(fail(StatusCode::CONFLICT, &busy_message(&user)));
+            }
+            host::SafeClose::Closed | host::SafeClose::NoSession => {
+                activity::admin(&state.pool, Some(&user), "Signed them out of Windows (their app closed safely)").await;
+                return Ok(Json(json!({ "disconnected": disconnected, "windows_sessions": 0, "closed_safely": true })));
+            }
+            host::SafeClose::NotKiosk => {} // a desktop: sign Windows out as before
+        }
+    }
+    let how = if force { " (forced)" } else { "" };
+    activity::admin(&state.pool, Some(&user), &format!("Signed them out of Windows{how}")).await;
     let win = user.win_username.clone();
     let windows_sessions = tokio::task::spawn_blocking(move || host::sign_out_blocking(&win)).await.unwrap_or(0);
     Ok(Json(json!({ "disconnected": disconnected, "windows_sessions": windows_sessions })))
+}
+
+#[derive(Deserialize)]
+struct ForceOption {
+    force: Option<u8>,
+}
+
+/// Close a user's black-screen program the safe way (waits up to 40 s).
+async fn close_safely(win_username: &str) -> host::SafeClose {
+    let win = win_username.to_string();
+    tokio::task::spawn_blocking(move || host::close_safely_blocking(&win, std::time::Duration::from_secs(40)))
+        .await
+        .unwrap_or(host::SafeClose::Busy)
+}
+
+fn busy_message(user: &User) -> String {
+    format!(
+        "{}'s app has a window with unsaved work open, so it was left running (closing it now could lose that work). \
+         Ask them to save and close it, or force the sign-out.",
+        user.username
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,12 +1225,33 @@ struct NewApp {
     /// account is granted on the host.
     #[serde(default)]
     work_dir: String,
+    /// "miracle" for Miracle; empty or "generic" for any other program.
+    #[serde(default)]
+    profile: String,
 }
 
 /// Trim a field; empty becomes `None` (no program / no folder set).
 fn opt(s: &str) -> Option<&str> {
     let t = s.trim();
     if t.is_empty() { None } else { Some(t) }
+}
+
+/// The profile to store ("miracle" or none), after checking it fits the app.
+fn check_profile(profile: &str, program: Option<&str>, work_dir: Option<&str>) -> Result<Option<&'static str>, ApiError> {
+    match profile.trim().to_lowercase().as_str() {
+        "" | "generic" => Ok(None),
+        "miracle" => {
+            let Some(program) = program else {
+                return Err(bad("A Miracle app needs the Miracle program (miracle.exe) or a Miracle shortcut."));
+            };
+            // miracle.exe on its own opens the company folder the app gives it.
+            if !program.to_lowercase().ends_with(".lnk") && work_dir.is_none() {
+                return Err(bad("Choose the company folder this Miracle app opens."));
+            }
+            Ok(Some(host::PROFILE_MIRACLE))
+        }
+        other => Err(bad(&format!("Unknown app type \"{other}\"."))),
+    }
 }
 
 /// A data folder inside a Windows profile (C:\Users\...) can't be used by other
@@ -1227,8 +1298,9 @@ async fn create_app(
     if let Some(dir) = opt(&input.work_dir) {
         check_data_folder(dir)?;
     }
+    let profile = check_profile(&input.profile, opt(&input.program), opt(&input.work_dir))?;
     let id = db::create_app(
-        &state.pool, key, name, hostname, port, opt(&input.program), opt(&input.work_dir),
+        &state.pool, key, name, hostname, port, opt(&input.program), opt(&input.work_dir), profile,
     )
     .await?;
     Ok(Json(json!({ "id": id })))
@@ -1244,6 +1316,8 @@ struct EditApp {
     program: String,
     #[serde(default)]
     work_dir: String,
+    #[serde(default)]
+    profile: String,
 }
 
 async fn update_app(
@@ -1267,11 +1341,12 @@ async fn update_app(
     if let Some(dir) = opt(&input.work_dir) {
         check_data_folder(dir)?;
     }
+    let profile = check_profile(&input.profile, opt(&input.program), opt(&input.work_dir))?;
     if db::app_by_id(&state.pool, id).await?.is_none() {
         return Err(fail(StatusCode::NOT_FOUND, "That app no longer exists."));
     }
     db::update_app(
-        &state.pool, id, name, hostname, port, opt(&input.program), opt(&input.work_dir),
+        &state.pool, id, name, hostname, port, opt(&input.program), opt(&input.work_dir), profile,
     )
     .await?;
     // Users who have this app get the new program and folder.

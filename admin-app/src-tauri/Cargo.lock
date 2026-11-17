@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "access-portal-admin"
-version = "0.2.15"
+version = "0.2.17"
 dependencies = [
  "access-portal",
  "anyhow",

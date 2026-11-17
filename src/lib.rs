@@ -199,6 +199,10 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
     })
 }
 
+/// Black-screen sessions already asked to close (logged once, asked every check).
+static ASKED_TO_CLOSE: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 /// Sign out the Windows sessions of portal users that have been disconnected
 /// longer than the app's setting allows. Never touches administrator accounts
 /// or accounts that aren't a portal user's.
@@ -209,6 +213,7 @@ async fn sign_out_disconnected(state: &AppState) {
     }
     let Ok(users) = db::list_users(&state.pool).await else { return };
     let sessions = tokio::task::spawn_blocking(host::windows_sessions_blocking).await.unwrap_or_default();
+    let kiosk = tokio::task::spawn_blocking(host::kiosk_sessions_blocking).await.unwrap_or_default();
     let limit = u64::from(hours) * 3600;
     let mut ids = Vec::new();
     for s in sessions {
@@ -216,6 +221,28 @@ async fn sign_out_disconnected(state: &AppState) {
             continue;
         }
         let Some(user) = users.iter().find(|u| u.win_username.eq_ignore_ascii_case(&s.user)) else { continue };
+        if kiosk.contains(&s.id) {
+            // A black-screen program: ask it to close safely and never force.
+            // If it has unsaved work it stays open; the next check asks again.
+            let first = ASKED_TO_CLOSE.lock().unwrap().insert(s.id);
+            if let Err(e) = host::request_close(&s.user) {
+                tracing::warn!("could not ask {}'s program to close: {e}", s.user);
+            } else if first {
+                activity::log(
+                    &state.pool,
+                    Some(user.id),
+                    &user.username,
+                    "auto_signout",
+                    &format!(
+                        "Asked their app to close after {} disconnected (it stays open if it has unsaved work)",
+                        activity::duration(s.disconnected_secs as i64)
+                    ),
+                    "this computer",
+                )
+                .await;
+            }
+            continue;
+        }
         ids.push(s.id);
         activity::log(
             &state.pool,

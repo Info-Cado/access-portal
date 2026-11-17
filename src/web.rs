@@ -302,6 +302,7 @@ async fn allowed_app(state: &AppState, user: &User, key: &str) -> Result<Result<
             // The Desktop entry is the full Windows desktop, never a kiosk app.
             program: None,
             work_dir: None,
+            profile: None,
             created_at: 0,
         }));
     }

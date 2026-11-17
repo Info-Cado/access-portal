@@ -44,6 +44,32 @@ pub async fn read_shortcut(path: String) -> Result<Value, String> {
     }
 }
 
+/// Where Miracle is installed on this computer, if it can be found: the usual
+/// folder first, then any folder on C:\ whose name mentions Miracle (and its
+/// "installation" subfolder).
+#[tauri::command]
+pub fn find_miracle() -> Option<String> {
+    let usual = std::path::Path::new(r"C:\Miracle-Ready\installation\miracle.exe");
+    if usual.is_file() {
+        return Some(usual.display().to_string());
+    }
+    let mut found: Vec<std::path::PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(r"C:\").ok()?.flatten() {
+        let dir = entry.path();
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if !dir.is_dir() || !name.contains("miracle") {
+            continue;
+        }
+        for candidate in [dir.join("miracle.exe"), dir.join("installation").join("miracle.exe")] {
+            if candidate.is_file() {
+                found.push(candidate);
+            }
+        }
+    }
+    found.sort();
+    found.first().map(|p| p.display().to_string())
+}
+
 /// The last argument that is an existing folder, e.g. `C:\Miracle-Companies\Kelvin`
 /// in `02 "0" "C:\Miracle-Companies\Kelvin"`.
 fn folder_in_args(args: &str) -> Option<String> {

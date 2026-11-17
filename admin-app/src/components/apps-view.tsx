@@ -25,7 +25,7 @@ import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/c
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, errorText, pickFolder, pickProgram, readShortcut, type PortalApp } from "@/lib/api"
+import { api, errorText, findMiracle, pickFolder, pickProgram, readShortcut, type PortalApp } from "@/lib/api"
 
 export function AppsView({ data, reload }: ViewProps) {
   const [creating, setCreating] = useState(false)
@@ -88,7 +88,10 @@ export function AppsView({ data, reload }: ViewProps) {
                         </div>
                         {app.program && (
                           <div className="text-xs">
-                            Black screen: <span className="font-mono">{app.program}</span>
+                            {app.profile === "miracle" ? "Miracle" : "Black screen"}:{" "}
+                            <span className="font-mono">
+                              {app.profile === "miracle" && app.work_dir ? app.work_dir : app.program}
+                            </span>
                           </div>
                         )}
                       </TableCell>
@@ -157,7 +160,7 @@ export function AppsView({ data, reload }: ViewProps) {
   )
 }
 
-const blank = { name: "", key: "", hostname: "127.0.0.1", port: "", program: "", work_dir: "" }
+const blank = { name: "", key: "", hostname: "127.0.0.1", port: "", program: "", work_dir: "", profile: "miracle" }
 
 /** "Tally Prime" -> "tally-prime": a starting point for the link key. */
 function keyFrom(name: string) {
@@ -195,11 +198,28 @@ function NewAppDialog({
         port: editing.port === "3389" ? "" : editing.port,
         program: editing.program ?? "",
         work_dir: editing.work_dir ?? "",
+        profile: editing.profile === "miracle" ? "miracle" : "generic",
       })
       setKeyTyped(true)
       setError("")
     }
   }, [open, editing])
+
+  const miracle = form.profile === "miracle"
+
+  // A Miracle app starts out with Miracle's program, when it can be found here.
+  useEffect(() => {
+    if (!open || !miracle || form.program) return
+    let stale = false
+    findMiracle()
+      .then((path) => {
+        if (path && !stale) setForm((f) => (f.program ? f : { ...f, program: path }))
+      })
+      .catch(() => {})
+    return () => {
+      stale = true
+    }
+  }, [open, miracle, form.program])
 
   const close = (next: boolean) => {
     if (busy) return
@@ -221,7 +241,7 @@ function NewAppDialog({
         const link = await readShortcut(path)
         if (link.data_folder) {
           setForm((f) => ({ ...f, work_dir: link.data_folder ?? f.work_dir }))
-          toast.success("Data folder filled in from the shortcut")
+          toast.success(`${miracle ? "Company" : "Data"} folder filled in from the shortcut`)
         }
       }
     } catch (e) {
@@ -231,7 +251,8 @@ function NewAppDialog({
 
   const browseFolder = async () => {
     try {
-      const path = await pickFolder("Choose the folder with this user’s company files", form.work_dir || "C:\\")
+      const title = miracle ? "Choose the Miracle company folder" : "Choose the folder with this user’s files"
+      const path = await pickFolder(title, form.work_dir || "C:\\")
       if (path) setForm((f) => ({ ...f, work_dir: path }))
     } catch (e) {
       setError(errorText(e))
@@ -262,7 +283,10 @@ function NewAppDialog({
 
   return (
     <Dialog open={open} onOpenChange={close}>
-      <DialogContent>
+      {/* A form: closes only with Cancel, X or Esc. In the desktop app a stray
+          outside focus event (the tooltip of the button that opened it, a
+          native picker) would otherwise close it a moment after opening. */}
+      <DialogContent onInteractOutside={(e) => e.preventDefault()}>
         <form onSubmit={submit} autoComplete="off" className="contents">
           <DialogHeader>
             <DialogTitle>{editing ? `Edit ${editing.name}` : "New app"}</DialogTitle>
@@ -326,12 +350,38 @@ function NewAppDialog({
               </Field>
             </div>
             <Field>
-              <FieldLabel htmlFor="na-program">Program (optional)</FieldLabel>
+              <FieldLabel>App type</FieldLabel>
+              <div className="flex gap-2" role="group" aria-label="App type">
+                <Button
+                  type="button"
+                  variant={miracle ? "default" : "outline"}
+                  aria-pressed={miracle}
+                  onClick={() => setForm((f) => ({ ...f, profile: "miracle" }))}
+                >
+                  Miracle
+                </Button>
+                <Button
+                  type="button"
+                  variant={miracle ? "outline" : "default"}
+                  aria-pressed={!miracle}
+                  onClick={() => setForm((f) => ({ ...f, profile: "generic" }))}
+                >
+                  Other program
+                </Button>
+              </div>
+              <FieldDescription>
+                {miracle
+                  ? "Miracle opens straight on the company folder below, on a black screen, and is closed the safe way (it never loses unsaved work)."
+                  : "Any other program: opened on a black screen as given, and closed with a normal close request."}
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="na-program">{miracle ? "Miracle program" : "Program (optional)"}</FieldLabel>
               <div className="flex gap-2">
                 <Input
                   id="na-program"
                   value={form.program}
-                  placeholder="Choose a Miracle shortcut or a program"
+                  placeholder={miracle ? "miracle.exe, or a shortcut Miracle made" : "Choose a program or a shortcut"}
                   spellCheck={false}
                   onChange={(e) => setForm((f) => ({ ...f, program: e.target.value }))}
                 />
@@ -341,19 +391,19 @@ function NewAppDialog({
                 </Button>
               </div>
               <FieldDescription>
-                Leave blank for the Windows desktop. Set it to a program, or to a shortcut
-                Miracle made for a company folder, and the user opens just that on a black
-                screen — no desktop — signing out when it closes. Needs the user’s Windows
-                account set to restricted.
+                {miracle
+                  ? "Filled in automatically when Miracle is found on this computer. A shortcut Miracle made also works."
+                  : "Leave blank for the Windows desktop. Set it and the user opens just this program on a black screen — no desktop — signing out when it closes."}{" "}
+                Needs the user’s Windows account set to restricted.
               </FieldDescription>
             </Field>
             <Field>
-              <FieldLabel htmlFor="na-workdir">Data folder</FieldLabel>
+              <FieldLabel htmlFor="na-workdir">{miracle ? "Company folder" : "Data folder"}</FieldLabel>
               <div className="flex gap-2">
                 <Input
                   id="na-workdir"
                   value={form.work_dir}
-                  placeholder="Choose the folder with this user’s company files"
+                  placeholder={miracle ? "The folder with this user’s company (CMP…) folders" : "Choose the folder with this user’s files"}
                   spellCheck={false}
                   onChange={(e) => setForm((f) => ({ ...f, work_dir: e.target.value }))}
                 />
@@ -363,9 +413,8 @@ function NewAppDialog({
                 </Button>
               </div>
               <FieldDescription>
-                The folder with this user’s company files (for a Miracle shortcut, the folder
-                it opens). Only users given this app can reach it — not the program’s own
-                folder, which everyone needs.
+                {miracle ? "Miracle opens this folder. " : ""}Only users given this app can reach it — not
+                the program’s own folder, which everyone needs.
               </FieldDescription>
             </Field>
             {error && <FieldError>{error}</FieldError>}

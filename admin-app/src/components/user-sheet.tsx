@@ -37,7 +37,7 @@ import {
 } from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
-import { api, errorText, since, type PortalState, type PortalUser, type TotpSetup } from "@/lib/api"
+import { api, ApiError, errorText, since, type PortalState, type PortalUser, type TotpSetup } from "@/lib/api"
 
 /** Blocks at or beyond this (unix seconds, ~year 3000) mean "until unblocked". */
 const FAR_FUTURE = 32_503_680_000
@@ -395,17 +395,58 @@ function UserDetails({
                     setConfirmation({
                       title: `Sign ${user.username} out?`,
                       description:
-                        "This disconnects them, ends their portal sign-in and signs their Windows account out. Their apps close and unsaved work is lost.",
+                        "This disconnects them, ends their portal sign-in and signs their Windows account out. A black-screen app is closed the safe way first; if it has unsaved work open you’ll be asked before anything is forced.",
                       action: "Sign out",
                       run: async () => {
-                        await api("POST", `${base}/sign-out`)
-                        await reload()
-                        toast.success(`${user.username} signed out`)
+                        try {
+                          await api("POST", `${base}/sign-out`)
+                          await reload()
+                          toast.success(`${user.username} signed out`)
+                        } catch (e) {
+                          if (!(e instanceof ApiError) || e.status !== 409) throw e
+                          await reload()
+                          // Their app refused to close (unsaved work): offer the hard way.
+                          setTimeout(
+                            () =>
+                              setConfirmation({
+                                title: `Force ${user.username}'s sign-out?`,
+                                description: `${e.message} Forcing it closes the app at once: their unsaved work is lost, and the app's data files may be left damaged.`,
+                                action: "Force sign out",
+                                run: async () => {
+                                  await api("POST", `${base}/sign-out?force=1`)
+                                  await reload()
+                                  toast.success(`${user.username} signed out (forced)`)
+                                },
+                              }),
+                            0,
+                          )
+                        }
                       },
                     })
                   }
                 >
                   Sign out of Windows
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="self-start text-destructive"
+                  disabled={busy}
+                  onClick={() =>
+                    setConfirmation({
+                      title: `Force-quit ${user.username}'s apps?`,
+                      description:
+                        "Closes their apps at once and signs Windows out, without the safe close. Use it only when an app is stuck: unsaved work is lost, and the app’s data files (Miracle’s company data, for example) can be left damaged.",
+                      action: "Force quit",
+                      run: async () => {
+                        await api("POST", `${base}/sign-out?force=1`)
+                        await reload()
+                        toast.success(`${user.username}'s apps were force-quit`)
+                      },
+                    })
+                  }
+                >
+                  Force quit
                 </Button>
               </FieldSet>
             </>

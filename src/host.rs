@@ -27,7 +27,7 @@ static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// The account's mode: `"app"`, `"full"`, or `"missing"` when no local Windows
 /// account has that name.
 pub async fn desktop_mode(win_username: &str) -> Result<String> {
-    remember(win_username, run("read", win_username, None, None, None).await)
+    remember(win_username, run("read", win_username, None, None).await)
 }
 
 /// [`desktop_mode`], answered from memory when it was read in the last
@@ -66,30 +66,41 @@ fn remember(win_username: &str, mode: Result<String>) -> Result<String> {
 
 /// Switch the account to a full desktop (`true`) or restrict it (`false`).
 /// Returns the mode now in effect.
-pub async fn set_desktop_mode(
-    win_username: &str,
-    full: bool,
-    program: Option<&str>,
-    work_dir: Option<&str>,
-) -> Result<String> {
-    let (program, work_dir) = if full { (None, None) } else { (program, work_dir) };
-    remember(
-        win_username,
-        run(if full { "full" } else { "app" }, win_username, None, program, work_dir).await,
-    )
+pub async fn set_desktop_mode(win_username: &str, full: bool, launch: Option<&Launch>) -> Result<String> {
+    let launch = if full { None } else { launch };
+    #[cfg(windows)]
+    if launch.is_some() {
+        tokio::task::spawn_blocking(install_launcher_files).await??;
+    }
+    remember(win_username, run(if full { "full" } else { "app" }, win_username, None, launch).await)
 }
+
+/// The program a restricted (black-screen) account opens.
+#[derive(Clone, Debug, Default)]
+pub struct Launch {
+    /// A program or a shortcut to one.
+    pub program: String,
+    /// The app's data folder (for Miracle, the company folder it opens).
+    pub work_dir: Option<String>,
+    /// "miracle", or None for any other program (see [`PROFILE_MIRACLE`]).
+    pub profile: Option<String>,
+}
+
+/// The Miracle accounting program: opened on the app's company folder and
+/// closed the way Miracle needs (see CLOSER_PS1).
+pub const PROFILE_MIRACLE: &str = "miracle";
 
 /// Create a local Windows account for a portal user: a standard user in the
 /// "Portal RDP Users" group, password never expires, restricted.
 pub async fn create_account(win_username: &str, password: &str) -> Result<()> {
     check_account_name(win_username)?;
-    remember(win_username, run("create", win_username, Some(password), None, None).await).map(|_| ())
+    remember(win_username, run("create", win_username, Some(password), None).await).map(|_| ())
 }
 
 /// Delete a Windows account the portal manages (a member of "Portal RDP Users",
 /// never an administrator) and its profile folder.
 pub async fn delete_account(win_username: &str) -> Result<()> {
-    remember(win_username, run("delete", win_username, None, None, None).await).map(|_| ())
+    remember(win_username, run("delete", win_username, None, None).await).map(|_| ())
 }
 
 /// Windows' rules for local account names.
@@ -113,8 +124,7 @@ async fn run(
     action: &str,
     win_username: &str,
     password: Option<&str>,
-    program: Option<&str>,
-    work_dir: Option<&str>,
+    launch: Option<&Launch>,
 ) -> Result<String> {
     use base64::Engine;
     use std::time::Duration;
@@ -134,8 +144,9 @@ async fn run(
         .env("AP_WINUSER", win_username)
         .env("AP_ACTION", action)
         .env("AP_PASSWORD", password.unwrap_or(""))
-        .env("AP_PROGRAM", program.unwrap_or(""))
-        .env("AP_WORKDIR", work_dir.unwrap_or(""))
+        .env("AP_PROGRAM", launch.map(|l| l.program.as_str()).unwrap_or(""))
+        .env("AP_WORKDIR", launch.and_then(|l| l.work_dir.as_deref()).unwrap_or(""))
+        .env("AP_PROFILE", launch.and_then(|l| l.profile.as_deref()).unwrap_or(""))
         .creation_flags(CREATE_NO_WINDOW)
         .kill_on_drop(true)
         .output();
@@ -165,8 +176,7 @@ async fn run(
     _action: &str,
     _win_username: &str,
     _password: Option<&str>,
-    _program: Option<&str>,
-    _work_dir: Option<&str>,
+    _launch: Option<&Launch>,
 ) -> Result<String> {
     bail!("Windows accounts can only be changed when the portal runs on Windows.")
 }
@@ -391,32 +401,8 @@ $marker   = 'Software\AccessPortal'
 # Not in the portal's data folder: that one is admins-only (it holds the
 # database). This folder is readable by every user and writable only by admins.
 $launcher = Join-Path $env:ProgramData 'AccessPortal-Shell\app-shell.vbs'
-# The launcher reads the program and its folder from the account's own settings
-# (written below) so one launcher file serves every account.
-$launcherVbs = @'
-Option Explicit
-Dim sh, prog, args, work
-Set sh = CreateObject("WScript.Shell")
-prog = ""
-args = ""
-work = ""
-On Error Resume Next
-prog = sh.RegRead("HKCU\Software\AccessPortal\Program")
-args = sh.RegRead("HKCU\Software\AccessPortal\Args")
-work = sh.RegRead("HKCU\Software\AccessPortal\WorkDir")
-On Error GoTo 0
-If prog = "" Then
-  sh.Run "explorer.exe"
-Else
-  If work <> "" Then sh.CurrentDirectory = work
-  If args <> "" Then
-    sh.Run """" & prog & """ " & args, 1, True
-  Else
-    sh.Run """" & prog & """", 1, True
-  End If
-  sh.Run "shutdown.exe /l", 0, False
-End If
-'@
+# The launcher (app-shell.vbs) and its closer are written by the portal
+# itself (install_launcher_files) before this script runs.
 
 $winlogon = 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon'
 $explorer = 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
@@ -529,27 +515,30 @@ try {
         }
         if (-not (Test-Path -LiteralPath $prog)) { throw "The program '$prog' does not exist." }
         if (-not $progDir) { $progDir = Split-Path $prog }
-        $launcherDir = Split-Path $launcher
-        New-Item -ItemType Directory -Path $launcherDir -Force | Out-Null
-        # Users may read and run the launcher but never change it.
-        & icacls $launcherDir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' /Q | Out-Null
-        Set-Content -LiteralPath $launcher -Value $launcherVbs -Encoding ASCII
+        # Miracle opens a company folder given as its third argument (what its
+        # own "create shortcut" writes), so miracle.exe plus the app's data
+        # folder is enough; a shortcut's own arguments win when there are some.
+        if ($env:AP_PROFILE -eq 'miracle' -and -not $progArgs -and $env:AP_WORKDIR) {
+          $progArgs = '02 "0" "' + $env:AP_WORKDIR.TrimEnd('\') + '"'
+        }
+        if (-not (Test-Path -LiteralPath $launcher)) { throw "The launcher $launcher is missing." }
         $m = $hku.CreateSubKey("$hive\$marker")
         $m.SetValue('Program', $prog, 'String')
         $m.SetValue('Args', $progArgs, 'String')
         $m.SetValue('WorkDir', $progDir, 'String')
+        $m.SetValue('Profile', [string]$env:AP_PROFILE, 'String')
         $m.Dispose()
         $wl.SetValue('Shell', 'wscript.exe "' + $launcher + '"', 'String')
       } else {
         $m = $hku.OpenSubKey("$hive\$marker", $true)
-        if ($m) { foreach ($v in 'Program','Args','WorkDir') { $m.DeleteValue($v, $false) }; $m.Dispose() }
+        if ($m) { foreach ($v in 'Program','Args','WorkDir','Profile') { $m.DeleteValue($v, $false) }; $m.Dispose() }
       }
       $wl.Dispose()
     }
     elseif ($action -eq 'full') {
       # Remove exactly what 'app' sets; other settings of the account stay.
       $remove = @{
-        $marker   = @('Restricted','Program','Args','WorkDir')
+        $marker   = @('Restricted','Program','Args','WorkDir','Profile')
         $explorer = @('NoRun','NoControlPanel','NoWinKeys','NoViewContextMenu','DisallowRun','NoDrives','NoViewOnDrive')
         $system   = @('DisableTaskMgr','DisableRegistryTools')
         $cmdPol   = @('DisableCMD')
@@ -698,6 +687,251 @@ $n
         let _ = win_username;
         0
     }
+}
+
+/// The black-screen launcher, set as a restricted account's shell. It starts the
+/// account's program (HKCU\Software\AccessPortal: Program, Args, WorkDir),
+/// watches for the portal's close request and runs app-close.ps1 when one comes,
+/// and signs the session out once the program has closed.
+const LAUNCHER_VBS: &str = r##"Option Explicit
+Dim sh, fso, here, prog, args, work, profile, cmd, ex, req, closer, started, asked, stamp, logPath, helper
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+' A short log in the user's own temp folder, for diagnosing (admins can read it).
+logPath = sh.ExpandEnvironmentStrings("%TEMP%") & "\access-portal-launcher.log"
+Sub Note(text)
+  On Error Resume Next
+  Dim f
+  Set f = fso.OpenTextFile(logPath, 8, True)
+  f.WriteLine Now & "  " & text
+  f.Close
+End Sub
+prog = ""
+args = ""
+work = ""
+profile = ""
+On Error Resume Next
+prog = sh.RegRead("HKCU\Software\AccessPortal\Program")
+args = sh.RegRead("HKCU\Software\AccessPortal\Args")
+work = sh.RegRead("HKCU\Software\AccessPortal\WorkDir")
+profile = sh.RegRead("HKCU\Software\AccessPortal\Profile")
+On Error GoTo 0
+If profile = "" Then profile = "generic"
+If prog = "" Then
+  sh.Run "explorer.exe"
+  WScript.Quit
+End If
+If work <> "" Then sh.CurrentDirectory = work
+cmd = """" & prog & """"
+If args <> "" Then cmd = cmd & " " & args
+' The portal asks for a safe close by writing this file (only admins can write
+' there); app-close.ps1 then walks the program through its own exit.
+here = fso.GetParentFolderName(WScript.ScriptFullName)
+req = here & "\close\" & LCase(sh.ExpandEnvironmentStrings("%USERNAME%")) & ".req"
+closer = here & "\app-close.ps1"
+started = Now
+asked = ""
+Set ex = sh.Exec(cmd)
+Note "started " & cmd & " (pid " & ex.ProcessID & ", profile " & profile & ")"
+Do While ex.Status = 0
+  WScript.Sleep 1000
+  If fso.FileExists(req) Then
+    stamp = CStr(fso.GetFile(req).DateLastModified)
+    If CDate(stamp) >= started And stamp <> asked Then
+      asked = stamp
+      Note "close requested (" & stamp & "): running app-close.ps1"
+      ' Exec, not Run: Run goes through the shell, which refuses programs the
+      ' account's restrictions block (powershell is one); conhost --headless
+      ' keeps the closer's console from showing.
+      On Error Resume Next
+      Set helper = sh.Exec("conhost.exe --headless powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File """ & closer & """ -ProcessId " & ex.ProcessID & " -AppProfile " & profile)
+      If Err.Number <> 0 Then
+        Note "could not start app-close.ps1: " & Err.Description
+        Err.Clear
+      Else
+        Do While helper.Status = 0
+          WScript.Sleep 300
+        Loop
+        Note "app-close.ps1 finished (exit " & helper.ExitCode & ")"
+      End If
+      On Error GoTo 0
+    End If
+  End If
+Loop
+Note "program closed: signing out"
+' The program has closed: end the session.
+sh.Run "shutdown.exe /l", 0, False"##;
+
+/// Closes the program the way a person would, so it shuts down cleanly (an
+/// accounting program killed with its tables open can corrupt them). If the
+/// program is still running afterwards it has unsaved work open, and it is left
+/// alone. Per profile:
+///
+/// - generic: one close request (WM_CLOSE), like clicking the window's X. A
+///   program that asks "save changes?" keeps waiting, so it counts as busy.
+/// - miracle (tested on Miracle 9.0): Esc closes lists and reports; on a form
+///   with unsaved changes it only asks "Exit without save?" and a second Esc
+///   answers No, so unsaved work is never thrown away. Then the close request,
+///   and one more Esc skips Miracle's backup-on-exit question (or dismisses
+///   "can't close while windows are open"). Enter is never sent: it is the only
+///   key that could confirm discarding work.
+const CLOSER_PS1: &str = r##"param([int]$ProcessId, [string]$AppProfile = 'generic')
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public static class ApClose {
+  delegate bool EP(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EP cb, IntPtr l);
+  [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr h, out int p);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  public static IntPtr MainOf(int pid) {
+    IntPtr f = IntPtr.Zero;
+    EnumWindows((h, l) => { int p; GetWindowThreadProcessId(h, out p); if (p == pid && IsWindowVisible(h)) { f = h; return false; } return true; }, IntPtr.Zero);
+    return f;
+  }
+  public static void Esc(IntPtr h) {
+    PostMessage(h, 0x100, (IntPtr)0x1B, (IntPtr)1);
+    PostMessage(h, 0x101, (IntPtr)0x1B, (IntPtr)unchecked((int)0xC0000001));
+  }
+}
+"@
+$h = [ApClose]::MainOf($ProcessId)
+if ($h -eq [IntPtr]::Zero) { exit 1 }
+if ($AppProfile -eq 'miracle') {
+  for ($i = 0; $i -lt 6; $i++) { [ApClose]::Esc($h); Start-Sleep -Milliseconds 800 }
+  $h = [ApClose]::MainOf($ProcessId)
+  if ($h -eq [IntPtr]::Zero) { exit 0 }
+  [void][ApClose]::PostMessage($h, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
+  Start-Sleep -Milliseconds 1500
+  [ApClose]::Esc($h)
+} else {
+  [void][ApClose]::PostMessage($h, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
+}"##;
+
+/// The folder holding the launcher: readable by every user, writable by admins.
+fn shell_dir() -> std::path::PathBuf {
+    std::env::var_os("ProgramData")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| r"C:\ProgramData".into())
+        .join("AccessPortal-Shell")
+}
+
+/// Write the launcher, its closer and the close-request folder. Not part of the
+/// account script, which travels on PowerShell's command line (32k limit).
+#[cfg(windows)]
+fn install_launcher_files() -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    let dir = shell_dir();
+    std::fs::create_dir_all(dir.join("close")).with_context(|| format!("creating {}", dir.display()))?;
+    // Users may read and run the launcher but never change it.
+    let ok = std::process::Command::new("icacls")
+        .arg(&dir)
+        .args(["/inheritance:r", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX", "/Q"])
+        .creation_flags(0x0800_0000)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        bail!("Could not set the permissions of {}.", dir.display());
+    }
+    let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+    std::fs::write(dir.join("app-shell.vbs"), crlf(LAUNCHER_VBS)).context("writing the launcher")?;
+    std::fs::write(dir.join("app-close.ps1"), crlf(CLOSER_PS1)).context("writing the launcher's closer")?;
+    Ok(())
+}
+
+/// How a safe close of a user's black-screen program ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeClose {
+    /// The account has no Windows session.
+    NoSession,
+    /// The program closed itself cleanly and the session ended.
+    Closed,
+    /// The program is still open: it has unsaved work (it refuses to close).
+    Busy,
+    /// The session isn't a black-screen one (a desktop): this doesn't apply.
+    NotKiosk,
+}
+
+/// Where the portal asks a session's launcher to close its program.
+fn close_request_path(win_username: &str) -> std::path::PathBuf {
+    let base = std::env::var_os("ProgramData").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\ProgramData".into());
+    base.join("AccessPortal-Shell").join("close").join(format!("{}.req", win_username.to_lowercase()))
+}
+
+/// Ask the launcher in this account's sessions to close its program safely (it
+/// checks every second). Doesn't wait. The request is a file only admins can
+/// write; the launcher acts on each new one once.
+pub fn request_close(win_username: &str) -> std::io::Result<()> {
+    let path = close_request_path(win_username);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, format!("{:?}", std::time::SystemTime::now()))
+}
+
+fn clear_close_request(win_username: &str) {
+    let _ = std::fs::remove_file(close_request_path(win_username));
+}
+
+/// Session ids running the black-screen launcher.
+pub fn kiosk_sessions_blocking() -> Vec<u32> {
+    #[cfg(windows)]
+    {
+        const SCRIPT: &str = r#"
+$ids = @(Get-CimInstance Win32_Process -Filter "Name='wscript.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -like '*app-shell.vbs*' } | ForEach-Object { [int]$_.SessionId })
+ConvertTo-Json -Compress -InputObject $ids
+"#;
+        let out = powershell_blocking(SCRIPT, &[]).unwrap_or_default();
+        let last = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("[]").trim();
+        serde_json::from_str::<Vec<u32>>(last)
+            .or_else(|_| serde_json::from_str::<u32>(last).map(|one| vec![one]))
+            .unwrap_or_default()
+    }
+    #[cfg(not(windows))]
+    Vec::new()
+}
+
+/// This account's sessions that run the black-screen launcher.
+fn kiosk_sessions_of(win_username: &str) -> (usize, Vec<u32>) {
+    let mine: Vec<u32> = windows_sessions_blocking()
+        .into_iter()
+        .filter(|s| s.user.eq_ignore_ascii_case(win_username))
+        .map(|s| s.id)
+        .collect();
+    let kiosk = kiosk_sessions_blocking();
+    let both = mine.iter().copied().filter(|id| kiosk.contains(id)).collect();
+    (mine.len(), both)
+}
+
+/// Close this account's black-screen program the way a person would, and wait
+/// up to `timeout` for it (and so the session) to end. Never forces anything:
+/// a program with unsaved work stays open and the answer is `Busy`.
+pub fn close_safely_blocking(win_username: &str, timeout: std::time::Duration) -> SafeClose {
+    let (sessions, kiosk) = kiosk_sessions_of(win_username);
+    if sessions == 0 {
+        return SafeClose::NoSession;
+    }
+    if kiosk.is_empty() {
+        return SafeClose::NotKiosk;
+    }
+    if let Err(e) = request_close(win_username) {
+        tracing::warn!("could not ask {win_username}'s program to close: {e}");
+        return SafeClose::Busy;
+    }
+    let start = std::time::Instant::now();
+    let outcome = loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if kiosk_sessions_of(win_username).1.is_empty() {
+            break SafeClose::Closed;
+        }
+        if start.elapsed() >= timeout {
+            break SafeClose::Busy;
+        }
+    };
+    clear_close_request(win_username);
+    tracing::info!("safe close of {win_username}'s program: {outcome:?}");
+    outcome
 }
 
 /// Give a Windows account exclusive access to one data folder: the account (and

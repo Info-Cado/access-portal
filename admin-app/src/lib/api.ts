@@ -74,6 +74,8 @@ export type PortalApp = {
   program: string | null
   /** The program's folder, and the only folder the user's account is granted. */
   work_dir: string | null
+  /** "miracle" for Miracle (opened on its company folder, closed safely); null for any other program. */
+  profile: string | null
 }
 
 export type PortalState = {
@@ -206,6 +208,11 @@ export async function pickFolder(title: string, start?: string): Promise<string 
 }
 
 export type Shortcut = { target: string; args: string; work_dir: string; data_folder: string | null }
+
+/** Where Miracle is installed on this computer, if it can be found. */
+export function findMiracle(): Promise<string | null> {
+  return invoke("find_miracle")
+}
 
 /** What a shortcut runs, and the folder it opens (for a Miracle company shortcut). */
 export function readShortcut(path: string): Promise<Shortcut> {
