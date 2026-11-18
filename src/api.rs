@@ -329,7 +329,18 @@ async fn create_windows_account(
     db::set_windows_login(&state.pool, &state.config, id, &user.win_username, &password).await?;
     tracing::info!("created windows account {} for portal user {}", user.win_username, user.username);
     // New accounts start restricted: set up their black-screen program now.
-    apply_app_access(&state, &user).await?;
+    // The account already exists at this point, so a failure here must not
+    // read as "the account wasn't created" (a retry would then fail with
+    // "already exists"); it is logged, and saving the apps again retries it.
+    if let Err(e) = apply_app_access(&state, &user).await {
+        tracing::warn!("setting up the apps of the new account {}: {}", user.win_username, e.1);
+        activity::admin(
+            &state.pool,
+            Some(&user),
+            "Created their Windows account, but their app could not be set up yet (save their apps again)",
+        )
+        .await;
+    }
     Ok(Json(json!({ "mode": "app" })))
 }
 
