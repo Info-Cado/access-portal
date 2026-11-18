@@ -22,10 +22,12 @@ pub struct Sessions {
 
 impl Default for Sessions {
     fn default() -> Self {
-        // Disconnecting an idle browser loses nothing (the apps keep running);
-        // signing out closes apps, so that one is off until chosen. Viewing a
+        // Disconnecting an idle browser loses nothing (the apps keep running).
+        // A Windows session left disconnected for 8 hours is signed out, because
+        // a forgotten session holds 0.3-1.5 GB of memory; black-screen programs
+        // are only asked to close (one with unsaved work stays open). Viewing a
         // screen asks the user first unless the admin turns that off.
-        Self { idle_minutes: 60, signout_hours: 0, shadow_consent: false }
+        Self { idle_minutes: 60, signout_hours: 8, shadow_consent: false }
     }
 }
 

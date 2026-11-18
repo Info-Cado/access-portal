@@ -23,6 +23,7 @@ mod models;
 mod network;
 mod presence;
 mod print;
+pub mod progress;
 mod rdp;
 mod settings;
 mod sound;
@@ -30,6 +31,8 @@ mod tiles;
 mod transport;
 mod video;
 mod web;
+#[cfg(windows)]
+mod win;
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -273,6 +276,22 @@ async fn sign_out_disconnected(state: &AppState) {
 impl Portal {
     /// One admin API call, made in-process. Answers `(status, json)`.
     pub async fn admin(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        self.admin_inner(method, path, body).await
+    }
+
+    /// [`Portal::admin`], with `sink` receiving the steps of a long action
+    /// ("Closing Miracle…") while it runs, for the app to show.
+    pub async fn admin_with_progress(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        sink: progress::Sink,
+    ) -> (u16, Value) {
+        progress::scope(sink, self.admin_inner(method, path, body)).await
+    }
+
+    async fn admin_inner(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let Ok(method) = Method::from_str(method) else {
             return (400, json!({ "error": "Unknown request method." }));
         };

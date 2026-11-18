@@ -1261,17 +1261,13 @@ async fn session(
                         // A black-screen program is closed the safe way and never
                         // forced; a desktop is signed out as before.
                         let user = extras.win_username.clone();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            match crate::host::close_safely_blocking(&user, Duration::from_secs(40)) {
-                                crate::host::SafeClose::NotKiosk => {
-                                    crate::host::sign_out_blocking(&user);
-                                    crate::host::SafeClose::Closed
-                                }
-                                other => other,
+                        let outcome = match crate::host::close_safely(&user, "your app", Duration::from_secs(40)).await {
+                            crate::host::SafeClose::NotKiosk => {
+                                tokio::task::spawn_blocking(move || crate::host::sign_out_blocking(&user)).await.ok();
+                                crate::host::SafeClose::Closed
                             }
-                        })
-                        .await
-                        .unwrap_or(crate::host::SafeClose::Busy);
+                            other => other,
+                        };
                         if outcome == crate::host::SafeClose::Busy {
                             return Ok("Your app still has a window with unsaved work open, so it was left running. \
                                        Sign in again, save and close that window, then sign out."

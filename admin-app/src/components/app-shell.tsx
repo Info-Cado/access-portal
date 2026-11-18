@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import {
   AppWindowIcon,
   HistoryIcon,
@@ -15,6 +15,7 @@ import { toast } from "sonner"
 import { ActivityView } from "@/components/activity-view"
 import { AppsView } from "@/components/apps-view"
 import { SettingsView } from "@/components/settings-view"
+import type { SetupCheck } from "@/components/setup-card"
 import { UsersView } from "@/components/users-view"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
@@ -42,6 +43,17 @@ type View = "users" | "apps" | "activity" | "settings"
 
 export type ViewProps = { data: PortalState; reload: () => Promise<void> }
 
+/** The "This computer" checks, shared by the problems banner and Settings. */
+export type SetupState = {
+  checks: SetupCheck[] | null
+  checking: boolean
+  error: string
+  /** Check again; answers the checks. */
+  check: () => Promise<void>
+  /** Take over checks a fix answered. */
+  setChecks: (checks: SetupCheck[]) => void
+}
+
 const TITLES: Record<View, string> = { users: "Users", apps: "Apps", activity: "Activity", settings: "Settings" }
 
 export function AppShell({
@@ -52,13 +64,27 @@ export function AppShell({
 }: ViewProps & { status: { address: string; public: PublicLink; elevated: boolean }; onLock: () => void }) {
   const [view, setView] = useState<View>("users")
   const [refreshing, setRefreshing] = useState(false)
-  // Is this computer fully set up? Checked once when the app is opened.
-  const [setupProblems, setSetupProblems] = useState(0)
+  // Is this computer fully set up? Checked once when the app is unlocked (this
+  // shell is shown only then); Settings shows the same result.
+  const [checks, setChecks] = useState<SetupCheck[] | null>(null)
+  const [checking, setChecking] = useState(true)
+  const [setupError, setSetupError] = useState("")
+  const checkSetup = useCallback(async () => {
+    setChecking(true)
+    try {
+      setChecks((await api<{ checks: SetupCheck[] }>("GET", "/api/admin/setup")).checks)
+      setSetupError("")
+    } catch (e) {
+      setSetupError(errorText(e))
+    } finally {
+      setChecking(false)
+    }
+  }, [])
   useEffect(() => {
-    api<{ checks: { ok: boolean; fix: string }[] }>("GET", "/api/admin/setup")
-      .then((r) => setSetupProblems(r.checks.filter((c) => !c.ok && c.fix).length))
-      .catch(() => {})
-  }, [view])
+    void checkSetup()
+  }, [checkSetup])
+  const setup: SetupState = { checks, checking, error: setupError, check: checkSetup, setChecks }
+  const setupProblems = checks?.filter((c) => !c.ok && c.fix).length ?? 0
 
   const [elevating, setElevating] = useState(false)
   const elevate = async () => {
@@ -197,7 +223,7 @@ export function AppShell({
           {view === "users" && <UsersView data={data} reload={reload} />}
           {view === "apps" && <AppsView data={data} reload={reload} />}
           {view === "activity" && <ActivityView data={data} reload={reload} />}
-          {view === "settings" && <SettingsView data={data} reload={reload} />}
+          {view === "settings" && <SettingsView data={data} reload={reload} setup={setup} />}
         </div>
       </SidebarInset>
     </SidebarProvider>

@@ -4,6 +4,8 @@ import { useEffect, useState } from "react"
 import { CheckIcon, CopyIcon } from "lucide-react"
 import { toast } from "sonner"
 
+import { Spinner } from "@/components/busy"
+
 import {
   AlertDialog,
   AlertDialogAction,
@@ -26,6 +28,7 @@ import {
 } from "@/components/ui/dialog"
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group"
+import { useAction } from "@/hooks/use-action"
 import { errorText, type TotpSetup } from "@/lib/api"
 
 export type Confirmation = {
@@ -34,8 +37,9 @@ export type Confirmation = {
   action: string
   /** An optional tick box shown above the buttons; its value goes to `run`. */
   option?: { label: string; checked: boolean }
-  /** Does the work; the dialog closes when it succeeds. */
-  run: (optionChecked: boolean) => Promise<void>
+  /** Does the work; the dialog closes when it succeeds. Steps passed to `onStep`
+   * are shown under the message while it runs. */
+  run: (optionChecked: boolean, onStep: (text: string) => void) => Promise<void>
 }
 
 /** Asks before something destructive. Pass `null` to keep it closed. */
@@ -46,20 +50,17 @@ export function ConfirmDialog({
   confirmation: Confirmation | null
   onClose: () => void
 }) {
-  const [busy, setBusy] = useState(false)
+  const { busy, step, run } = useAction()
   const [ticked, setTicked] = useState(false)
   useEffect(() => setTicked(confirmation?.option?.checked ?? false), [confirmation])
 
   const go = async () => {
     if (!confirmation) return
-    setBusy(true)
     try {
-      await confirmation.run(ticked)
+      await run((onStep) => confirmation.run(ticked, onStep))
       onClose()
     } catch (e) {
       toast.error(errorText(e))
-    } finally {
-      setBusy(false)
     }
   }
 
@@ -70,6 +71,11 @@ export function ConfirmDialog({
           <AlertDialogTitle>{confirmation?.title}</AlertDialogTitle>
           <AlertDialogDescription>{confirmation?.description}</AlertDialogDescription>
         </AlertDialogHeader>
+        {busy && step && (
+          <p aria-live="polite" className="line-clamp-2 text-sm font-medium">
+            {step}
+          </p>
+        )}
         {confirmation?.option && (
           <Field orientation="horizontal">
             <Checkbox
@@ -93,6 +99,7 @@ export function ConfirmDialog({
               void go()
             }}
           >
+            {busy && <Spinner />}
             {confirmation?.action}
           </AlertDialogAction>
         </AlertDialogFooter>

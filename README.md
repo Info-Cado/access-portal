@@ -111,8 +111,8 @@ The screen is a grid of 512-pixel blocks (aligned to the tile grid). A block tha
 stays busy for a few frames gets its own H.264 encoder (`openh264`) and is sent as
 a keyframe followed by delta frames, at up to ~33 fps; a block that goes quiet is
 torn down. Each packet carries the block, a generation (so a stale packet from a
-block's previous run is ignored), and a sequence number (the unordered channel is
-reassembled in order). The browser decodes each block with its own WebCodecs
+block's previous run is ignored), and a sequence number (so the browser can
+tell a missing packet). The browser decodes each block with its own WebCodecs
 `VideoDecoder` and draws it; a browser without WebCodecs H.264 simply gets the
 tile stream. Set `VIDEO=off` to disable it.
 
@@ -124,9 +124,9 @@ comes up within a few seconds it falls back to a WebSocket on `/ws/<app>`,
 carrying exactly the same messages. Hovering the Files button shows which one is
 in use.
 
-The direct channel is **unordered**, so a lost packet is resent without holding
-up the tiles behind it — the picture keeps moving on a lossy link instead of
-freezing. Tiles carry a batch sequence number, and the browser tracks the newest
+The direct channel is **ordered and reliable** (like the WebSocket), because
+video and drawing commands need their order: a lost packet is resent and
+everything after it waits for it. Tiles carry a batch sequence number, and the browser tracks the newest
 batch drawn into each 256-pixel cell, so a tile that arrives late (after a newer
 update to the same area) is skipped rather than overwriting fresher pixels. Up to
 `MAX_IN_FLIGHT` batches are sent before waiting for the browser to acknowledge
@@ -266,8 +266,10 @@ The window has four screens:
   - *This computer* — what the computer needs, with one-click fixes (above);
   - *Sessions* — disconnect idle sessions after a time without keyboard or
     mouse input (default 1 hour; a one-minute warning first; apps keep
-    running); sign out Windows sessions left disconnected (default never;
-    apps close; Windows administrator accounts never); ask before viewing a
+    running); sign out Windows sessions left disconnected (default 8 hours,
+    since a forgotten session holds 0.3–1.5 GB of memory; apps close, but a
+    black-screen program is only asked to close and stays open if it has
+    unsaved work; Windows administrator accounts never); ask before viewing a
     user's screen (default off — **View screen** and **Take control** start at
     once, with nothing shown to the user; turn it on to have Windows ask them
     first);
@@ -293,7 +295,13 @@ settings are removed and the portal also offers them **Desktop** (this
 computer's normal Windows desktop, `DESKTOP_HOST`, default `127.0.0.1:3389`).
 After signing in, a user with only the desktop or only one app goes straight
 to it; one with neither sees "Nothing is assigned to you". Windows
-administrator accounts are never restricted. A change applies from the user's next session. New users get a
+administrator accounts are never restricted. A change applies from the user's next session.
+Accounts the portal manages (in "Portal RDP Users", not administrators) also
+get **lean sessions** in both modes: their sign-in skips the programs set to
+start for every user of the computer (Windows' machine-wide Run and RunOnce
+lists, such as AnyDesk, the Tailscale tray or OneDrive setup), and OneDrive
+doesn't start for them, so sessions open faster and use less memory. The Full
+desktop switch never undoes this. New users get a
 Windows account of their own by default (a standard account in the "Portal RDP
 Users" group); deleting a user disconnects any session they have open and
 leaves the Windows account unless you tick the box. Several portal users can

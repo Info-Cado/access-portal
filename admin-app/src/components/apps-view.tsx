@@ -3,6 +3,7 @@ import { AppWindowIcon, FileIcon, FolderOpenIcon, PencilIcon, PlusIcon, Trash2Ic
 import { toast } from "sonner"
 
 import type { ViewProps } from "@/components/app-shell"
+import { BusyLabel } from "@/components/busy"
 import { ConfirmDialog, type Confirmation } from "@/components/dialogs"
 import { Button } from "@/components/ui/button"
 import {
@@ -25,6 +26,7 @@ import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/c
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { useAction } from "@/hooks/use-action"
 import { api, errorText, findMiracle, pickFolder, pickProgram, readShortcut, type PortalApp } from "@/lib/api"
 
 export function AppsView({ data, reload }: ViewProps) {
@@ -125,10 +127,10 @@ export function AppsView({ data, reload }: ViewProps) {
                                     ? `It will disappear for the ${count === 1 ? "user" : `${count} users`} who can open it now.`
                                     : "No user has it assigned.",
                                   action: "Delete app",
-                                  run: async () => {
-                                    await api("DELETE", `/api/admin/apps/${app.id}`)
-                                    await reload()
+                                  run: async (_, onStep) => {
+                                    await api("DELETE", `/api/admin/apps/${app.id}`, undefined, { onStep })
                                     toast.success("App deleted")
+                                    reload().catch(() => {})
                                   },
                                 })
                               }
@@ -186,7 +188,7 @@ function NewAppDialog({
   const [form, setForm] = useState(blank)
   const [keyTyped, setKeyTyped] = useState(false)
   const [error, setError] = useState("")
-  const [busy, setBusy] = useState(false)
+  const { busy, step, run } = useAction()
 
   // Opening the dialog for an app fills in what it has now.
   useEffect(() => {
@@ -261,23 +263,20 @@ function NewAppDialog({
 
   const submit = async (ev: FormEvent) => {
     ev.preventDefault()
-    setBusy(true)
     setError("")
     try {
-      if (editing) {
-        await api("PUT", `/api/admin/apps/${editing.id}`, form)
-      } else {
-        await api("POST", "/api/admin/apps", form)
-      }
-      await reload()
+      await run((onStep) =>
+        editing
+          ? api("PUT", `/api/admin/apps/${editing.id}`, form, { onStep })
+          : api("POST", "/api/admin/apps", form, { onStep }),
+      )
       toast.success(`${form.name.trim()} ${editing ? "saved" : "created"}`)
       setForm(blank)
       setKeyTyped(false)
       onOpenChange(false)
+      reload().catch(() => {})
     } catch (e) {
       setError(errorText(e))
-    } finally {
-      setBusy(false)
     }
   }
 
@@ -423,8 +422,8 @@ function NewAppDialog({
             <Button type="button" variant="outline" onClick={() => close(false)} disabled={busy}>
               Cancel
             </Button>
-            <Button type="submit" disabled={busy}>
-              {busy ? "Saving…" : editing ? "Save" : "Create app"}
+            <Button type="submit" className="max-w-full min-w-0" disabled={busy}>
+              {busy ? <BusyLabel step={step} fallback="Saving…" /> : editing ? "Save" : "Create app"}
             </Button>
           </DialogFooter>
         </form>

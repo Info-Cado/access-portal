@@ -2,7 +2,7 @@ import { useState } from "react"
 import { CopyIcon } from "lucide-react"
 import { toast } from "sonner"
 
-import type { ViewProps } from "@/components/app-shell"
+import type { SetupState, ViewProps } from "@/components/app-shell"
 import { AlertsCard, BackupsCard, UpdatesCard } from "@/components/maintenance-cards"
 import { SetupCard } from "@/components/setup-card"
 import { Button } from "@/components/ui/button"
@@ -46,10 +46,10 @@ function withCurrent(choices: [number, string][], value: number, unit: string): 
   return choices.some(([v]) => v === value) ? choices : [...choices, [value, `After ${value} ${unit}`]]
 }
 
-export function SettingsView({ data, reload }: ViewProps) {
+export function SettingsView({ data, reload, setup }: ViewProps & { setup: SetupState }) {
   return (
     <div className="flex max-w-2xl flex-col gap-4">
-      <SetupCard />
+      <SetupCard setup={setup} />
       <NetworkCard network={data.network} reload={reload} />
       <SessionsCard settings={data.settings} reload={reload} />
       <AlertsCard data={data} reload={reload} />

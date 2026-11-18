@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::models::User;
+use crate::progress::step;
 use crate::{access, activity, auth, backup, db, host, settings, AppState};
 
 /// The admin routes. Not for the network listener: see the module notes.
@@ -238,9 +239,11 @@ async fn create_user(
         "" => username,
         w => w,
     };
+    check_app_ids(&state, &input.app_ids).await?;
     let win_password = if input.create_windows_account {
         // The account is made first, so a failure leaves nothing half done.
         let password = new_windows_password();
+        step(format!("Creating the Windows account {win_username}…"));
         host::create_account(win_username, &password).await.map_err(host_error)?;
         password
     } else if input.win_password.is_empty() {
@@ -260,7 +263,7 @@ async fn create_user(
         input.enable_totp,
     )
     .await?;
-    db::set_user_apps(&state.pool, id, &input.app_ids).await?;
+    save_user_apps(&state, id, &input.app_ids).await?;
     if let Some(user) = db::user_by_id(&state.pool, id).await? {
         let how = if input.create_windows_account { " with a new Windows account" } else { "" };
         activity::admin(&state.pool, Some(&user), &format!("Created the user{how}")).await;
@@ -292,19 +295,23 @@ async fn delete_user(
     // ends their access at once even when the Windows account stays (it may be
     // shared with other portal users).
     state.presence.kick_user(id, crate::presence::DELETED);
+    let mut folder_left = None;
     if options.windows == Some(1) {
         // Close their program safely first; never delete over unsaved work.
-        if close_safely(&user.win_username).await == host::SafeClose::Busy {
+        let app = program_name(&state, &user.win_username).await;
+        if close_safely(&user.win_username, &app).await == host::SafeClose::Busy {
             return Err(fail(
                 StatusCode::CONFLICT,
                 &format!("{} Then delete the user again.", busy_message(&user)),
             ));
         }
-        host::delete_account(&user.win_username).await.map_err(host_error)?;
+        folder_left = host::delete_account(&user.win_username).await.map_err(host_error)?;
     }
+    step(format!("Deleting {}…", user.username));
     db::delete_user(&state.pool, id).await?;
     let windows = if options.windows == Some(1) { " and their Windows account" } else { "" };
     activity::admin(&state.pool, Some(&user), &format!("Deleted the user{windows}")).await;
+    note_folder_left(&state, Some(&user), &user.win_username, folder_left).await;
     Ok(Json(json!({})))
 }
 
@@ -317,9 +324,23 @@ async fn create_windows_account(
 ) -> ApiResult {
     let user = existing_user(&state, id).await?;
     let password = new_windows_password();
+    step(format!("Creating the Windows account {}…", user.win_username));
     host::create_account(&user.win_username, &password).await.map_err(host_error)?;
     db::set_windows_login(&state.pool, &state.config, id, &user.win_username, &password).await?;
     tracing::info!("created windows account {} for portal user {}", user.win_username, user.username);
+    // New accounts start restricted: set up their black-screen program now.
+    // The account already exists at this point, so a failure here must not
+    // read as "the account wasn't created" (a retry would then fail with
+    // "already exists"); it is logged, and saving the apps again retries it.
+    if let Err(e) = apply_app_access(&state, &user).await {
+        tracing::warn!("setting up the apps of the new account {}: {}", user.win_username, e.1);
+        activity::admin(
+            &state.pool,
+            Some(&user),
+            "Created their Windows account, but their app could not be set up yet (save their apps again)",
+        )
+        .await;
+    }
     Ok(Json(json!({ "mode": "app" })))
 }
 
@@ -336,9 +357,33 @@ async fn set_apps(
     Json(input): Json<AppIds>,
 ) -> ApiResult {
     let user = existing_user(&state, id).await?;
-    db::set_user_apps(&state.pool, id, &input.app_ids).await?;
+    check_app_ids(&state, &input.app_ids).await?;
+    save_user_apps(&state, id, &input.app_ids).await?;
     apply_app_access(&state, &user).await?;
     Ok(Json(json!({})))
+}
+
+const APP_GONE: &str = "One of those apps no longer exists. Refresh and try again.";
+
+/// Refuse app ids that aren't (or are no longer) apps.
+async fn check_app_ids(state: &AppState, ids: &[i64]) -> Result<(), ApiError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let known: std::collections::HashSet<i64> = db::list_apps(&state.pool).await?.iter().map(|a| a.id).collect();
+    if ids.iter().any(|id| !known.contains(id)) {
+        return Err(bad(APP_GONE));
+    }
+    Ok(())
+}
+
+/// Save a user's apps; an app deleted in the meantime is a 400, not a 500.
+async fn save_user_apps(state: &AppState, id: i64, ids: &[i64]) -> Result<(), ApiError> {
+    match db::set_user_apps(&state.pool, id, ids).await {
+        Ok(()) => Ok(()),
+        Err(e) if format!("{e:#}").contains("FOREIGN KEY") => Err(bad(APP_GONE)),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Bring a user's Windows account in line with their apps: access to the data
@@ -358,22 +403,36 @@ async fn apply_app_access(state: &AppState, user: &User) -> Result<(), ApiError>
     if folders.is_empty() && pick_launch(apps.clone()).is_none() {
         return Ok(());
     }
-    let mode = host::desktop_mode(&user.win_username).await.unwrap_or_default();
+    let win = user.win_username.as_str();
+    let mode = host::desktop_mode(win).await.unwrap_or_default();
     if mode == "missing" {
         return Ok(()); // no such Windows account (yet): nothing to set up
     }
-    for dir in &folders {
-        crate::host::grant_folder(&user.win_username, dir)
+    // The folders and the program are separate Windows settings: do them together.
+    let grants = folders.iter().map(|dir| async move {
+        step(format!("Giving {win} the folder {dir}…"));
+        host::grant_folder(win, dir)
             .await
-            .map_err(|e| fail(StatusCode::BAD_GATEWAY, &format!("The apps were saved, but {} couldn't be given the folder {dir}: {e:#}", user.win_username)))?;
-    }
-    if mode == "app" {
-        let launch = pick_launch(apps);
-        host::set_desktop_mode(&user.win_username, false, launch.as_ref())
+            .map_err(|e| fail(StatusCode::BAD_GATEWAY, &format!("The apps were saved, but {win} couldn't be given the folder {dir}: {e:#}")))
+    });
+    let program = async {
+        if mode != "app" {
+            return Ok(());
+        }
+        let app_name = apps.iter().find(|a| a.program.as_deref().is_some_and(|p| !p.trim().is_empty())).map(|a| a.name.clone());
+        let launch = pick_launch(apps.clone());
+        match &app_name {
+            Some(name) => step(format!("Setting up {name} for {win}…")),
+            None => step(format!("Restricting {win} to its apps…")),
+        }
+        host::set_desktop_mode(win, false, launch.as_ref())
             .await
-            .map_err(|e| fail(StatusCode::BAD_GATEWAY, &format!("The apps were saved, but the program couldn't be set up for {}: {e:#}", user.win_username)))?;
-    }
-    Ok(())
+            .map(|_| ())
+            .map_err(|e| fail(StatusCode::BAD_GATEWAY, &format!("The apps were saved, but the program couldn't be set up for {win}: {e:#}")))
+    };
+    let (granted, program) = futures_util::future::join(futures_util::future::join_all(grants), program).await;
+    granted.into_iter().collect::<Result<Vec<()>, ApiError>>()?;
+    program
 }
 
 #[derive(Deserialize)]
@@ -488,6 +547,7 @@ async fn set_desktop_mode(
     // restricted, the account opens just this program; its folder is the only
     // one the account may reach.
     let launch = pick_launch(db::apps_for_user(&state.pool, id).await?);
+    step_switch(&user.win_username, input.full);
     let mode = host::set_desktop_mode(&user.win_username, input.full, launch.as_ref())
         .await
         .map_err(host_error)?;
@@ -501,6 +561,7 @@ async fn set_desktop_mode(
     // account (standard-user rights still run Windows and the program itself).
     if mode == "app" {
         if let Some(dir) = launch.as_ref().and_then(|l| l.work_dir.as_deref()) {
+            step(format!("Giving {} the folder {dir}…", user.win_username));
             if let Err(e) = crate::host::grant_folder(&user.win_username, dir).await {
                 tracing::warn!("could not scope folder {dir} for {}: {e:#}", user.win_username);
             }
@@ -534,6 +595,7 @@ async fn owner_user(state: &AppState) -> Result<Option<User>, ApiError> {
 /// and the owner's portal access: `{accounts: [...], owner_user_id}`.
 async fn windows_accounts(State(state): State<AppState>, _: Admin) -> ApiResult {
     let users = db::list_users(&state.pool).await?;
+    step("Reading the Windows accounts…");
     let mut accounts = host::list_accounts().await.map_err(host_error)?;
     for account in &mut accounts {
         let name = account.get("name").and_then(|n| n.as_str()).unwrap_or("").to_lowercase();
@@ -578,6 +640,7 @@ async fn update_windows_account(
         enabled: input.enabled,
         password: input.password.clone(),
     };
+    step(format!("Changing the Windows account {name}…"));
     host::update_account(&name, &changes).await.map_err(host_error)?;
     let mut what = Vec::new();
     if changes.full_name.is_some() || changes.description.is_some() {
@@ -588,6 +651,7 @@ async fn update_windows_account(
     }
     if let Some(password) = &input.password {
         what.push("password");
+        step(format!("Saving {name}'s new password for its portal users…"));
         for u in db::list_users(&state.pool).await? {
             if u.win_username.eq_ignore_ascii_case(&name) {
                 db::set_windows_login(&state.pool, &state.config, u.id, &u.win_username, password).await?;
@@ -615,17 +679,32 @@ async fn delete_windows_account(
 ) -> ApiResult {
     let files = options.files == Some(1);
     // Close its black-screen program safely first; never delete over unsaved work.
-    if close_safely(&name).await == host::SafeClose::Busy {
+    let app = program_name(&state, &name).await;
+    if close_safely(&name, &app).await == host::SafeClose::Busy {
         return Err(fail(
             StatusCode::CONFLICT,
             &format!("{name}'s app has a window with unsaved work open, so the account was left alone. \
                       Ask them to save and close it, then delete the account again."),
         ));
     }
-    host::delete_any_account(&name, files).await.map_err(host_error)?;
+    let folder_left = host::delete_any_account(&name, files).await.map_err(host_error)?;
     let with = if files { " and its files" } else { "" };
     activity::admin(&state.pool, None, &format!("Deleted Windows account {name}{with}")).await;
+    note_folder_left(&state, None, &name, folder_left).await;
     Ok(Json(json!({})))
+}
+
+/// When Windows kept a deleted account's profile folder, say so in the
+/// activity list (and the log) so it can be removed by hand.
+async fn note_folder_left(state: &AppState, user: Option<&User>, account: &str, folder: Option<String>) {
+    if let Some(folder) = folder {
+        activity::admin(
+            &state.pool,
+            user,
+            &format!("Windows kept the folder {folder} of the deleted account {account}; delete it by hand after a restart"),
+        )
+        .await;
+    }
 }
 
 async fn account_desktop_mode(_: Admin, Path(name): Path<String>) -> ApiResult {
@@ -665,12 +744,14 @@ async fn set_account_desktop_mode(
     Json(input): Json<DesktopSwitch>,
 ) -> ApiResult {
     let launch = account_launch(&state, &name).await?;
+    step_switch(&name, input.full);
     let mode = host::set_desktop_mode(&name, input.full, launch.as_ref()).await.map_err(host_error)?;
     if mode == "missing" {
         return Err(fail(StatusCode::CONFLICT, &format!("There is no Windows account named {name} on this computer.")));
     }
     if mode == "app" {
         if let Some(dir) = launch.as_ref().and_then(|l| l.work_dir.as_deref()) {
+            step(format!("Giving {name} the folder {dir}…"));
             if let Err(e) = crate::host::grant_folder(&name, dir).await {
                 tracing::warn!("could not scope folder {dir} for {name}: {e:#}");
             }
@@ -707,6 +788,7 @@ async fn enable_owner_access(State(state): State<AppState>, _: Admin, Json(input
     if db::user_by_username(&state.pool, username).await?.is_some() {
         return Err(fail(StatusCode::CONFLICT, "That portal username is already taken."));
     }
+    step("Reading the Windows accounts…");
     let accounts = host::list_accounts().await.map_err(host_error)?;
     let Some(me) = accounts.iter().find(|a| a.get("me").and_then(|m| m.as_bool()) == Some(true)) else {
         return Err(fail(StatusCode::CONFLICT, "Access Portal isn't running as a local Windows account."));
@@ -718,9 +800,13 @@ async fn enable_owner_access(State(state): State<AppState>, _: Admin, Json(input
         w => w.to_string(),
     };
     // A wrong password would only show up when the desktop fails to open.
+    if !microsoft {
+        step(format!("Checking the Windows password of {account}…"));
+    }
     if !microsoft && !host::check_password(&account, &input.win_password).await.map_err(host_error)? {
         return Err(bad("Windows says that isn't the password of your account."));
     }
+    step(format!("Creating the portal user {username}…"));
     let (id, _) = db::create_user(
         &state.pool,
         &state.config,
@@ -828,6 +914,7 @@ async fn shadow(
         .get(id)
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That session already ended."))?;
     let user = existing_user(&state, connection.user_id).await?;
+    step(format!("Finding {}'s Windows session…", user.win_username));
     let sessions = tokio::task::spawn_blocking(host::windows_sessions_blocking).await.unwrap_or_default();
     let mut theirs: Vec<_> = sessions
         .into_iter()
@@ -838,6 +925,7 @@ async fn shadow(
         return Err(fail(StatusCode::CONFLICT, &format!("{} has no Windows session open right now.", user.win_username)));
     };
     let ask = settings::sessions(&state.pool).await.shadow_consent;
+    step("Opening the screen viewer…");
     host::shadow(session.id, input.control, ask).map_err(host_error)?;
     let what = if input.control { "Took control of" } else { "Viewed" };
     // When consent is off the user is told nothing; with it on, Windows prompts
@@ -1162,13 +1250,15 @@ async fn sign_out_user(
     axum::extract::Query(options): axum::extract::Query<ForceOption>,
 ) -> ApiResult {
     let user = existing_user(&state, id).await?;
+    step(format!("Disconnecting {}…", user.username));
     let disconnected = state.presence.kick_user(id, crate::presence::SIGNED_OUT);
     db::delete_sessions_for_user(&state.pool, id).await?;
     // Give the sessions a moment to close before Windows signs the account out.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let force = options.force == Some(1);
     if !force {
-        match close_safely(&user.win_username).await {
+        let app = program_name(&state, &user.win_username).await;
+        match close_safely(&user.win_username, &app).await {
             host::SafeClose::Busy => {
                 activity::admin(&state.pool, Some(&user), "Sign-out stopped: their app has unsaved work open").await;
                 return Err(fail(StatusCode::CONFLICT, &busy_message(&user)));
@@ -1182,6 +1272,7 @@ async fn sign_out_user(
     }
     let how = if force { " (forced)" } else { "" };
     activity::admin(&state.pool, Some(&user), &format!("Signed them out of Windows{how}")).await;
+    step(format!("Signing {} out of Windows…", user.win_username));
     let win = user.win_username.clone();
     let windows_sessions = tokio::task::spawn_blocking(move || host::sign_out_blocking(&win)).await.unwrap_or(0);
     Ok(Json(json!({ "disconnected": disconnected, "windows_sessions": windows_sessions })))
@@ -1193,11 +1284,32 @@ struct ForceOption {
 }
 
 /// Close a user's black-screen program the safe way (waits up to 40 s).
-async fn close_safely(win_username: &str) -> host::SafeClose {
-    let win = win_username.to_string();
-    tokio::task::spawn_blocking(move || host::close_safely_blocking(&win, std::time::Duration::from_secs(40)))
-        .await
-        .unwrap_or(host::SafeClose::Busy)
+async fn close_safely(win_username: &str, app: &str) -> host::SafeClose {
+    host::close_safely(win_username, app, std::time::Duration::from_secs(40)).await
+}
+
+/// The name of the black-screen app of a Windows account, for progress steps
+/// ("Asking Miracle to close…"): the app of any portal user signing in as it.
+async fn program_name(state: &AppState, win_username: &str) -> String {
+    if let Ok(users) = db::list_users(&state.pool).await {
+        for user in users.iter().filter(|u| u.win_username.eq_ignore_ascii_case(win_username)) {
+            if let Ok(apps) = db::apps_for_user(&state.pool, user.id).await {
+                if let Some(app) = apps.into_iter().find(|a| a.program.as_deref().is_some_and(|p| !p.trim().is_empty())) {
+                    return app.name;
+                }
+            }
+        }
+    }
+    "the app".to_string()
+}
+
+/// The step shown while the Full desktop switch changes an account.
+fn step_switch(win_username: &str, full: bool) {
+    if full {
+        step(format!("Giving {win_username} the full desktop…"));
+    } else {
+        step(format!("Restricting {win_username} to its apps…"));
+    }
 }
 
 fn busy_message(user: &User) -> String {
@@ -1350,12 +1462,31 @@ async fn update_app(
         &state.pool, id, name, hostname, port, opt(&input.program), opt(&input.work_dir), profile,
     )
     .await?;
-    // Users who have this app get the new program and folder.
+    // Users who have this app get the new program and folder. Different
+    // Windows accounts are set up at once; portal users sharing one account
+    // one after another, as before (the last one's program wins).
+    let mut accounts: Vec<Vec<User>> = Vec::new();
     for user in db::list_users(&state.pool).await? {
-        if db::apps_for_user(&state.pool, user.id).await?.iter().any(|a| a.id == id) {
-            apply_app_access(&state, &user).await?;
+        if !db::apps_for_user(&state.pool, user.id).await?.iter().any(|a| a.id == id) {
+            continue;
+        }
+        match accounts.iter_mut().find(|g| g[0].win_username.eq_ignore_ascii_case(&user.win_username)) {
+            Some(group) => group.push(user),
+            None => accounts.push(vec![user]),
         }
     }
+    if !accounts.is_empty() {
+        step(format!("Updating {name} for {} Windows account(s)…", accounts.len()));
+    }
+    let state = &state;
+    let results = futures_util::future::join_all(accounts.iter().map(|group| async move {
+        for user in group {
+            apply_app_access(state, user).await?;
+        }
+        Ok::<(), ApiError>(())
+    }))
+    .await;
+    results.into_iter().collect::<Result<Vec<()>, ApiError>>()?;
     Ok(Json(json!({})))
 }
 

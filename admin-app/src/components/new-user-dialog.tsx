@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react"
 import { toast } from "sonner"
 
+import { BusyLabel } from "@/components/busy"
 import type { SecretToShow } from "@/components/dialogs"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -25,6 +26,8 @@ import {
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
+import { refreshWindowsAccounts } from "@/components/windows-accounts"
+import { useAction } from "@/hooks/use-action"
 import { api, errorText, type PortalApp, type TotpSetup } from "@/lib/api"
 
 const blank = {
@@ -58,7 +61,7 @@ export function NewUserDialog({
 }) {
   const [form, setForm] = useState(blank)
   const [error, setError] = useState("")
-  const [busy, setBusy] = useState(false)
+  const { busy, step, run } = useAction()
   const set = (patch: Partial<typeof blank>) => setForm((f) => ({ ...f, ...patch }))
 
   // Opening with a preset ties the new login to an existing Windows account and
@@ -82,28 +85,33 @@ export function NewUserDialog({
 
   const submit = async (ev: FormEvent) => {
     ev.preventDefault()
-    setBusy(true)
     setError("")
     try {
-      const res = await api<{ totp: TotpSetup | null }>("POST", "/api/admin/users", {
-        username: form.username,
-        password: form.password,
-        win_username: form.winUser,
-        win_password: form.createWin ? "" : form.winPass,
-        create_windows_account: form.createWin,
-        enable_totp: form.totp,
-        app_ids: form.appIds,
-      })
-      await reload()
+      const res = await run((onStep) =>
+        api<{ totp: TotpSetup | null }>(
+          "POST",
+          "/api/admin/users",
+          {
+            username: form.username,
+            password: form.password,
+            win_username: form.winUser,
+            win_password: form.createWin ? "" : form.winPass,
+            create_windows_account: form.createWin,
+            enable_totp: form.totp,
+            app_ids: form.appIds,
+          },
+          { onStep },
+        ),
+      )
       const username = form.username.trim()
       setForm(blank)
       onOpenChange(false)
       if (res.totp) onSecret({ username, totp: res.totp })
       else toast.success(`${username} created`)
+      reload().catch(() => {})
+      void refreshWindowsAccounts()
     } catch (e) {
       setError(errorText(e))
-    } finally {
-      setBusy(false)
     }
   }
 
@@ -237,8 +245,8 @@ export function NewUserDialog({
             <Button type="button" variant="outline" onClick={() => close(false)} disabled={busy}>
               Cancel
             </Button>
-            <Button type="submit" disabled={busy}>
-              {busy ? "Creating…" : "Create user"}
+            <Button type="submit" className="max-w-full min-w-0" disabled={busy}>
+              {busy ? <BusyLabel step={step} fallback="Creating…" /> : "Create user"}
             </Button>
           </DialogFooter>
         </form>

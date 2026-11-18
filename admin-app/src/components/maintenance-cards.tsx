@@ -214,8 +214,9 @@ export function BackupsCard() {
       description:
         "Users, apps, permissions, settings and the activity log go back to how they were then. What is there now is saved as a new backup first. The app restarts, so everyone connected is disconnected for a moment.",
       action: "Restore and restart",
-      run: async () => {
-        await api("POST", `/api/admin/backups/${b.name}/restore`)
+      run: async (_, onStep) => {
+        await api("POST", `/api/admin/backups/${b.name}/restore`, undefined, { onStep })
+        onStep("Restarting…")
         await restartApp()
       },
     })
