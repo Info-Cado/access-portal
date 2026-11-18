@@ -17,12 +17,27 @@
 //!
 //! Changing another account's hive needs administrator rights, so the portal
 //! must run as an administrator for this to work.
+//!
+//! Everything here calls Windows directly (see `win.rs`); only "Fix everything"
+//! (`host_setup.ps1`) and the launcher's closer still use PowerShell.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-/// Only one hive change at a time: two at once could load the same hive twice.
-static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// One change at a time per Windows account (two at once could load the same
+/// hive twice). Different accounts don't wait for each other.
+#[cfg_attr(not(windows), allow(dead_code))]
+async fn lock_account(name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::LazyLock::new(Default::default);
+    let lock = LOCKS.lock().unwrap().entry(name.to_lowercase()).or_default().clone();
+    lock.lock_owned().await
+}
+
+/// Run blocking Windows calls off the async threads.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f).await.context("a Windows step stopped unexpectedly")
+}
 
 /// The account's mode: `"app"`, `"full"`, or `"missing"` when no local Windows
 /// account has that name.
@@ -31,9 +46,7 @@ pub async fn desktop_mode(win_username: &str) -> Result<String> {
 }
 
 /// [`desktop_mode`], answered from memory when it was read in the last
-/// [`MODE_TTL`]. Reading it from Windows takes a second or two, too slow for
-/// every page a user opens; changes made through the portal update the copy at
-/// once.
+/// [`MODE_TTL`]. Changes made through the portal update the copy at once.
 pub async fn desktop_mode_cached(win_username: &str) -> Result<String> {
     let key = win_username.to_lowercase();
     if let Some((mode, at)) = MODES.lock().unwrap().get(&key) {
@@ -70,7 +83,13 @@ pub async fn set_desktop_mode(win_username: &str, full: bool, launch: Option<&La
     let launch = if full { None } else { launch };
     #[cfg(windows)]
     if launch.is_some() {
-        tokio::task::spawn_blocking(install_launcher_files).await??;
+        // Once per run is enough (it also sets the folder's permissions).
+        static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let present = shell_dir().join("app-shell.vbs").exists() && shell_dir().join("app-close.ps1").exists();
+        if !(present && INSTALLED.load(std::sync::atomic::Ordering::Relaxed)) {
+            blocking(install_launcher_files).await??;
+            INSTALLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     remember(win_username, run(if full { "full" } else { "app" }, win_username, None, launch).await)
 }
@@ -98,9 +117,40 @@ pub async fn create_account(win_username: &str, password: &str) -> Result<()> {
 }
 
 /// Delete a Windows account the portal manages (a member of "Portal RDP Users",
-/// never an administrator) and its profile folder.
-pub async fn delete_account(win_username: &str) -> Result<()> {
-    remember(win_username, run("delete", win_username, None, None).await).map(|_| ())
+/// never an administrator) and its profile folder. Sessions it still has are
+/// signed out first. Returns the profile folder when Windows could not remove
+/// it (it is left on disk).
+pub async fn delete_account(win_username: &str) -> Result<Option<String>> {
+    #[cfg(windows)]
+    {
+        let _one_at_a_time = lock_account(win_username).await;
+        let name = win_username.to_string();
+        let Some(user) = blocking(move || imp::managed_for_delete(&name)).await?? else {
+            remember(win_username, Ok("missing".to_string()))?;
+            return Ok(None);
+        };
+        let left = delete_signed_out(user, true).await?;
+        remember(win_username, Ok("missing".to_string()))?;
+        Ok(left)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = win_username;
+        bail!("Windows accounts can only be changed when the portal runs on Windows.")
+    }
+}
+
+/// Sign the account out of Windows, then delete it (and, with `files`, its
+/// profile folder, retried for up to 10 s while Windows lets go of it).
+#[cfg(windows)]
+async fn delete_signed_out(user: crate::win::UserInfo, files: bool) -> Result<Option<String>> {
+    let name = user.name.clone();
+    if blocking(move || sign_out_blocking(&name)).await? > 0 {
+        crate::progress::step(format!("Signed {} out of Windows…", user.name));
+    }
+    crate::progress::step(format!("Deleting the Windows account {}…", user.name));
+    let left = blocking(move || imp::delete_with_profile(&user, files)).await??;
+    Ok(left)
 }
 
 /// Windows' rules for local account names.
@@ -112,72 +162,17 @@ pub fn check_account_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct ScriptResult {
-    ok: bool,
-    mode: Option<String>,
-    error: Option<String>,
-}
-
 #[cfg(windows)]
-async fn run(
-    action: &str,
-    win_username: &str,
-    password: Option<&str>,
-    launch: Option<&Launch>,
-) -> Result<String> {
-    use base64::Engine;
-    use std::time::Duration;
-
-    let _one_at_a_time = LOCK.lock().await;
-
-    // -EncodedCommand takes the script as base64 UTF-16LE, which avoids every
-    // quoting problem. The account name travels in an environment variable and
-    // is only ever used as data inside the script.
-    let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let child = tokio::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"])
-        .arg(encoded)
-        .env("AP_WINUSER", win_username)
-        .env("AP_ACTION", action)
-        .env("AP_PASSWORD", password.unwrap_or(""))
-        .env("AP_PROGRAM", launch.map(|l| l.program.as_str()).unwrap_or(""))
-        .env("AP_WORKDIR", launch.and_then(|l| l.work_dir.as_deref()).unwrap_or(""))
-        .env("AP_PROFILE", launch.and_then(|l| l.profile.as_deref()).unwrap_or(""))
-        .creation_flags(CREATE_NO_WINDOW)
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(Duration::from_secs(60), child)
-        .await
-        .context("changing the Windows account took too long")?
-        .context("starting PowerShell")?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let last = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let result: ScriptResult = serde_json::from_str(last.trim()).with_context(|| {
-        format!(
-            "unexpected answer from the account script: {}{}",
-            stdout.trim(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-    })?;
-    match (result.ok, result.mode, result.error) {
-        (true, Some(mode), _) => Ok(mode),
-        (_, _, Some(error)) => bail!(error),
-        _ => bail!("the account script gave no answer"),
-    }
+async fn run(action: &str, win_username: &str, password: Option<&str>, launch: Option<&Launch>) -> Result<String> {
+    let _one_at_a_time = lock_account(win_username).await;
+    let (action, name) = (action.to_string(), win_username.to_string());
+    let password = password.map(str::to_string);
+    let launch = launch.cloned();
+    blocking(move || imp::mode(&action, &name, password.as_deref(), launch.as_ref())).await?
 }
 
 #[cfg(not(windows))]
-async fn run(
-    _action: &str,
-    _win_username: &str,
-    _password: Option<&str>,
-    _launch: Option<&Launch>,
-) -> Result<String> {
+async fn run(_action: &str, _win_username: &str, _password: Option<&str>, _launch: Option<&Launch>) -> Result<String> {
     bail!("Windows accounts can only be changed when the portal runs on Windows.")
 }
 
@@ -190,12 +185,14 @@ async fn run(
 /// `{name, full_name, description, enabled, is_admin, portal, me, microsoft,
 /// last_logon}`; `me` is the account the portal runs as (the computer's owner).
 pub async fn list_accounts() -> Result<Vec<serde_json::Value>> {
-    let out = run_accounts("list", "", &[]).await?;
-    Ok(out.get("accounts").and_then(|a| a.as_array()).cloned().unwrap_or_default())
+    #[cfg(windows)]
+    return blocking(imp::list).await?;
+    #[cfg(not(windows))]
+    bail!("Windows accounts can only be changed when the portal runs on Windows.")
 }
 
 /// Changes to one account; `None` leaves that detail as it is.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct AccountChanges {
     pub full_name: Option<String>,
     pub description: Option<String>,
@@ -206,376 +203,461 @@ pub struct AccountChanges {
 /// Change an account's details. Built-in accounts are refused, and so is
 /// turning off the account the portal runs as.
 pub async fn update_account(name: &str, changes: &AccountChanges) -> Result<()> {
-    let mut set = Vec::new();
-    let mut env = Vec::new();
-    if let Some(v) = &changes.full_name {
-        set.push("full_name");
-        env.push(("AP_FULLNAME", v.clone()));
+    #[cfg(windows)]
+    {
+        let _one_at_a_time = lock_account(name).await;
+        let (name, changes) = (name.to_string(), changes.clone());
+        blocking(move || imp::update(&name, &changes)).await?
     }
-    if let Some(v) = &changes.description {
-        set.push("description");
-        env.push(("AP_DESCRIPTION", v.clone()));
+    #[cfg(not(windows))]
+    {
+        let _ = (name, changes);
+        bail!("Windows accounts can only be changed when the portal runs on Windows.")
     }
-    if let Some(v) = changes.enabled {
-        set.push("enabled");
-        env.push(("AP_ENABLED", if v { "1" } else { "0" }.to_string()));
-    }
-    if let Some(v) = &changes.password {
-        set.push("password");
-        env.push(("AP_PASSWORD", v.clone()));
-    }
-    env.push(("AP_SET", set.join(",")));
-    run_accounts("update", name, &env).await.map(|_| ())
 }
 
 /// Delete any local account except Windows administrators, built-in accounts
 /// and the account the portal runs as; with `files`, its profile folder too.
 /// Sessions it has open are signed out first (their unsaved work is lost).
-pub async fn delete_any_account(name: &str, files: bool) -> Result<()> {
-    // The script refuses the protected accounts before anything is touched.
-    run_accounts("can-delete", name, &[]).await?;
-    let who = name.to_string();
-    tokio::task::spawn_blocking(move || sign_out_blocking(&who)).await.ok();
-    run_accounts("delete", name, &[("AP_FILES", if files { "1" } else { "0" }.to_string())])
-        .await
-        .map(|_| ())?;
-    remember(name, Ok("missing".to_string())).map(|_| ())
+/// Returns the profile folder when it had to be left on disk.
+pub async fn delete_any_account(name: &str, files: bool) -> Result<Option<String>> {
+    #[cfg(windows)]
+    {
+        let _one_at_a_time = lock_account(name).await;
+        let who = name.to_string();
+        // The protected accounts are refused before anything is touched.
+        let user = blocking(move || imp::can_delete(&who)).await??;
+        let left = delete_signed_out(user, files).await?;
+        remember(name, Ok("missing".to_string()))?;
+        Ok(left)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (name, files);
+        bail!("Windows accounts can only be changed when the portal runs on Windows.")
+    }
 }
 
 /// Whether `password` is the account's Windows password. Only for local
 /// accounts; a Microsoft account's password can't be checked here.
 pub async fn check_password(name: &str, password: &str) -> Result<bool> {
-    let out = run_accounts("check", name, &[("AP_PASSWORD", password.to_string())]).await?;
-    Ok(out.get("valid").and_then(|v| v.as_bool()).unwrap_or(false))
+    #[cfg(windows)]
+    {
+        let (name, password) = (name.to_string(), password.to_string());
+        blocking(move || imp::check(&name, &password)).await?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (name, password);
+        bail!("Windows accounts can only be changed when the portal runs on Windows.")
+    }
 }
 
+/// The Windows side of the account functions above. Every rule and message is
+/// the one the PowerShell scripts had before.
 #[cfg(windows)]
-async fn run_accounts(action: &str, name: &str, env: &[(&str, String)]) -> Result<serde_json::Value> {
-    use base64::Engine;
-    use std::time::Duration;
+mod imp {
+    use super::{shell_dir, AccountChanges, Launch};
+    use crate::win::{self, Hive, Key, UserInfo};
+    use anyhow::{anyhow, bail, Result};
+    use serde_json::{json, Value};
+    use std::path::PathBuf;
 
-    let _one_at_a_time = LOCK.lock().await;
-    let utf16: Vec<u8> = ACCOUNTS_SCRIPT.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut command = tokio::process::Command::new("powershell.exe");
-    command
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand"])
-        .arg(encoded)
-        .env("AP_ACTION", action)
-        .env("AP_WINUSER", name)
-        .creation_flags(CREATE_NO_WINDOW)
-        .kill_on_drop(true);
-    for (key, value) in env {
-        command.env(key, value);
+    pub const PORTAL_GROUP: &str = "Portal RDP Users";
+    const NOT_ADMIN: &str = "The portal is not running as an administrator, so it cannot read or change Windows accounts.";
+
+    /// Administrator, Guest, DefaultAccount, WDAGUtilityAccount.
+    fn builtin(sid: &str) -> bool {
+        ["-500", "-501", "-503", "-504"].iter().any(|rid| sid.ends_with(rid))
     }
-    let out = tokio::time::timeout(Duration::from_secs(60), command.output())
-        .await
-        .context("reading the Windows accounts took too long")?
-        .context("starting PowerShell")?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let last = stdout.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let result: serde_json::Value = serde_json::from_str(last.trim()).with_context(|| {
-        format!(
-            "unexpected answer from the account script: {}{}",
-            stdout.trim(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-    })?;
-    if result.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-        Ok(result)
-    } else {
-        bail!(result.get("error").and_then(|e| e.as_str()).unwrap_or("the account script gave no answer").to_string())
+
+    fn admin_sids() -> Result<Vec<String>> {
+        Ok(win::administrators()?.into_iter().map(|(sid, _)| sid).collect())
     }
-}
 
-#[cfg(not(windows))]
-async fn run_accounts(_action: &str, _name: &str, _env: &[(&str, String)]) -> Result<serde_json::Value> {
-    bail!("Windows accounts can only be changed when the portal runs on Windows.")
-}
-
-/// Lists, changes and deletes local accounts. Prints one JSON line.
-#[cfg(windows)]
-const ACCOUNTS_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Continue'
-function Finish($result) { ConvertTo-Json -InputObject $result -Compress -Depth 4; exit 0 }
-function GroupSids($group) {
-  @(([ADSI]"WinNT://./$group,group").psbase.Invoke('Members') | ForEach-Object {
-    (New-Object Security.Principal.SecurityIdentifier ([byte[]]$_.GetType().InvokeMember('objectSid', 'GetProperty', $null, $_, $null)), 0).Value
-  })
-}
-# Administrator, Guest, DefaultAccount, WDAGUtilityAccount.
-function Builtin($sid) { $sid -match '-(500|501|503|504)$' }
-
-try {
-  $me = [Security.Principal.WindowsIdentity]::GetCurrent()
-  $mySid = $me.User.Value
-  if (-not ([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'The portal is not running as an administrator, so it cannot read or change Windows accounts.'
-  }
-  $adminGroup = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
-  $admins = GroupSids $adminGroup
-  $portalGroup = 'Portal RDP Users'
-  $portal = if (Get-LocalGroup -Name $portalGroup -ErrorAction SilentlyContinue) { GroupSids $portalGroup } else { @() }
-  $action = $env:AP_ACTION
-
-  if ($action -eq 'list') {
-    $list = @(Get-LocalUser | Where-Object { -not (Builtin $_.SID.Value) } | ForEach-Object {
-      $sid = $_.SID.Value
-      [ordered]@{
-        name = $_.Name; full_name = [string]$_.FullName; description = [string]$_.Description
-        enabled = [bool]$_.Enabled; is_admin = $admins -contains $sid; portal = $portal -contains $sid
-        me = $sid -eq $mySid; microsoft = ([string]$_.PrincipalSource) -eq 'MicrosoftAccount'
-        last_logon = $(if ($_.LastLogon) { [int64]([DateTimeOffset]$_.LastLogon).ToUnixTimeSeconds() } else { $null })
-      }
-    })
-    Finish @{ ok = $true; accounts = $list }
-  }
-
-  $user = Get-LocalUser -Name $env:AP_WINUSER -ErrorAction SilentlyContinue
-  if (-not $user) { throw "There is no Windows account named $($env:AP_WINUSER) on this computer." }
-  $sid = $user.SID.Value
-  $name = $user.Name
-  if (Builtin $sid) { throw "$name is one of Windows' built-in accounts; the portal leaves those alone." }
-
-  if ($action -eq 'check') {
-    Add-Type -AssemblyName System.DirectoryServices.AccountManagement
-    $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext 'Machine'
-    try { $valid = $ctx.ValidateCredentials($name, $env:AP_PASSWORD) } finally { $ctx.Dispose() }
-    Finish @{ ok = $true; valid = [bool]$valid }
-  }
-
-  if ($action -eq 'update') {
-    $set = @($env:AP_SET -split ',' | Where-Object { $_ })
-    if ($set -contains 'enabled' -and $env:AP_ENABLED -ne '1' -and $sid -eq $mySid) {
-      throw "$name is the account Access Portal runs as; it can't be turned off."
+    fn portal_sids() -> Result<Option<Vec<String>>> {
+        Ok(win::group_members(PORTAL_GROUP)?.map(|m| m.into_iter().map(|(sid, _)| sid).collect()))
     }
-    if ($set -contains 'full_name') { Set-LocalUser -SID $sid -FullName $env:AP_FULLNAME -ErrorAction Stop }
-    if ($set -contains 'description') {
-      if ($env:AP_DESCRIPTION.Length -gt 48) { throw 'Windows allows at most 48 characters in a description.' }
-      Set-LocalUser -SID $sid -Description $env:AP_DESCRIPTION -ErrorAction Stop
-    }
-    if ($set -contains 'password') {
-      if ($user.PrincipalSource -eq 'MicrosoftAccount') { throw "$name signs in with a Microsoft account; change its password at account.microsoft.com." }
-      Set-LocalUser -SID $sid -Password (ConvertTo-SecureString $env:AP_PASSWORD -AsPlainText -Force) -ErrorAction Stop
-    }
-    if ($set -contains 'enabled') {
-      if ($env:AP_ENABLED -eq '1') { Enable-LocalUser -SID $sid -ErrorAction Stop } else { Disable-LocalUser -SID $sid -ErrorAction Stop }
-    }
-    Finish @{ ok = $true }
-  }
 
-  if ($action -eq 'can-delete' -or $action -eq 'delete') {
-    if ($sid -eq $mySid) { throw "$name is the account Access Portal runs as; it can't be deleted." }
-    if ($admins -contains $sid) { throw "$name is a Windows administrator account; the portal never deletes those." }
-    if ($action -eq 'delete') {
-      Remove-LocalUser -SID $sid -ErrorAction Stop
-      if ($env:AP_FILES -eq '1') {
-        Get-CimInstance Win32_UserProfile | Where-Object SID -eq $sid | Remove-CimInstance -ErrorAction SilentlyContinue
-      }
-    }
-    Finish @{ ok = $true }
-  }
-  throw "Unknown action $action."
-}
-catch {
-  Finish @{ ok = $false; error = $_.Exception.Message }
-}
-"#;
-
-/// Runs elevated inside the portal's process context. Prints one JSON line.
-#[cfg(windows)]
-const SCRIPT: &str = r#"
-$ErrorActionPreference = 'Continue'
-function Finish($result) { $result | ConvertTo-Json -Compress; exit 0 }
-
-$name = $env:AP_WINUSER
-$action = $env:AP_ACTION
-# A restricted account can run one program on a black screen instead of the
-# desktop: its shell is a small launcher (below) that starts the program the
-# portal chose for it and signs the session out when the program closes. Windows
-# Home delivers but refuses to launch an RDP "alternate shell", so the launch is
-# done here, through the account's own shell, which Home does run.
-$oldShell = '*\access-portal\*-shell.vbs*'
-$marker   = 'Software\AccessPortal'
-# Not in the portal's data folder: that one is admins-only (it holds the
-# database). This folder is readable by every user and writable only by admins.
-$launcher = Join-Path $env:ProgramData 'AccessPortal-Shell\app-shell.vbs'
-# The launcher (app-shell.vbs) and its closer are written by the portal
-# itself (install_launcher_files) before this script runs.
-
-$winlogon = 'Software\Microsoft\Windows NT\CurrentVersion\Winlogon'
-$explorer = 'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
-$system   = 'Software\Microsoft\Windows\CurrentVersion\Policies\System'
-$cmdPol   = 'Software\Policies\Microsoft\Windows\System'
-$blocked  = 'cmd.exe','powershell.exe','pwsh.exe','powershell_ise.exe','regedit.exe','mmc.exe','taskmgr.exe','wt.exe'
-
-function GroupSids($group) {
-  @(([ADSI]"WinNT://./$group,group").psbase.Invoke('Members') | ForEach-Object {
-    (New-Object Security.Principal.SecurityIdentifier ([byte[]]$_.GetType().InvokeMember('objectSid', 'GetProperty', $null, $_, $null)), 0).Value
-  })
-}
-$portalGroup = 'Portal RDP Users'
-
-try {
-  $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-  $elevated = $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-  $user = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
-
-  if ($action -eq 'create') {
-    if (-not $elevated) { throw 'The portal is not running as an administrator, so it cannot create Windows accounts.' }
-    if ($user) { throw "A Windows account named $name already exists on this computer." }
-    if (-not (Get-LocalGroup -Name $portalGroup -ErrorAction SilentlyContinue)) {
-      throw "This computer has no '$portalGroup' group yet, so a new account could not sign in over Remote Desktop."
-    }
-    $secure = ConvertTo-SecureString $env:AP_PASSWORD -AsPlainText -Force
-    $user = New-LocalUser -Name $name -Password $secure -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -Description 'access-portal RDP user' -ErrorAction Stop
-    Add-LocalGroupMember -Group $portalGroup -Member $name -ErrorAction Stop
-    $action = 'app'   # new accounts start restricted
-  }
-
-  if (-not $user) { Finish @{ ok = $true; mode = 'missing' } }
-  $sid = $user.SID.Value
-  if (-not $elevated) {
-    throw 'The portal is not running as an administrator, so it cannot read or change Windows accounts.'
-  }
-  $adminGroup = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
-  $isAdmin = (GroupSids $adminGroup) -contains $sid
-
-  if ($action -eq 'delete') {
-    if ($isAdmin) { throw "$name is a Windows administrator account; the portal never deletes those." }
-    if (-not ((GroupSids $portalGroup) -contains $sid)) { throw "$name isn't in the '$portalGroup' group, so the portal doesn't manage it and won't delete it." }
-    Remove-LocalUser -SID $sid -ErrorAction Stop
-    # The profile folder too; skipped while the account is still signed in.
-    Get-CimInstance Win32_UserProfile | Where-Object SID -eq $sid | Remove-CimInstance -ErrorAction SilentlyContinue
-    Finish @{ ok = $true; mode = 'missing' }
-  }
-
-  if ($action -eq 'app') {
-    # Never lock down an administrator account.
-    if ($isAdmin) { throw "$name is a Windows administrator account; it can't be restricted." }
-  }
-
-  $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
-  if (-not (Test-Path $profileKey)) {
-    # Never signed in, so nothing has been set: Windows would give a full desktop.
-    if ($action -ne 'app') { Finish @{ ok = $true; mode = 'full' } }
-    Add-Type -Namespace AccessPortal -Name Profile -MemberDefinition '[DllImport("userenv.dll", CharSet = CharSet.Unicode)] public static extern int CreateProfile(string sid, string name, System.Text.StringBuilder path, uint size);'
-    $path = New-Object System.Text.StringBuilder 260
-    $hr = [AccessPortal.Profile]::CreateProfile($sid, $name, $path, 260)
-    if ($hr -ne 0) { throw ('Could not create the Windows profile for {0} (0x{1:X8}).' -f $name, $hr) }
-  }
-
-  # The account's settings: already open if it is signed in, else load its file.
-  $hive = $sid
-  $loaded = $false
-  if (-not (Test-Path "Registry::HKEY_USERS\$sid")) {
-    $dir = (Get-ItemProperty $profileKey).ProfileImagePath
-    $hive = "ap_$sid"
-    & reg.exe load "HKU\$hive" "$dir\NTUSER.DAT" *> $null
-    if ($LASTEXITCODE -ne 0) { throw "Could not open the settings of $name." }
-    $loaded = $true
-  }
-
-  $hku = [Microsoft.Win32.Registry]::Users
-  try {
-    if ($action -eq 'app' -or $action -eq 'full') {
-      $k = $hku.OpenSubKey("$hive\$winlogon", $true)
-      if ($k) {
-        $cur = [string]$k.GetValue('Shell')
-        if ($cur -like $oldShell -or $cur -like '*\app-shell.vbs*') { $k.DeleteValue('Shell', $false) }
-        $k.Dispose()
-      }
-    }
-    if ($action -eq 'app') {
-      $k = $hku.CreateSubKey("$hive\$marker"); $k.SetValue('Restricted', 1, 'DWord'); $k.Dispose()
-      $k = $hku.CreateSubKey("$hive\$explorer")
-      foreach ($v in 'NoRun','NoControlPanel','NoWinKeys','NoViewContextMenu','DisallowRun') { $k.SetValue($v, 1, 'DWord') }
-      $k.SetValue('NoDrives', 4, 'DWord'); $k.SetValue('NoViewOnDrive', 4, 'DWord'); $k.Dispose()
-      $k = $hku.CreateSubKey("$hive\$explorer\DisallowRun")
-      $i = 1; foreach ($exe in $blocked) { $k.SetValue([string]$i, $exe, 'String'); $i++ }; $k.Dispose()
-      $k = $hku.CreateSubKey("$hive\$system"); $k.SetValue('DisableTaskMgr', 1, 'DWord'); $k.SetValue('DisableRegistryTools', 1, 'DWord'); $k.Dispose()
-      $k = $hku.CreateSubKey("$hive\$cmdPol"); $k.SetValue('DisableCMD', 2, 'DWord'); $k.Dispose()
-      # With a program, the account's shell becomes the launcher (black screen,
-      # just that program). Without one, no custom shell: a plain locked desktop.
-      $wl = $hku.CreateSubKey("$hive\$winlogon")
-      if ($env:AP_PROGRAM) {
-        # A shortcut (such as one Miracle makes for a company folder) is opened
-        # here, as administrator, so the account needs no access to wherever the
-        # shortcut file lives; its target, arguments and folder are what it runs.
-        $prog = $env:AP_PROGRAM.Trim().Trim('"')
-        $progArgs = ''
-        $progDir = ''
-        if ($prog -like '*.lnk') {
-          if (-not (Test-Path -LiteralPath $prog)) { throw "The shortcut '$prog' does not exist." }
-          $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($prog)
-          $prog = $lnk.TargetPath
-          $progArgs = [string]$lnk.Arguments
-          $progDir = [string]$lnk.WorkingDirectory
+    /// The account, refusing missing and built-in ones (the accounts script's rules).
+    fn existing(name: &str) -> Result<UserInfo> {
+        let Some(user) = win::user_info(name)? else {
+            bail!("There is no Windows account named {name} on this computer.");
+        };
+        if builtin(&user.sid) {
+            bail!("{} is one of Windows' built-in accounts; the portal leaves those alone.", user.name);
         }
-        if (-not (Test-Path -LiteralPath $prog)) { throw "The program '$prog' does not exist." }
-        if (-not $progDir) { $progDir = Split-Path $prog }
-        # Miracle opens a company folder given as its third argument (what its
-        # own "create shortcut" writes), so miracle.exe plus the app's data
-        # folder is enough; a shortcut's own arguments win when there are some.
-        if ($env:AP_PROFILE -eq 'miracle' -and -not $progArgs -and $env:AP_WORKDIR) {
-          $progArgs = '02 "0" "' + $env:AP_WORKDIR.TrimEnd('\') + '"'
-        }
-        if (-not (Test-Path -LiteralPath $launcher)) { throw "The launcher $launcher is missing." }
-        $m = $hku.CreateSubKey("$hive\$marker")
-        $m.SetValue('Program', $prog, 'String')
-        $m.SetValue('Args', $progArgs, 'String')
-        $m.SetValue('WorkDir', $progDir, 'String')
-        $m.SetValue('Profile', [string]$env:AP_PROFILE, 'String')
-        $m.Dispose()
-        $wl.SetValue('Shell', 'wscript.exe "' + $launcher + '"', 'String')
-      } else {
-        $m = $hku.OpenSubKey("$hive\$marker", $true)
-        if ($m) { foreach ($v in 'Program','Args','WorkDir','Profile') { $m.DeleteValue($v, $false) }; $m.Dispose() }
-      }
-      $wl.Dispose()
-    }
-    elseif ($action -eq 'full') {
-      # Remove exactly what 'app' sets; other settings of the account stay.
-      $remove = @{
-        $marker   = @('Restricted','Program','Args','WorkDir','Profile')
-        $explorer = @('NoRun','NoControlPanel','NoWinKeys','NoViewContextMenu','DisallowRun','NoDrives','NoViewOnDrive')
-        $system   = @('DisableTaskMgr','DisableRegistryTools')
-        $cmdPol   = @('DisableCMD')
-      }
-      foreach ($path in $remove.Keys) {
-        $k = $hku.OpenSubKey("$hive\$path", $true)
-        if ($k) { foreach ($v in $remove[$path]) { $k.DeleteValue($v, $false) }; $k.Dispose() }
-      }
-      $k = $hku.OpenSubKey("$hive\$explorer", $true)
-      if ($k) { $k.DeleteSubKeyTree('DisallowRun', $false); $k.Dispose() }
+        Ok(user)
     }
 
-    $k = $hku.OpenSubKey("$hive\$marker")
-    $restricted = $k -and ($k.GetValue('Restricted') -eq 1)
-    if ($k) { $k.Dispose() }
-    $k = $hku.OpenSubKey("$hive\$winlogon")
-    $shell = if ($k) { [string]$k.GetValue('Shell') } else { '' }
-    if ($k) { $k.Dispose() }
-    # Accounts restricted by older versions have the old shell but no marker.
-    $mode = if ($restricted -or $shell -like $oldShell) { 'app' } else { 'full' }
-  }
-  finally {
-    if ($loaded) {
-      [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-      for ($try = 0; $try -lt 5; $try++) {
-        & reg.exe unload "HKU\$hive" *> $null
-        if ($LASTEXITCODE -eq 0) { break }
-        Start-Sleep -Milliseconds 400
-      }
+    fn require_admin() -> Result<()> {
+        if !win::is_elevated() {
+            bail!(NOT_ADMIN);
+        }
+        Ok(())
     }
-  }
-  Finish @{ ok = $true; mode = $mode }
+
+    pub fn list() -> Result<Vec<Value>> {
+        require_admin()?;
+        let me = win::my_sid()?;
+        let admins = admin_sids()?;
+        let portal = portal_sids()?.unwrap_or_default();
+        let mut list = Vec::new();
+        for name in win::user_names()? {
+            let Some(u) = win::user_info(&name)? else { continue };
+            if builtin(&u.sid) {
+                continue;
+            }
+            list.push(json!({
+                "name": u.name,
+                "full_name": u.full_name,
+                "description": u.comment,
+                "enabled": u.enabled(),
+                "is_admin": admins.contains(&u.sid),
+                "portal": portal.contains(&u.sid),
+                "me": u.sid == me,
+                "microsoft": win::is_microsoft(&u.name),
+                "last_logon": if u.last_logon == 0 { Value::Null } else { json!(i64::from(u.last_logon)) },
+            }));
+        }
+        Ok(list)
+    }
+
+    pub fn check(name: &str, password: &str) -> Result<bool> {
+        require_admin()?;
+        let user = existing(name)?;
+        Ok(win::check_password(&user.name, password))
+    }
+
+    pub fn update(name: &str, changes: &AccountChanges) -> Result<()> {
+        require_admin()?;
+        let user = existing(name)?;
+        let name = user.name.as_str();
+        if changes.enabled == Some(false) && user.sid == win::my_sid()? {
+            bail!("{name} is the account Access Portal runs as; it can't be turned off.");
+        }
+        if let Some(v) = &changes.full_name {
+            win::set_full_name(name, v)?;
+        }
+        if let Some(v) = &changes.description {
+            if v.encode_utf16().count() > 48 {
+                bail!("Windows allows at most 48 characters in a description.");
+            }
+            win::set_comment(name, v)?;
+        }
+        if let Some(v) = &changes.password {
+            if win::is_microsoft(name) {
+                bail!("{name} signs in with a Microsoft account; change its password at account.microsoft.com.");
+            }
+            win::set_password(name, v)?;
+        }
+        if let Some(on) = changes.enabled {
+            win::set_enabled(name, on)?;
+        }
+        Ok(())
+    }
+
+    /// The accounts script's delete rules: never the portal's own account,
+    /// never an administrator.
+    pub fn can_delete(name: &str) -> Result<UserInfo> {
+        require_admin()?;
+        let user = existing(name)?;
+        if user.sid == win::my_sid()? {
+            bail!("{} is the account Access Portal runs as; it can't be deleted.", user.name);
+        }
+        if admin_sids()?.contains(&user.sid) {
+            bail!("{} is a Windows administrator account; the portal never deletes those.", user.name);
+        }
+        Ok(user)
+    }
+
+    /// The account script's delete rules for a portal user's own account: only
+    /// members of "Portal RDP Users", never administrators. `None` when the
+    /// account doesn't exist (nothing to delete).
+    pub fn managed_for_delete(name: &str) -> Result<Option<UserInfo>> {
+        let Some(user) = win::user_info(name)? else { return Ok(None) };
+        require_admin()?;
+        if admin_sids()?.contains(&user.sid) {
+            bail!("{name} is a Windows administrator account; the portal never deletes those.");
+        }
+        if !portal_sids()?.unwrap_or_default().contains(&user.sid) {
+            bail!("{name} isn't in the '{PORTAL_GROUP}' group, so the portal doesn't manage it and won't delete it.");
+        }
+        Ok(Some(user))
+    }
+
+    /// Delete the account, then (with `files`) its profile. Windows can take a
+    /// few seconds to let go of a profile after its last sign-out, so the
+    /// removal is retried for up to 10 s. Returns the folder if it is still
+    /// there afterwards.
+    pub fn delete_with_profile(user: &UserInfo, files: bool) -> Result<Option<String>> {
+        let folder = win::profile_path(&user.sid);
+        win::delete_user(&user.name)?;
+        if !files {
+            return Ok(None);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last_error = 0;
+        while win::has_profile(&user.sid) {
+            match win::delete_profile(&user.sid) {
+                Ok(()) => break,
+                Err(code) => last_error = code,
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        match folder.filter(|f| f.exists()) {
+            Some(f) => {
+                let shown = f.display().to_string();
+                tracing::warn!(
+                    "deleted Windows account {} but its profile folder {shown} is still there ({})",
+                    user.name,
+                    if last_error == 0 { "no error from Windows".to_string() } else { win::error_text(last_error) }
+                );
+                Ok(Some(shown))
+            }
+            None => {
+                tracing::info!("deleted Windows account {} and its profile", user.name);
+                Ok(None)
+            }
+        }
+    }
+
+    // --- desktop mode ------------------------------------------------------
+
+    // A restricted account can run one program on a black screen instead of the
+    // desktop: its shell is a small launcher that starts the program the portal
+    // chose for it and signs the session out when the program closes. Windows
+    // Home delivers but refuses to launch an RDP "alternate shell", so the
+    // launch is done through the account's own shell, which Home does run.
+    const OLD_SHELL: &str = r"*\access-portal\*-shell.vbs*";
+    const MARKER: &str = r"Software\AccessPortal";
+    const WINLOGON: &str = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon";
+    const EXPLORER: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+    const SYSTEM: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\System";
+    const CMD_POLICY: &str = r"Software\Policies\Microsoft\Windows\System";
+    const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+    const BLOCKED: [&str; 8] = ["cmd.exe", "powershell.exe", "pwsh.exe", "powershell_ise.exe", "regedit.exe", "mmc.exe", "taskmgr.exe", "wt.exe"];
+
+    /// PowerShell's `-like` for patterns with `*` only: whole string, any case.
+    pub fn like(text: &str, pattern: &str) -> bool {
+        let (text, pattern) = (text.to_lowercase(), pattern.to_lowercase());
+        let parts: Vec<&str> = pattern.split('*').collect();
+        if parts.len() == 1 {
+            return text == pattern;
+        }
+        let (first, last) = (parts[0], parts[parts.len() - 1]);
+        if !text.starts_with(first) || text.len() < first.len() + last.len() || !text.ends_with(last) {
+            return false;
+        }
+        let mut rest = &text[first.len()..text.len() - last.len()];
+        for part in &parts[1..parts.len() - 1] {
+            match rest.find(part) {
+                Some(i) => rest = &rest[i + part.len()..],
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// read, create, app (restricted, with or without a black-screen program)
+    /// or full. Returns the mode now in effect, or "missing".
+    pub fn mode(action: &str, name: &str, password: Option<&str>, launch: Option<&Launch>) -> Result<String> {
+        let elevated = win::is_elevated();
+        let mut user = win::user_info(name)?;
+        let mut action = action;
+        if action == "create" {
+            if !elevated {
+                bail!("The portal is not running as an administrator, so it cannot create Windows accounts.");
+            }
+            if user.is_some() {
+                bail!("A Windows account named {name} already exists on this computer.");
+            }
+            if win::group_members(PORTAL_GROUP)?.is_none() {
+                bail!("This computer has no '{PORTAL_GROUP}' group yet, so a new account could not sign in over Remote Desktop.");
+            }
+            win::add_user(name, password.unwrap_or(""), "access-portal RDP user")?;
+            if let Err(e) = win::add_to_group(PORTAL_GROUP, name) {
+                // Leave nothing half done.
+                let _ = win::delete_user(name);
+                return Err(e);
+            }
+            user = win::user_info(name)?;
+            action = "app"; // new accounts start restricted
+        }
+        let Some(user) = user else { return Ok("missing".into()) };
+        let sid = user.sid.as_str();
+        if !elevated {
+            bail!(NOT_ADMIN);
+        }
+        let is_admin = admin_sids()?.iter().any(|s| s == sid);
+        if action == "app" && is_admin {
+            // Never lock down an administrator account.
+            bail!("{name} is a Windows administrator account; it can't be restricted.");
+        }
+        // Lean sessions, for accounts the portal manages (see `lean`).
+        let managed = !is_admin && portal_sids()?.unwrap_or_default().iter().any(|s| s == sid);
+
+        let profile_dir = if win::has_profile(sid) {
+            win::profile_path(sid).ok_or_else(|| anyhow!("Could not open the settings of {name}."))?
+        } else {
+            // Never signed in, so nothing has been set: Windows would give a full desktop.
+            if action != "app" {
+                return Ok("full".into());
+            }
+            let made = win::create_profile(sid, name)?;
+            win::profile_path(sid).unwrap_or(made)
+        };
+
+        // The account's settings: already open if it is signed in, else its file.
+        let Some(hive) = Hive::open(sid, &profile_dir)? else {
+            bail!("Could not open the settings of {name}.");
+        };
+        let root = hive.root();
+        if action == "app" || action == "full" {
+            if let Some(k) = root.open_sub(WINLOGON, true)? {
+                let current = k.get_string("Shell").unwrap_or_default();
+                if like(&current, OLD_SHELL) || like(&current, r"*\app-shell.vbs*") {
+                    k.delete_value("Shell")?;
+                }
+            }
+        }
+        if action == "app" {
+            restrict(root, launch)?;
+        } else if action == "full" {
+            unrestrict(root)?;
+        }
+        if managed && (action == "app" || action == "full") {
+            lean(root)?;
+        }
+
+        let restricted = root
+            .open_sub(MARKER, false)?
+            .is_some_and(|k| k.get_dword("Restricted") == Some(1) || k.get_string("Restricted").as_deref() == Some("1"));
+        let shell = root.open_sub(WINLOGON, false)?.and_then(|k| k.get_string("Shell")).unwrap_or_default();
+        // Accounts restricted by older versions have the old shell but no marker.
+        let mode = if restricted || like(&shell, OLD_SHELL) { "app" } else { "full" };
+        drop(hive);
+        Ok(mode.into())
+    }
+
+    fn restrict(root: &Key, launch: Option<&Launch>) -> Result<()> {
+        root.create_sub(MARKER)?.set_dword("Restricted", 1)?;
+        let k = root.create_sub(EXPLORER)?;
+        for v in ["NoRun", "NoControlPanel", "NoWinKeys", "NoViewContextMenu", "DisallowRun"] {
+            k.set_dword(v, 1)?;
+        }
+        k.set_dword("NoDrives", 4)?;
+        k.set_dword("NoViewOnDrive", 4)?;
+        drop(k);
+        let k = root.create_sub(&format!(r"{EXPLORER}\DisallowRun"))?;
+        for (i, exe) in BLOCKED.iter().enumerate() {
+            k.set_string(&(i + 1).to_string(), exe)?;
+        }
+        drop(k);
+        let k = root.create_sub(SYSTEM)?;
+        k.set_dword("DisableTaskMgr", 1)?;
+        k.set_dword("DisableRegistryTools", 1)?;
+        drop(k);
+        root.create_sub(CMD_POLICY)?.set_dword("DisableCMD", 2)?;
+
+        // With a program, the account's shell becomes the launcher (black screen,
+        // just that program). Without one, no custom shell: a plain locked desktop.
+        let winlogon = root.create_sub(WINLOGON)?;
+        let Some(launch) = launch.filter(|l| !l.program.is_empty()) else {
+            if let Some(m) = root.open_sub(MARKER, true)? {
+                for v in ["Program", "Args", "WorkDir", "Profile"] {
+                    m.delete_value(v)?;
+                }
+            }
+            return Ok(());
+        };
+        // A shortcut (such as one Miracle makes for a company folder) is opened
+        // here, as administrator, so the account needs no access to wherever the
+        // shortcut file lives; its target, arguments and folder are what it runs.
+        let mut program = launch.program.trim().trim_matches('"').to_string();
+        let mut args = String::new();
+        let mut dir = String::new();
+        if program.to_lowercase().ends_with(".lnk") {
+            if !std::path::Path::new(&program).exists() {
+                bail!("The shortcut '{program}' does not exist.");
+            }
+            (program, args, dir) = win::resolve_shortcut(std::path::Path::new(&program))?;
+        }
+        if program.is_empty() || !std::path::Path::new(&program).exists() {
+            bail!("The program '{program}' does not exist.");
+        }
+        if dir.is_empty() {
+            dir = std::path::Path::new(&program).parent().map(|p| p.display().to_string()).unwrap_or_default();
+        }
+        // Miracle opens a company folder given as its third argument (what its
+        // own "create shortcut" writes), so miracle.exe plus the app's data
+        // folder is enough; a shortcut's own arguments win when there are some.
+        let profile = launch.profile.clone().unwrap_or_default();
+        if let Some(work) = launch.work_dir.as_deref().filter(|w| !w.is_empty()) {
+            if profile.eq_ignore_ascii_case("miracle") && args.is_empty() {
+                args = format!("02 \"0\" \"{}\"", work.trim_end_matches('\\'));
+            }
+        }
+        let launcher: PathBuf = shell_dir().join("app-shell.vbs");
+        if !launcher.exists() {
+            bail!("The launcher {} is missing.", launcher.display());
+        }
+        let m = root.create_sub(MARKER)?;
+        m.set_string("Program", &program)?;
+        m.set_string("Args", &args)?;
+        m.set_string("WorkDir", &dir)?;
+        m.set_string("Profile", &profile)?;
+        winlogon.set_string("Shell", &format!("wscript.exe \"{}\"", launcher.display()))?;
+        Ok(())
+    }
+
+    /// Remove exactly what [`restrict`] sets; other settings of the account stay
+    /// (the lean-session values too).
+    fn unrestrict(root: &Key) -> Result<()> {
+        let remove: [(&str, &[&str]); 4] = [
+            (MARKER, &["Restricted", "Program", "Args", "WorkDir", "Profile"]),
+            (EXPLORER, &["NoRun", "NoControlPanel", "NoWinKeys", "NoViewContextMenu", "DisallowRun", "NoDrives", "NoViewOnDrive"]),
+            (SYSTEM, &["DisableTaskMgr", "DisableRegistryTools"]),
+            (CMD_POLICY, &["DisableCMD"]),
+        ];
+        for (path, values) in remove {
+            if let Some(k) = root.open_sub(path, true)? {
+                for v in values {
+                    k.delete_value(v)?;
+                }
+            }
+        }
+        if let Some(k) = root.open_sub(EXPLORER, true)? {
+            k.delete_tree("DisallowRun")?;
+        }
+        Ok(())
+    }
+
+    /// Lean sessions: a portal account's sign-in skips the programs installed
+    /// for every user of the computer (the machine's Run and RunOnce lists:
+    /// AnyDesk, the Tailscale tray, OneDrive setup and the like), and OneDrive
+    /// doesn't start for it. Sessions start faster and use less memory. Applied
+    /// in both modes and never undone by the Full desktop switch.
+    fn lean(root: &Key) -> Result<()> {
+        let k = root.create_sub(EXPLORER)?;
+        k.set_dword("DisableLocalMachineRun", 1)?;
+        k.set_dword("DisableLocalMachineRunOnce", 1)?;
+        drop(k);
+        if let Some(k) = root.open_sub(RUN, true)? {
+            k.delete_value("OneDrive")?;
+            k.delete_value("OneDriveSetup")?;
+        }
+        Ok(())
+    }
+
 }
-catch {
-  Finish @{ ok = $false; error = $_.Exception.Message }
-}
-"#;
+
+// ---------------------------------------------------------------------------
+// This computer's Remote Desktop settings
+// ---------------------------------------------------------------------------
 
 /// Remote Desktop settings the portal's sessions are tuned for, applied to this
 /// machine on start (needs administrator rights; skipped otherwise):
@@ -591,43 +673,43 @@ catch {
 pub fn tune_remote_desktop() {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         let settings = [
-            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "AVCHardwareEncodePreferred", 1u32),
-            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "bEnumerateHWBeforeSW", 1),
-            (r"HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations", "DWMFRAMEINTERVAL", 15),
+            (r"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "AVCHardwareEncodePreferred", 1u32),
+            (r"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "bEnumerateHWBeforeSW", 1),
+            (r"SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations", "DWMFRAMEINTERVAL", 15),
             // New accounts would otherwise start with Windows' privacy-settings screen.
-            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows\OOBE", "DisablePrivacyExperience", 1),
+            (r"SOFTWARE\Policies\Microsoft\Windows\OOBE", "DisablePrivacyExperience", 1),
             // Let sessions use the user's microphone and camera, and play sound.
-            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableAudioCapture", 0),
-            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableCam", 0),
-            (r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableCameraRedir", 0),
+            (r"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableAudioCapture", 0),
+            (r"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableCam", 0),
+            (r"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDisableCameraRedir", 0),
             // Show the last signed-in account on the sign-in screen instead of
             // a blank "Other user" box asking for a name. Only changes what the
             // screen shows: no automatic sign-in, no account or RDP changes.
-            (r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "dontdisplaylastusername", 0),
+            (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "dontdisplaylastusername", 0),
         ];
         for (key, name, value) in settings {
-            let current = std::process::Command::new("reg")
-                .args(["query", key, "/v", name])
-                .creation_flags(0x0800_0000)
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
-            if current.contains(&format!("0x{value:x}")) {
-                continue;
-            }
-            let ok = std::process::Command::new("reg")
-                .args(["add", key, "/v", name, "/t", "REG_DWORD", "/d", &value.to_string(), "/f"])
-                .creation_flags(0x0800_0000)
-                .status()
-                .is_ok_and(|s| s.success());
-            if ok {
+            if set_machine_dword(key, name, value) {
                 tracing::info!("remote desktop tuned: {name} = {value}");
-            } else {
-                tracing::warn!("could not set {name} (the portal needs administrator rights for this)");
             }
+        }
+    }
+}
+
+/// Set a DWORD under HKEY_LOCAL_MACHINE unless it already has that value.
+/// Returns whether it was changed.
+#[cfg(windows)]
+fn set_machine_dword(key: &str, name: &str, value: u32) -> bool {
+    use crate::win::{Key, HKEY_LOCAL_MACHINE};
+    let current = Key::open(HKEY_LOCAL_MACHINE, key, false).ok().flatten().and_then(|k| k.get_dword(name));
+    if current == Some(value) {
+        return false;
+    }
+    match Key::create(HKEY_LOCAL_MACHINE, key).and_then(|k| k.set_dword(name, value)) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("could not set {name} (the portal needs administrator rights for this): {e:#}");
+            false
         }
     }
 }
@@ -637,48 +719,12 @@ pub fn tune_remote_desktop() {
 pub fn sign_out_blocking(win_username: &str) -> usize {
     #[cfg(windows)]
     {
-        use base64::Engine;
-        use std::os::windows::process::CommandExt;
-        const SCRIPT: &str = r#"
-Add-Type -TypeDefinition @'
-using System; using System.Runtime.InteropServices; using System.Collections.Generic;
-public static class ApWts {
-  [StructLayout(LayoutKind.Sequential)] struct INFO { public int SessionId; [MarshalAs(UnmanagedType.LPWStr)] public string Name; public int State; }
-  [DllImport("wtsapi32.dll")] static extern bool WTSEnumerateSessionsW(IntPtr h, int r, int v, out IntPtr p, out int c);
-  [DllImport("wtsapi32.dll", CharSet=CharSet.Unicode)] static extern bool WTSQuerySessionInformationW(IntPtr h, int id, int cls, out IntPtr buf, out int len);
-  [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr p);
-  [DllImport("wtsapi32.dll")] public static extern bool WTSLogoffSession(IntPtr h, int id, bool wait);
-  public static List<int> SessionsOf(string user) {
-    var r = new List<int>(); IntPtr p; int c;
-    if (!WTSEnumerateSessionsW(IntPtr.Zero, 0, 1, out p, out c)) return r;
-    int sz = Marshal.SizeOf(typeof(INFO));
-    for (int i = 0; i < c; i++) {
-      var s = (INFO)Marshal.PtrToStructure(new IntPtr(p.ToInt64() + i * sz), typeof(INFO));
-      IntPtr b; int l;
-      if (WTSQuerySessionInformationW(IntPtr.Zero, s.SessionId, 5, out b, out l)) {
-        if (string.Equals(Marshal.PtrToStringUni(b), user, StringComparison.OrdinalIgnoreCase)) r.Add(s.SessionId);
-        WTSFreeMemory(b);
-      }
-    }
-    WTSFreeMemory(p); return r;
-  }
-}
-'@
-$n = 0
-foreach ($id in [ApWts]::SessionsOf($env:AP_WINUSER)) { if ([ApWts]::WTSLogoffSession([IntPtr]::Zero, $id, $true)) { $n++ } }
-$n
-"#;
-        let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-        let out = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encoded])
-            .env("AP_WINUSER", win_username)
-            .creation_flags(0x0800_0000)
-            .output();
-        let n = out
-            .ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().lines().last().and_then(|l| l.trim().parse().ok()))
-            .unwrap_or(0);
+        let ids: Vec<u32> = crate::win::sessions()
+            .into_iter()
+            .filter(|s| s.user.eq_ignore_ascii_case(win_username))
+            .map(|s| s.id)
+            .collect();
+        let n = ids.into_iter().filter(|&id| crate::win::log_off(id, true)).count();
         tracing::info!("signed {win_username} out of Windows ({n} session(s))");
         n
     }
@@ -734,7 +780,7 @@ asked = ""
 Set ex = sh.Exec(cmd)
 Note "started " & cmd & " (pid " & ex.ProcessID & ", profile " & profile & ")"
 Do While ex.Status = 0
-  WScript.Sleep 1000
+  WScript.Sleep 250
   If fso.FileExists(req) Then
     stamp = CStr(fso.GetFile(req).DateLastModified)
     If CDate(stamp) >= started And stamp <> asked Then
@@ -816,8 +862,7 @@ fn shell_dir() -> std::path::PathBuf {
         .join("AccessPortal-Shell")
 }
 
-/// Write the launcher, its closer and the close-request folder. Not part of the
-/// account script, which travels on PowerShell's command line (32k limit).
+/// Write the launcher, its closer and the close-request folder.
 #[cfg(windows)]
 fn install_launcher_files() -> Result<()> {
     use std::os::windows::process::CommandExt;
@@ -859,7 +904,8 @@ fn close_request_path(win_username: &str) -> std::path::PathBuf {
 }
 
 /// Ask the launcher in this account's sessions to close its program safely (it
-/// checks every second). Doesn't wait. The request is a file only admins can
+/// checks four times a second; sessions started by older versions check every
+/// second). Doesn't wait. The request is a file only admins can
 /// write; the launcher acts on each new one once.
 pub fn request_close(win_username: &str) -> std::io::Result<()> {
     let path = close_request_path(win_username);
@@ -873,20 +919,27 @@ fn clear_close_request(win_username: &str) {
     let _ = std::fs::remove_file(close_request_path(win_username));
 }
 
-/// Session ids running the black-screen launcher.
+/// Session ids running the black-screen launcher: a `wscript.exe` whose
+/// command line names app-shell.vbs. A wscript.exe whose command line can't be
+/// read counts too, so a black-screen program is never mistaken for a desktop
+/// (which would be signed out without the safe close).
 pub fn kiosk_sessions_blocking() -> Vec<u32> {
     #[cfg(windows)]
     {
-        const SCRIPT: &str = r#"
-$ids = @(Get-CimInstance Win32_Process -Filter "Name='wscript.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.CommandLine -like '*app-shell.vbs*' } | ForEach-Object { [int]$_.SessionId })
-ConvertTo-Json -Compress -InputObject $ids
-"#;
-        let out = powershell_blocking(SCRIPT, &[]).unwrap_or_default();
-        let last = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("[]").trim();
-        serde_json::from_str::<Vec<u32>>(last)
-            .or_else(|_| serde_json::from_str::<u32>(last).map(|one| vec![one]))
-            .unwrap_or_default()
+        let mut ids: Vec<u32> = crate::win::processes()
+            .into_iter()
+            .filter(|(_, exe)| exe.eq_ignore_ascii_case("wscript.exe"))
+            .filter_map(|(pid, _)| {
+                let session = crate::win::session_of(pid)?;
+                match crate::win::command_line(pid) {
+                    Some(line) => line.to_lowercase().contains("app-shell.vbs").then_some(session),
+                    None => Some(session),
+                }
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
     #[cfg(not(windows))]
     Vec::new()
@@ -904,34 +957,181 @@ fn kiosk_sessions_of(win_username: &str) -> (usize, Vec<u32>) {
     (mine.len(), both)
 }
 
+/// The launcher's log (it writes to %TEMP% of the account): the profile's
+/// Temp folder, and each session's own Temp subfolder (Remote Desktop gives
+/// every session one).
+fn launcher_logs(win_username: &str, sessions: &[u32]) -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        const LOG: &str = "access-portal-launcher.log";
+        let Some(dir) = crate::win::user_info(win_username).ok().flatten().and_then(|u| crate::win::profile_path(&u.sid)) else {
+            return Vec::new();
+        };
+        let temp = dir.join("AppData").join("Local").join("Temp");
+        let mut logs = vec![temp.join(LOG)];
+        logs.extend(sessions.iter().map(|id| temp.join(id.to_string()).join(LOG)));
+        logs
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (win_username, sessions);
+        Vec::new()
+    }
+}
+
+/// What was added to a log since `from` (moved on to its end).
+fn log_since(path: &std::path::Path, from: &mut u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else { return String::new() };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len < *from {
+        *from = 0; // a new log
+    }
+    let mut text = Vec::new();
+    if file.seek(SeekFrom::Start(*from)).is_err() || file.read_to_end(&mut text).is_err() {
+        return String::new();
+    }
+    *from += text.len() as u64;
+    String::from_utf8_lossy(&text).into_owned()
+}
+
+/// How long a program may take to exit once the closer has walked it through
+/// its exit; still running after that, it is holding unsaved work.
+const AFTER_CLOSER: std::time::Duration = std::time::Duration::from_millis(2500);
+/// The same for Miracle, which can take several seconds to save and close its
+/// company files after its last window goes. Answering "unsaved work" too early
+/// would invite a forced sign-out while it is still writing.
+const AFTER_CLOSER_MIRACLE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether the newest program a launcher log says it started runs with the
+/// Miracle profile (`started … (pid N, profile miracle)`).
+fn started_miracle(log: &std::path::Path) -> bool {
+    std::fs::read_to_string(log)
+        .ok()
+        .and_then(|text| text.lines().rev().find(|l| l.contains("  started ")).map(|l| l.contains("profile miracle)")))
+        .unwrap_or(false)
+}
+
 /// Close this account's black-screen program the way a person would, and wait
-/// up to `timeout` for it (and so the session) to end. Never forces anything:
-/// a program with unsaved work stays open and the answer is `Busy`.
-pub fn close_safely_blocking(win_username: &str, timeout: std::time::Duration) -> SafeClose {
-    let (sessions, kiosk) = kiosk_sessions_of(win_username);
+/// up to `timeout` for it to end. Never forces the program: one with unsaved
+/// work stays open and the answer is `Busy`. Once it has closed, the
+/// account's black-screen sessions are ended too (the launcher's own sign-out
+/// doesn't always end a disconnected session). `app` names the program in the
+/// progress steps.
+pub async fn close_safely(win_username: &str, app: &str, timeout: std::time::Duration) -> SafeClose {
+    use std::time::{Duration, Instant};
+    let who = win_username.to_string();
+    let Ok((sessions, kiosk, logs)) = blocking(move || {
+        let (sessions, kiosk) = kiosk_sessions_of(&who);
+        let logs = launcher_logs(&who, &kiosk);
+        (sessions, kiosk, logs)
+    })
+    .await
+    else {
+        return SafeClose::Busy;
+    };
     if sessions == 0 {
         return SafeClose::NoSession;
     }
     if kiosk.is_empty() {
         return SafeClose::NotKiosk;
     }
+    // Where the logs end now, so only what the launcher writes after the
+    // request is read.
+    let grace = if logs.iter().any(|p| started_miracle(p)) { AFTER_CLOSER_MIRACLE } else { AFTER_CLOSER };
+    let mut logs: Vec<(std::path::PathBuf, u64)> = logs
+        .into_iter()
+        .map(|p| {
+            let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            (p, len)
+        })
+        .collect();
+    crate::progress::step(format!("Asking {app} to close…"));
     if let Err(e) = request_close(win_username) {
         tracing::warn!("could not ask {win_username}'s program to close: {e}");
         return SafeClose::Busy;
     }
-    let start = std::time::Instant::now();
+    let start = Instant::now();
+    let mut closer_done: Option<Instant> = None;
+    let mut program_closed = false;
+    let mut shown = 0;
     let outcome = loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        if kiosk_sessions_of(win_username).1.is_empty() {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let who = win_username.to_string();
+        let running = blocking(move || kiosk_sessions_of(&who).1).await.unwrap_or_else(|_| vec![0]);
+        if running.is_empty() {
             break SafeClose::Closed;
+        }
+        for (path, from) in &mut logs {
+            let text = log_since(path, from);
+            if text.contains("program closed") {
+                program_closed = true; // the launcher is on its way out
+            }
+            if closer_done.is_none() && (text.contains("app-close.ps1 finished") || text.contains("could not start app-close.ps1")) {
+                closer_done = Some(Instant::now());
+            }
+        }
+        if !program_closed && closer_done.is_some_and(|at| at.elapsed() >= grace) {
+            break SafeClose::Busy;
         }
         if start.elapsed() >= timeout {
             break SafeClose::Busy;
         }
+        let secs = start.elapsed().as_secs();
+        if secs > shown {
+            shown = secs;
+            crate::progress::step(format!("Waiting for {app} to close ({secs} s)…"));
+        }
     };
     clear_close_request(win_username);
-    tracing::info!("safe close of {win_username}'s program: {outcome:?}");
+    tracing::info!("safe close of {win_username}'s program: {outcome:?} after {} ms", start.elapsed().as_millis());
+    if outcome == SafeClose::Closed {
+        end_sessions(win_username, &kiosk).await;
+    }
     outcome
+}
+
+/// After a safe close: give the account's black-screen sessions 2 s to end by
+/// themselves (the launcher runs `shutdown /l`), then sign out any that are
+/// left (their program has already closed, so nothing is lost) and wait for
+/// that. On a test laptop `shutdown /l` never ended the session, so a longer
+/// wait would only add to every sign-out.
+async fn end_sessions(win_username: &str, ids: &[u32]) {
+    use std::time::{Duration, Instant};
+    let left = || {
+        let (who, ids) = (win_username.to_string(), ids.to_vec());
+        blocking(move || {
+            windows_sessions_blocking()
+                .into_iter()
+                .filter(|s| s.user.eq_ignore_ascii_case(&who) && ids.contains(&s.id))
+                .map(|s| s.id)
+                .collect::<Vec<u32>>()
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut remaining = left().await.unwrap_or_default();
+    while !remaining.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        remaining = left().await.unwrap_or_default();
+    }
+    if remaining.is_empty() {
+        return;
+    }
+    crate::progress::step(format!("Signing {win_username} out of Windows…"));
+    tracing::info!("{win_username}'s program closed but session(s) {remaining:?} stayed; signing them out");
+    let ids = remaining.clone();
+    let n = blocking(move || log_off_blocking(&ids)).await.unwrap_or(0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut remaining = left().await.unwrap_or_default();
+    while !remaining.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        remaining = left().await.unwrap_or_default();
+    }
+    if remaining.is_empty() {
+        tracing::info!("signed {win_username} out of {n} session(s) after the safe close");
+    } else {
+        tracing::warn!("{win_username}'s session(s) {remaining:?} are still there after signing out");
+    }
 }
 
 /// Give a Windows account exclusive access to one data folder: the account (and
@@ -955,25 +1155,16 @@ pub async fn revoke_folder(win_username: &str, dir: &str) -> anyhow::Result<()> 
 #[cfg(windows)]
 async fn folder_acl(win_username: &str, dir: &str, action: &str) -> anyhow::Result<()> {
     let (u, d, a) = (win_username.to_owned(), dir.to_owned(), action.to_owned());
-    let out = tokio::task::spawn_blocking(move || {
-        powershell_blocking(FOLDER_ACL_SCRIPT, &[("AP_WINUSER", &u), ("AP_DIR", &d), ("AP_ACTION", &a)])
-    })
-    .await??;
-    #[derive(serde::Deserialize)]
-    struct R {
-        ok: bool,
-        #[serde(default)]
-        error: Option<String>,
+    let full = blocking(move || folder_acl_blocking(&u, &d, &a)).await??;
+    tracing::info!("folder access {action} for {win_username}: {dir}");
+    // Repair anything an earlier version left without permissions: a walk of
+    // every file, so it runs in the background, once per folder per run.
+    static REPAIRED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    if action == "grant" && REPAIRED.lock().unwrap().insert(full.to_lowercase()) {
+        tokio::task::spawn_blocking(move || repair_tree(&full));
     }
-    let line = out.trim().lines().last().unwrap_or("").trim();
-    let r: R = serde_json::from_str(line)
-        .unwrap_or(R { ok: false, error: Some(format!("unexpected output: {out}")) });
-    if r.ok {
-        tracing::info!("folder access {action} for {win_username}: {dir}");
-        Ok(())
-    } else {
-        anyhow::bail!(r.error.unwrap_or_else(|| "changing folder permissions failed".into()))
-    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -984,79 +1175,117 @@ async fn folder_acl(win_username: &str, dir: &str, _action: &str) -> anyhow::Res
 
 /// Grants or removes one account's exclusive access to one data folder with
 /// `icacls`. Refuses drive roots and the Windows / program / profile regions so
-/// a mistyped folder can never lock the operating system.
+/// a mistyped folder can never lock the operating system. Returns the folder's
+/// full path.
 #[cfg(windows)]
-const FOLDER_ACL_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-function Finish($r) { $r | ConvertTo-Json -Compress; exit 0 }
-$user = $env:AP_WINUSER
-$dir = $env:AP_DIR
-$action = $env:AP_ACTION
-try {
-  if ([string]::IsNullOrWhiteSpace($dir)) { throw 'No folder was given.' }
-  if (-not (Test-Path -LiteralPath $dir -PathType Container)) { throw "The folder '$dir' does not exist on this computer." }
-  $full = (Resolve-Path -LiteralPath $dir).Path.TrimEnd('\')
-  $lower = $full.ToLower()
-  if ($full.Length -le 3) { throw "Refusing to change permissions on a drive root ($full)." }
-  $prot = @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, (Join-Path $env:SystemDrive 'Users')) |
-    Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\').ToLower() }
-  foreach ($p in $prot) {
-    if ($lower -eq $p -or $p.StartsWith($lower + '\')) {
-      throw "Refusing to change permissions on a system folder ($full)."
+fn folder_acl_blocking(user: &str, dir: &str, action: &str) -> anyhow::Result<String> {
+    if dir.trim().is_empty() {
+        bail!("No folder was given.");
     }
-  }
-  $admins = '*S-1-5-32-544'   # BUILTIN\Administrators
-  $system = '*S-1-5-18'       # NT AUTHORITY\SYSTEM
-  if ($action -eq 'grant') {
-    # Inheritable rights on the folder itself, then stop it inheriting from its
-    # parent (the computer's default "Users" read). Everything inside inherits
-    # from this folder, so it all follows. Only the top folder is changed: doing
-    # this to every file (/T) leaves files with no permissions at all.
-    & icacls $full /grant "${admins}:(OI)(CI)F" "${system}:(OI)(CI)F" "${user}:(OI)(CI)M" /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Could not grant $user access to $full (icacls $LASTEXITCODE)." }
-    & icacls $full /inheritance:r /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Could not lock $full to its users (icacls $LASTEXITCODE)." }
-    # Repair anything an earlier version left without permissions.
-    Get-ChildItem -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
-      $acl = Get-Acl -LiteralPath $_.FullName -ErrorAction SilentlyContinue
-      if ($acl -and $acl.Access.Count -eq 0) {
-        & icacls $_.FullName /reset /C /Q | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-          & takeown /F $_.FullName /A | Out-Null
-          & icacls $_.FullName /reset /C /Q | Out-Null
+    let path = std::path::Path::new(dir);
+    if !path.is_dir() {
+        bail!("The folder '{dir}' does not exist on this computer.");
+    }
+    let full = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).display().to_string();
+    let full = full.trim_end_matches('\\').to_string();
+    let lower = full.to_lowercase();
+    if full.chars().count() <= 3 {
+        bail!("Refusing to change permissions on a drive root ({full}).");
+    }
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let protected = [
+        var("SystemRoot"),
+        var("ProgramFiles"),
+        var("ProgramFiles(x86)"),
+        var("ProgramData"),
+        var("SystemDrive").map(|d| format!("{}\\Users", d.trim_end_matches('\\'))),
+    ];
+    for p in protected.into_iter().flatten() {
+        let p = p.trim_end_matches('\\').to_lowercase();
+        if lower == p || p.starts_with(&format!("{lower}\\")) {
+            bail!("Refusing to change permissions on a system folder ({full}).");
         }
-      }
     }
-    Finish @{ ok = $true }
-  }
-  elseif ($action -eq 'revoke') {
-    & icacls $full /remove:g "$user" /C /Q | Out-Null
-    Finish @{ ok = $true }
-  }
-  else { throw "Unknown action $action." }
+    match action {
+        "grant" => {
+            // Inheritable rights on the folder itself, then stop it inheriting
+            // from its parent (the computer's default "Users" read). Everything
+            // inside inherits from this folder, so it all follows. Only the top
+            // folder is changed: doing this to every file (/T) leaves files with
+            // no permissions at all.
+            let account = format!("{user}:(OI)(CI)M");
+            let code = icacls(&[&full, "/grant", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", &account, "/C", "/Q"]);
+            if code != 0 {
+                bail!("Could not grant {user} access to {full} (icacls {code}).");
+            }
+            let code = icacls(&[&full, "/inheritance:r", "/C", "/Q"]);
+            if code != 0 {
+                bail!("Could not lock {full} to its users (icacls {code}).");
+            }
+        }
+        "revoke" => {
+            icacls(&[&full, "/remove:g", user, "/C", "/Q"]);
+        }
+        other => bail!("Unknown action {other}."),
+    }
+    Ok(full)
 }
-catch {
-  Finish @{ ok = $false; error = $_.Exception.Message }
-}
-"#;
 
-/// Run a PowerShell script (hidden window) with some environment variables and
-/// return what it printed.
+/// Run a Windows tool with no window; its exit code (-1 if it didn't start).
 #[cfg(windows)]
-fn powershell_blocking(script: &str, env: &[(&str, &str)]) -> anyhow::Result<String> {
-    use base64::Engine;
+fn run_tool(program: &str, args: &[&str]) -> i32 {
     use std::os::windows::process::CommandExt;
-    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-    let mut command = std::process::Command::new("powershell.exe");
-    command
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encoded])
-        .creation_flags(0x0800_0000);
-    for (k, v) in env {
-        command.env(k, v);
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(0x0800_0000)
+        .status()
+        .map(|s| s.code().unwrap_or(-1))
+        .unwrap_or(-1)
+}
+
+#[cfg(windows)]
+fn icacls(args: &[&str]) -> i32 {
+    run_tool("icacls", args)
+}
+
+/// Give back normal (inherited) permissions to anything under `root` that has
+/// none at all, as an earlier version could leave behind.
+#[cfg(windows)]
+fn repair_tree(root: &str) {
+    let start = std::time::Instant::now();
+    let (mut checked, mut fixed, mut failed) = (0usize, 0usize, 0usize);
+    let mut stack = vec![std::path::PathBuf::from(root)];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            checked += 1;
+            if crate::win::has_empty_dacl(&path) == Some(true) {
+                let p = path.display().to_string();
+                let mut ok = icacls(&[&p, "/reset", "/C", "/Q"]) == 0;
+                if !ok {
+                    run_tool("takeown", &["/F", &p, "/A"]);
+                    ok = icacls(&[&p, "/reset", "/C", "/Q"]) == 0;
+                }
+                if ok {
+                    fixed += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+            // Its own permissions are fixed first, so it can be listed now.
+            if entry.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink()) {
+                stack.push(path);
+            }
+        }
     }
-    let out = command.output().context("starting PowerShell")?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    tracing::info!(
+        "checked {checked} item(s) in {root} for missing permissions in {} ms: {fixed} repaired, {failed} could not be",
+        start.elapsed().as_millis()
+    );
 }
 
 /// A Windows session on this computer.
@@ -1075,87 +1304,37 @@ pub struct WinSession {
 pub const WTS_ACTIVE: u32 = 0;
 pub const WTS_DISCONNECTED: u32 = 4;
 
-#[cfg(windows)]
-const SESSIONS_SCRIPT: &str = r#"
-Add-Type -TypeDefinition @'
-using System; using System.Runtime.InteropServices; using System.Collections.Generic;
-public static class ApSessions {
-  [StructLayout(LayoutKind.Sequential)] struct SESSION { public int SessionId; [MarshalAs(UnmanagedType.LPWStr)] public string Name; public int State; }
-  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct INFO {
-    public int State; public int SessionId; public int InB; public int OutB; public int InF; public int OutF; public int InC; public int OutC;
-    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string Station;
-    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=17)] public string Domain;
-    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=21)] public string User;
-    public long ConnectTime; public long DisconnectTime; public long LastInputTime; public long LogonTime; public long CurrentTime;
-  }
-  [DllImport("wtsapi32.dll")] static extern bool WTSEnumerateSessionsW(IntPtr h, int r, int v, out IntPtr p, out int c);
-  [DllImport("wtsapi32.dll")] static extern bool WTSQuerySessionInformationW(IntPtr h, int id, int cls, out IntPtr buf, out int len);
-  [DllImport("wtsapi32.dll")] static extern void WTSFreeMemory(IntPtr p);
-  [DllImport("wtsapi32.dll")] public static extern bool WTSLogoffSession(IntPtr h, int id, bool wait);
-  public static List<object[]> List() {
-    var r = new List<object[]>(); IntPtr p; int c;
-    if (!WTSEnumerateSessionsW(IntPtr.Zero, 0, 1, out p, out c)) return r;
-    int sz = Marshal.SizeOf(typeof(SESSION));
-    for (int i = 0; i < c; i++) {
-      var s = (SESSION)Marshal.PtrToStructure(new IntPtr(p.ToInt64() + i * sz), typeof(SESSION));
-      IntPtr b; int l;
-      if (!WTSQuerySessionInformationW(IntPtr.Zero, s.SessionId, 24, out b, out l)) continue;
-      var info = (INFO)Marshal.PtrToStructure(b, typeof(INFO));
-      WTSFreeMemory(b);
-      if (string.IsNullOrEmpty(info.User)) continue;
-      long disc = (s.State == 4 && info.DisconnectTime > 0) ? Math.Max(0, (info.CurrentTime - info.DisconnectTime) / 10000000) : 0;
-      r.Add(new object[] { s.SessionId, info.User, s.State, disc });
-    }
-    WTSFreeMemory(p); return r;
-  }
-}
-'@
-if ($env:AP_LOGOFF) {
-  $n = 0
-  foreach ($id in $env:AP_LOGOFF.Split(',')) { if ([ApSessions]::WTSLogoffSession([IntPtr]::Zero, [int]$id, $true)) { $n++ } }
-  $n; exit 0
-}
-$adminGroup = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
-$admins = @(([ADSI]"WinNT://./$adminGroup,group").psbase.Invoke('Members') | ForEach-Object { $_.GetType().InvokeMember('Name', 'GetProperty', $null, $_, $null) })
-$list = @([ApSessions]::List() | ForEach-Object {
-  [pscustomobject]@{ id = $_[0]; user = $_[1]; state = $_[2]; disconnected_secs = $_[3]; admin = ($admins -contains $_[1]) }
-})
-ConvertTo-Json -InputObject $list -Compress
-"#;
-
 /// Every signed-in Windows session on this computer.
 pub fn windows_sessions_blocking() -> Vec<WinSession> {
     #[cfg(windows)]
     {
-        let out = match powershell_blocking(SESSIONS_SCRIPT, &[]) {
-            Ok(out) => out,
+        let admins: Vec<String> = match crate::win::administrators() {
+            Ok(members) => members.into_iter().map(|(_, name)| name).collect(),
             Err(e) => {
                 tracing::warn!("listing Windows sessions: {e:#}");
-                return Vec::new();
+                Vec::new()
             }
         };
-        let last = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("[]");
-        serde_json::from_str(last.trim()).unwrap_or_else(|e| {
-            tracing::warn!("listing Windows sessions: unexpected answer ({e}): {}", out.trim());
-            Vec::new()
-        })
+        crate::win::sessions()
+            .into_iter()
+            .map(|s| WinSession {
+                admin: admins.iter().any(|a| a.eq_ignore_ascii_case(&s.user)),
+                id: s.id,
+                user: s.user,
+                state: s.state,
+                disconnected_secs: s.disconnected_secs,
+            })
+            .collect()
     }
     #[cfg(not(windows))]
     Vec::new()
 }
 
-/// Sign these Windows sessions out (their apps close).
+/// Sign these Windows sessions out (their apps close); waits for each to end.
 pub fn log_off_blocking(ids: &[u32]) -> usize {
     #[cfg(windows)]
     {
-        if ids.is_empty() {
-            return 0;
-        }
-        let list = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-        powershell_blocking(SESSIONS_SCRIPT, &[("AP_LOGOFF", &list)])
-            .ok()
-            .and_then(|o| o.trim().lines().last().and_then(|l| l.trim().parse().ok()))
-            .unwrap_or(0)
+        ids.iter().filter(|&&id| crate::win::log_off(id, true)).count()
     }
     #[cfg(not(windows))]
     {
@@ -1193,15 +1372,11 @@ pub fn shadow(session_id: u32, control: bool, ask: bool) -> anyhow::Result<()> {
 pub fn set_shadow_policy(ask: bool) {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        let value = if ask { "1" } else { "2" };
-        let ok = std::process::Command::new("reg")
-            .args(["add", r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "/v", "Shadow", "/t", "REG_DWORD", "/d", value, "/f"])
-            .creation_flags(0x0800_0000)
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            tracing::warn!("could not set the screen-viewing policy (needs administrator rights)");
+        let value = if ask { 1 } else { 2 };
+        let key = r"SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services";
+        let ok = crate::win::Key::create(crate::win::HKEY_LOCAL_MACHINE, key).and_then(|k| k.set_dword("Shadow", value));
+        if let Err(e) = ok {
+            tracing::warn!("could not set the screen-viewing policy (needs administrator rights): {e:#}");
         }
     }
     #[cfg(not(windows))]

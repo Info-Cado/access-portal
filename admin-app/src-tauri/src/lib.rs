@@ -213,6 +213,7 @@ async fn request(
     method: String,
     path: String,
     body: Option<Value>,
+    progress: tauri::ipc::Channel<String>,
 ) -> Result<Value, String> {
     if !path.starts_with("/api/admin/") || path.starts_with("/api/admin/auth/verify") {
         return Err("Only the portal's admin calls can be made.".into());
@@ -224,16 +225,59 @@ async fn request(
         Server::Running(p) => p,
         Server::Failed(e) => return Err(format!("The portal is not running: {e}")),
     };
-    let (status, data) = portal.admin(&method, &path, body).await;
+    // Steps of a long action ("Closing Miracle…") go straight to the caller.
+    let sink: access_portal::progress::Sink = std::sync::Arc::new(move |text: String| {
+        let _ = progress.send(text);
+    });
+    let (status, data) = portal.admin_with_progress(&method, &path, body, sink).await;
     Ok(json!({ "status": status, "data": data }))
 }
 
+/// How long a closed window stays in memory, so reopening it soon is instant.
+/// After that it is destroyed: its web view holds about 130 MB.
+const KEEP_CLOSED_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Bumped whenever the window is shown, so a pending "destroy the closed
+/// window" from an earlier close knows to leave it alone.
+static WINDOW_SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Show the window, creating it first if it doesn't exist (it is only created
+/// when someone opens it, and destroyed a while after it is closed).
 fn show_window(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.unminimize();
-        let _ = w.show();
-        let _ = w.set_focus();
-    }
+    WINDOW_SHOWN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let window = match app.get_webview_window("main") {
+        Some(w) => w,
+        None => {
+            let Some(config) = app.config().app.windows.iter().find(|w| w.label == "main") else { return };
+            match tauri::WebviewWindowBuilder::from_config(app, config).and_then(|b| b.build()) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!("opening the window: {e}");
+                    return;
+                }
+            }
+        }
+    };
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+/// Destroy the closed window after a while unless it was opened again.
+fn forget_closed_window(window: &tauri::Window) {
+    let shown = WINDOW_SHOWN.load(std::sync::atomic::Ordering::SeqCst);
+    let app = window.app_handle().clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(KEEP_CLOSED_WINDOW);
+        if WINDOW_SHOWN.load(std::sync::atomic::Ordering::SeqCst) != shown {
+            return;
+        }
+        if let Some(w) = app.get_webview_window("main") {
+            if !w.is_visible().unwrap_or(true) {
+                let _ = w.destroy();
+            }
+        }
+    });
 }
 
 fn build_tray(app: &AppHandle, tooltip: &str) -> tauri::Result<()> {
@@ -369,6 +413,7 @@ pub fn run() {
                 let _ = window.hide();
                 // Whoever opens it next signs in again.
                 window.app_handle().state::<AppLock>().lock();
+                forget_closed_window(window);
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -390,6 +435,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("starting Access Portal")
         .run(|app, event| {
+            // The portal keeps running in the tray when the window is destroyed
+            // (only Quit, which gives an exit code, ends the app).
+            if let RunEvent::ExitRequested { api, code: None, .. } = &event {
+                api.prevent_exit();
+            }
             // Quitting stops the tunnel program too (it is a separate process).
             if let RunEvent::Exit = event {
                 if let Some(t) = app.state::<Option<tunnel::Tunnel>>().inner() {

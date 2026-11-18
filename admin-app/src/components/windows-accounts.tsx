@@ -2,10 +2,11 @@
 // edit details, password, on/off and the full desktop; delete; and open the
 // owner's own desktop from the portal.
 
-import { useCallback, useEffect, useState } from "react"
+import { useEffect, useState, useSyncExternalStore } from "react"
 import { ChevronRightIcon, MonitorIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react"
 import { toast } from "sonner"
 
+import { BusyLabel } from "@/components/busy"
 import { ConfirmDialog, type Confirmation } from "@/components/dialogs"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -31,9 +32,44 @@ import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { api, errorText, since, type WindowsAccount, type WindowsAccounts } from "@/lib/api"
+import { useAction, useOptimisticValue } from "@/hooks/use-action"
+import { ago, api, errorText, type WindowsAccount, type WindowsAccounts } from "@/lib/api"
 
 const path = (name: string) => `/api/admin/windows-accounts/${encodeURIComponent(name)}`
+
+// The list takes about a second to read from Windows, so the last one is kept for
+// the whole time the app is open and read again only after a change or on Refresh.
+type ListState = { list: WindowsAccounts | null; error: string; loading: boolean }
+let listState: ListState = { list: null, error: "", loading: false }
+let loadSeq = 0
+const listeners = new Set<() => void>()
+
+function setListState(patch: Partial<ListState>) {
+  listState = { ...listState, ...patch }
+  listeners.forEach((l) => l())
+}
+
+/** Read the Windows accounts again. Only the newest read's answer is kept. */
+export async function refreshWindowsAccounts(): Promise<void> {
+  const seq = ++loadSeq
+  setListState({ loading: true })
+  try {
+    const list = await api<WindowsAccounts>("GET", "/api/admin/windows-accounts")
+    if (seq === loadSeq) setListState({ list, error: "", loading: false })
+  } catch (e) {
+    if (seq === loadSeq) setListState({ error: errorText(e), loading: false })
+  }
+}
+
+function useWindowsAccounts(): ListState {
+  return useSyncExternalStore(
+    (l) => {
+      listeners.add(l)
+      return () => listeners.delete(l)
+    },
+    () => listState,
+  )
+}
 
 export function WindowsAccountsSection({
   reload,
@@ -46,29 +82,18 @@ export function WindowsAccountsSection({
   /** Open the new-user dialog to add a portal login for a Windows account. */
   onAddLogin: (winUser: string, accountName: string) => void
 }) {
-  const [list, setList] = useState<WindowsAccounts | null>(null)
-  const [error, setError] = useState("")
-  const [loading, setLoading] = useState(false)
+  const { list, error, loading } = useWindowsAccounts()
   const [selected, setSelected] = useState<string | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      setList(await api<WindowsAccounts>("GET", "/api/admin/windows-accounts"))
-      setError("")
-    } catch (e) {
-      setError(errorText(e))
-    } finally {
-      setLoading(false)
-    }
+  // Read once; after that the kept list is shown at once.
+  useEffect(() => {
+    if (listState.list === null && !listState.loading) void refreshWindowsAccounts()
   }, [])
 
-  useEffect(() => {
-    void load()
-  }, [load])
-
-  const refreshAll = async () => {
-    await Promise.all([load(), reload()])
+  /** Read the list and the portal's data again, in the background. */
+  const refreshAll = () => {
+    void refreshWindowsAccounts()
+    reload().catch(() => {})
   }
 
   const q = query.trim().toLowerCase()
@@ -91,21 +116,30 @@ export function WindowsAccountsSection({
             Every local account, including ones the portal didn’t make. Windows’ built-in accounts are hidden.
           </p>
         </div>
-        <Button variant="outline" size="sm" className="ml-auto" disabled={loading} onClick={() => void load()}>
+        <Button
+          variant="outline"
+          size="sm"
+          className="ml-auto"
+          disabled={loading}
+          onClick={() => void refreshWindowsAccounts()}
+        >
           <RefreshCwIcon className={loading ? "animate-spin" : undefined} />
           Refresh
         </Button>
       </div>
 
-      {error ? (
+      {error && (
         <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           {error}
         </div>
-      ) : list === null ? (
-        <div className="flex flex-col gap-2">
-          <Skeleton className="h-10 w-full" />
-          <Skeleton className="h-10 w-full" />
-        </div>
+      )}
+      {list === null ? (
+        !error && (
+          <div className="flex flex-col gap-2">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        )
       ) : (
         <div className="overflow-hidden rounded-lg border">
           <Table>
@@ -149,7 +183,7 @@ export function WindowsAccountsSection({
                     {a.portal_users.length ? a.portal_users.map((u) => u.username).join(", ") : "None"}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {a.last_logon ? `${since(a.last_logon)}${since(a.last_logon) === "just now" ? "" : " ago"}` : "Never"}
+                    {a.last_logon ? ago(a.last_logon) : "Never"}
                   </TableCell>
                   <TableCell>
                     <ChevronRightIcon className="size-4 text-muted-foreground" />
@@ -181,7 +215,7 @@ function AccountSheet({
 }: {
   account: WindowsAccount | null
   ownerUserId: number | null
-  refresh: () => Promise<void>
+  refresh: () => void
   onClose: () => void
   onAddLogin: (winUser: string, accountName: string) => void
 }) {
@@ -218,32 +252,40 @@ function AccountDetails({
 }: {
   account: WindowsAccount
   ownerUserId: number | null
-  refresh: () => Promise<void>
+  /** Read the list again in the background. */
+  refresh: () => void
   onClose: () => void
   onAddLogin: (winUser: string, accountName: string) => void
 }) {
   const base = path(account.name)
-  const [busy, setBusy] = useState(false)
   const [fullName, setFullName] = useState(account.full_name)
   const [description, setDescription] = useState(account.description)
   const [password, setPassword] = useState("")
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null)
   const [ownerDialog, setOwnerDialog] = useState(false)
 
-  const change = async (work: () => Promise<unknown>, done: string) => {
-    setBusy(true)
-    try {
-      await work()
-      await refresh()
-      toast.success(done)
-      return true
-    } catch (e) {
-      toast.error(errorText(e))
-      return false
-    } finally {
-      setBusy(false)
-    }
-  }
+  const details = useAction()
+  const passwordAction = useAction()
+
+  /** Run one change; say it worked as soon as it has, then read the list again. */
+  const change = (action: typeof details, work: (onStep: (text: string) => void) => Promise<unknown>, done: string) =>
+    action
+      .run(work)
+      .then(() => {
+        toast.success(done)
+        refresh()
+        return true
+      })
+      .catch((e) => {
+        toast.error(errorText(e))
+        return false
+      })
+
+  const [enabled, setEnabled] = useOptimisticValue(account.enabled, async (on: boolean) => {
+    await api("PUT", base, { enabled: on })
+    toast.success(on ? "Account turned on" : "Account turned off")
+    refresh()
+  })
 
   const deletable = !account.me && !account.is_admin
   const linked = account.portal_users.map((u) => u.username).join(", ")
@@ -255,7 +297,7 @@ function AccountDetails({
           {account.name}
           {account.me && <Badge>You</Badge>}
           {account.is_admin && <Badge variant="secondary">Administrator</Badge>}
-          {!account.enabled && <Badge variant="destructive">Off</Badge>}
+          {!enabled && <Badge variant="destructive">Off</Badge>}
         </DialogTitle>
         <DialogDescription>
           {account.me
@@ -316,7 +358,6 @@ function AccountDetails({
                 <Switch
                   id="owner-access"
                   checked={ownerUserId !== null}
-                  disabled={busy}
                   onCheckedChange={(on) =>
                     on
                       ? setOwnerDialog(true)
@@ -325,10 +366,10 @@ function AccountDetails({
                           description:
                             "The portal user for your account is deleted. Your Windows account and its files stay as they are.",
                           action: "Turn off",
-                          run: async () => {
-                            await api("DELETE", "/api/admin/owner-access")
-                            await refresh()
+                          run: async (_, onStep) => {
+                            await api("DELETE", "/api/admin/owner-access", undefined, { onStep })
                             toast.success("Your desktop is no longer on the portal")
+                            refresh()
                           },
                         })
                   }
@@ -344,18 +385,15 @@ function AccountDetails({
                 <FieldContent>
                   <FieldLabel htmlFor="acct-enabled">Account on</FieldLabel>
                   <FieldDescription>
-                    {account.enabled
+                    {enabled
                       ? "On. It can sign in to this computer and over Remote Desktop."
                       : "Off. Nobody can sign in with it, from the portal or anywhere else."}
                   </FieldDescription>
                 </FieldContent>
                 <Switch
                   id="acct-enabled"
-                  checked={account.enabled}
-                  disabled={busy}
-                  onCheckedChange={(enabled) =>
-                    change(() => api("PUT", base, { enabled }), enabled ? "Account turned on" : "Account turned off")
-                  }
+                  checked={enabled}
+                  onCheckedChange={setEnabled}
                 />
               </Field>
               {!account.is_admin && (
@@ -372,7 +410,11 @@ function AccountDetails({
             autoComplete="off"
             onSubmit={async (ev) => {
               ev.preventDefault()
-              await change(() => api("PUT", base, { full_name: fullName, description }), "Details saved")
+              await change(
+                details,
+                (onStep) => api("PUT", base, { full_name: fullName, description }, { onStep }),
+                "Details saved",
+              )
             }}
           >
             <FieldSet>
@@ -396,9 +438,9 @@ function AccountDetails({
                   type="submit"
                   variant="outline"
                   className="self-start"
-                  disabled={busy || (fullName === account.full_name && description === account.description)}
+                  disabled={details.busy || (fullName === account.full_name && description === account.description)}
                 >
-                  Save details
+                  {details.busy ? <BusyLabel step={details.step} fallback="Saving…" /> : "Save details"}
                 </Button>
               </FieldGroup>
             </FieldSet>
@@ -418,7 +460,12 @@ function AccountDetails({
               autoComplete="off"
               onSubmit={async (ev) => {
                 ev.preventDefault()
-                if (await change(() => api("PUT", base, { password }), "Windows password changed")) setPassword("")
+                const ok = await change(
+                  passwordAction,
+                  (onStep) => api("PUT", base, { password }, { onStep }),
+                  "Windows password changed",
+                )
+                if (ok) setPassword("")
               }}
             >
               <Field>
@@ -432,8 +479,12 @@ function AccountDetails({
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                   />
-                  <Button type="submit" variant="outline" disabled={busy || !password}>
-                    Set password
+                  <Button type="submit" variant="outline" disabled={passwordAction.busy || !password}>
+                    {passwordAction.busy ? (
+                      <BusyLabel step={passwordAction.step} fallback="Setting…" />
+                    ) : (
+                      "Set password"
+                    )}
                   </Button>
                 </div>
                 <FieldDescription>
@@ -450,7 +501,7 @@ function AccountDetails({
       <DialogFooter className="mx-0 mb-0 border-t sm:justify-start">
         <Button
           variant="destructive"
-          disabled={busy || !deletable}
+          disabled={!deletable}
           title={
             account.me
               ? "This is the account Access Portal runs as."
@@ -468,11 +519,11 @@ function AccountDetails({
                   : ""),
               action: "Delete account",
               option: { label: "Also delete its files (its user folder)", checked: false },
-              run: async (files) => {
-                await api("DELETE", files ? `${base}?files=1` : base)
+              run: async (files, onStep) => {
+                await api("DELETE", files ? `${base}?files=1` : base, undefined, { onStep })
                 onClose()
-                await refresh()
                 toast.success(`Windows account ${account.name} deleted`)
+                refresh()
               },
             })
           }
@@ -504,34 +555,29 @@ type Mode = "app" | "full" | "missing"
 
 /** The same Full desktop switch the portal users' panel has, by account name. */
 function AccountDesktopMode({ account }: { account: WindowsAccount }) {
-  const [mode, setMode] = useState<Mode | null>(null)
+  const [fetched, setFetched] = useState<Mode | null>(null)
   const [error, setError] = useState("")
-  const [busy, setBusy] = useState(false)
   const url = `${path(account.name)}/desktop`
 
   useEffect(() => {
     let live = true
     api<{ mode: Mode }>("GET", url)
-      .then((r) => live && setMode(r.mode))
+      .then((r) => live && setFetched(r.mode))
       .catch((e) => live && setError(errorText(e)))
     return () => {
       live = false
     }
   }, [url])
 
-  const change = async (full: boolean) => {
-    setBusy(true)
-    try {
-      setMode((await api<{ mode: Mode }>("PUT", url, { full })).mode)
-      toast.success(full ? "Full desktop turned on" : "Full desktop turned off", {
-        description: "Applies from its next session.",
-      })
-    } catch (e) {
-      toast.error(errorText(e))
-    } finally {
-      setBusy(false)
-    }
-  }
+  // Moves at once; saved in the background.
+  const [mode, setMode] = useOptimisticValue<Mode | null>(fetched, async (next) => {
+    const full = next === "full"
+    const r = await api<{ mode: Mode }>("PUT", url, { full })
+    toast.success(full ? "Full desktop turned on" : "Full desktop turned off", {
+      description: "Applies from its next session.",
+    })
+    return r.mode
+  })
 
   return (
     <Field orientation="horizontal">
@@ -552,8 +598,8 @@ function AccountDesktopMode({ account }: { account: WindowsAccount }) {
         <Switch
           id="acct-full-desktop"
           checked={mode === "full"}
-          disabled={busy || (mode !== "app" && mode !== "full")}
-          onCheckedChange={change}
+          disabled={mode !== "app" && mode !== "full"}
+          onCheckedChange={(full) => setMode(full ? "full" : "app")}
         />
       )}
     </Field>
@@ -570,11 +616,11 @@ function OwnerAccessDialog({
   account: WindowsAccount
   open: boolean
   onOpenChange: (open: boolean) => void
-  done: () => Promise<void>
+  done: () => void
 }) {
   const blank = { username: account.name.toLowerCase(), password: "", winPassword: "", winUsername: "" }
   const [form, setForm] = useState(blank)
-  const [busy, setBusy] = useState(false)
+  const { busy, step, run } = useAction()
   useEffect(() => {
     if (open) setForm(blank)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -582,23 +628,27 @@ function OwnerAccessDialog({
   const set = (patch: Partial<typeof blank>) => setForm((f) => ({ ...f, ...patch }))
 
   const submit = async () => {
-    setBusy(true)
     try {
-      await api("POST", "/api/admin/owner-access", {
-        username: form.username,
-        password: form.password,
-        win_password: form.winPassword,
-        win_username: form.winUsername,
-      })
-      await done()
+      await run((onStep) =>
+        api(
+          "POST",
+          "/api/admin/owner-access",
+          {
+            username: form.username,
+            password: form.password,
+            win_password: form.winPassword,
+            win_username: form.winUsername,
+          },
+          { onStep },
+        ),
+      )
       onOpenChange(false)
       toast.success("Your desktop is on the portal", {
         description: `Sign in to the portal as ${form.username.trim()} to open it.`,
       })
+      done()
     } catch (e) {
       toast.error(errorText(e))
-    } finally {
-      setBusy(false)
     }
   }
 
@@ -677,7 +727,7 @@ function OwnerAccessDialog({
               type="submit"
               disabled={busy || !form.username.trim() || !form.password || !form.winPassword}
             >
-              Turn on
+              {busy ? <BusyLabel step={step} fallback="Turning on…" /> : "Turn on"}
             </Button>
           </DialogFooter>
         </form>

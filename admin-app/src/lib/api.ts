@@ -1,7 +1,7 @@
 // Calls to the portal running inside this app. They go through the app's
 // native side (`request` in src-tauri), in-process: no network, no sign-in.
 
-import { invoke } from "@tauri-apps/api/core"
+import { Channel, invoke } from "@tauri-apps/api/core"
 
 /** A session open right now. */
 export type LiveSession = {
@@ -165,10 +165,19 @@ export function serverStatus(): Promise<ServerStatus> {
   return invoke<ServerStatus>("status")
 }
 
-export async function api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
+export type ApiOptions = {
+  /** Gets each step of a long action as the portal reports it ("Closing Miracle…"). */
+  onStep?: (text: string) => void
+}
+
+export async function api<T = unknown>(method: string, path: string, body?: unknown, opts?: ApiOptions): Promise<T> {
+  // The portal sends the steps of a long action through this; most calls send nothing.
+  const progress = new Channel<string>()
+  if (opts?.onStep) progress.onmessage = opts.onStep
+  const args = { method, path, body: body ?? null, progress }
   let res: { status: number; data: { error?: string } }
   try {
-    res = await invoke("request", { method, path, body: body ?? null })
+    res = await invoke("request", args)
   } catch (e) {
     throw new ApiError(String(e))
   }
@@ -259,14 +268,24 @@ export function saveDownload(name: string, contents: string): Promise<string> {
   return invoke("save_download", { name, contents })
 }
 
-/** "just now", "4 min", "2 h 5 min" since a Unix time. */
+/** "just now", "4 min", "5 h", "3 days", "4 months", "2 years" since a Unix time. */
 export function since(unix: number): string {
   const s = Math.max(0, Math.floor(Date.now() / 1000 - unix))
   if (s < 60) return "just now"
   const m = Math.floor(s / 60)
   if (m < 60) return `${m} min`
   const h = Math.floor(m / 60)
-  return m % 60 ? `${h} h ${m % 60} min` : `${h} h`
+  if (h < 48) return m % 60 ? `${h} h ${m % 60} min` : `${h} h`
+  const d = Math.floor(h / 24)
+  if (d < 60) return `${d} days`
+  if (d < 730) return `${Math.floor(d / 30)} months`
+  return `${Math.floor(d / 365)} years`
+}
+
+/** "just now", or "5 h ago". */
+export function ago(unix: number): string {
+  const t = since(unix)
+  return t === "just now" ? t : `${t} ago`
 }
 
 export function errorText(e: unknown): string {

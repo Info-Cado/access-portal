@@ -299,24 +299,15 @@ fn local_addresses() -> Vec<(&'static str, String)> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const SCRIPT: &str = "Get-NetIPAddress -AddressFamily IPv4 -AddressState Preferred -ErrorAction SilentlyContinue | \
-            Where-Object { $_.InterfaceAlias -notmatch '^(vEthernet|Loopback)' } | \
-            ForEach-Object { $_.IPAddress }";
         let mut found = Vec::new();
-        if let Ok(out) = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
-            .creation_flags(0x0800_0000)
-            .output()
-        {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Ok(ip) = line.trim().parse::<IpAddr>() {
-                    match kind(ip) {
-                        Some(k @ ("lan" | "tailscale")) => found.push((k, ip.to_string())),
-                        _ => {}
-                    }
-                }
+        for ip in crate::win::ipv4_addresses(&["vEthernet", "Loopback"]) {
+            match kind(IpAddr::V4(ip)) {
+                Some(k @ ("lan" | "tailscale")) => found.push((k, ip.to_string())),
+                _ => {}
             }
         }
+        // Local network addresses first, as before.
+        found.sort_by_key(|(k, _)| *k != "lan");
         // MagicDNS name, e.g. my-pc.tailnet-name.ts.net.
         let tailscale = std::path::Path::new(&std::env::var("ProgramFiles").unwrap_or_default()).join("Tailscale\\tailscale.exe");
         if let Ok(out) = std::process::Command::new(tailscale)
