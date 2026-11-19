@@ -89,8 +89,8 @@ below, and `EGFX=off` turns the pipeline off.
 On the local network the link is fast, so H.264 costs more than it saves. A
 session whose link stays inside the local network skips H.264 and the motion
 hybrid: Windows sends its plain lossless bitmaps, and the portal sends every
-change as fast-packed lossless PNG tiles in one batch, so the browser paints the
-whole change at once. A link counts as local when it is:
+change as fast-packed tiles in one batch, so the browser paints the whole change
+at once. A link counts as local when it is:
 
 - a direct link between two local-network addresses (the browser's may be an
   mDNS `….local` name), or
@@ -98,10 +98,22 @@ whole change at once. A link counts as local when it is:
   less (when both computers run Tailscale, the browser often picks that path), or
 - a WebSocket straight from a local-network address (not through the tunnel).
 
-Packing a full 1920x1080 screen takes about 4.5 ms (the normal tile path takes
-about 57 ms for a slightly smaller result). Measured over Wi-Fi on the
-development laptop: 20 Page Downs in one second settle at 1.0 s, against 1.5 s
-with H.264; the portal adds 0.5 ms per change. `LAN_MODE=off` turns it off.
+Text and windows go as lossless PNG. Photo-like areas (a wallpaper, a picture),
+where a lossless tile is several times bigger than a JPEG, go as JPEG first and
+are resent lossless once the screen has been still for 150 ms, in small pieces
+one at a time so a new change never waits behind them. A lossless photo can be
+more than the whole Wi-Fi link: dragging a window over a photo wallpaper took
+7.5 MB/s, about all of the laptop's 60 Mbit/s Wi-Fi, so every change queued.
+The portal measures the link from the browser's acknowledgements of big
+batches; at 320 Mbit/s or more (wired gigabit) photos go lossless at once, and
+below 160 Mbit/s they go back to JPEG first. Tiles are packed on up to 8 cores.
+
+Measured over Wi-Fi on the development laptop, dragging a window over a photo
+wallpaper: 59-66 frames a second against 43-50 before, the picture catches up
+240 ms after the mouse stops against 300-430 ms, the longest wait for a batch
+fell from 200-290 ms to 40-60 ms, and the data from 7.5 to 4.5 MB/s. A key
+press shows in 35-50 ms, almost all of it Windows drawing (the link adds 2-5
+ms). `LAN_MODE=off` turns local network mode off.
 
 ### Screen updates without H.264 (`src/tiles.rs`)
 
