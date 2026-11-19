@@ -571,10 +571,14 @@ async fn rdp_socket(
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }));
     }
-    let target = match session_target(&state, &user, &key, &viewport, &headers).await? {
+    let mut target = match session_target(&state, &user, &key, &viewport, &headers).await? {
         Ok(target) => target,
         Err(status) => return Ok(status.into_response()),
     };
+    // Straight from the local network (not through the tunnel, whose address
+    // is the browser's public one).
+    target.lan = state.config.lan_mode
+        && client_address(&headers).parse().is_ok_and(crate::network::is_lan);
     let connection = connection_info(&state, &user, &key, &headers, "relayed").await;
     let presence = state.presence.clone();
     let health = state.health.clone();
@@ -645,11 +649,12 @@ async fn rtc_offer(
         // A refused direct link falls back to the WebSocket, which says why.
         return Ok(StatusCode::FORBIDDEN.into_response());
     }
-    let target = match session_target(&state, &user, &key, &viewport, &headers).await? {
+    let mut target = match session_target(&state, &user, &key, &viewport, &headers).await? {
         Ok(target) => target,
         Err(status) => return Ok(status.into_response()),
     };
     let username = target.username.clone();
+    let lan_mode = state.config.lan_mode;
     let connection = connection_info(&state, &user, &key, &headers, "direct").await;
     let presence = state.presence.clone();
     let health = state.health.clone();
@@ -660,6 +665,7 @@ async fn rtc_offer(
         ..Default::default()
     }];
     let on_open: transport::OnOpen = Box::new(move |link| {
+        target.lan = lan_mode && link.lan();
         tokio::spawn(async move {
             let listed = presence.enter(connection.clone());
             run_logged(target, listed, connection, health, Box::new(link)).await;
@@ -759,6 +765,8 @@ async fn session_target(
         files_dir: user_files_dir(state, user).await.ok(),
         // The browser advertises it can decode Windows' H.264 (High profile) with ?vd=2.
         egfx: state.config.egfx && viewport.vd == Some(2),
+        // Set by the caller once it knows which link the session uses.
+        lan: false,
         kick: None,
         notices: None,
         idle: match settings::sessions(&state.pool).await.idle_minutes {

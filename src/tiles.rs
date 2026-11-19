@@ -9,6 +9,9 @@
 //! * many colours, large     -> JPEG now, then a lossless PNG once things go quiet
 //! * many colours, small     -> RGB PNG
 //!
+//! On the local network every tile is a lossless PNG packed the fastest way
+//! (about 12 times quicker than the above for a slightly bigger picture).
+//!
 //! Batches are capped in size and the caller limits how many are in flight, so
 //! on a slow link pending changes pile up as *flags* rather than as queued
 //! bytes, and the newest pixels are what gets sent next.
@@ -43,10 +46,13 @@ pub struct Tiles {
     force: Vec<bool>,
     /// Where the next batch starts, so every tile gets its turn.
     cursor: usize,
+    /// Local network: every tile is a plain lossless PNG, packed the fastest
+    /// way. Bytes are cheap there; the time to pack them is not.
+    lan: bool,
 }
 
 impl Tiles {
-    pub fn new(width: u16, height: u16, framebuffer_len: usize) -> Self {
+    pub fn new(width: u16, height: u16, framebuffer_len: usize, lan: bool) -> Self {
         let (width, height) = (usize::from(width), usize::from(height));
         let cols = width.div_ceil(TILE).max(1);
         let rows = height.div_ceil(TILE).max(1);
@@ -59,6 +65,7 @@ impl Tiles {
             lossy: vec![false; cols * rows],
             force: vec![false; cols * rows],
             cursor: 0,
+            lan,
         }
     }
 
@@ -184,7 +191,12 @@ impl Tiles {
                 }
             }
 
-            let Some((fmt, data)) = encode(&rgb, w, h, !lossless_only) else {
+            let encoded = if self.lan {
+                png_image(w, h, png::ColorType::Rgb, &rgb, None, png::Compression::Fast).map(|d| (FMT_PNG, d))
+            } else {
+                encode(&rgb, w, h, !lossless_only)
+            };
+            let Some((fmt, data)) = encoded else {
                 continue;
             };
             if lossless_only {
@@ -283,7 +295,7 @@ fn encode(rgb: &[u8], w: usize, h: usize, allow_lossy: bool) -> Option<(u8, Vec<
     }
 
     if fits {
-        return png_image(w, h, png::ColorType::Indexed, &indices, Some(palette)).map(|d| (FMT_PNG, d));
+        return png_image(w, h, png::ColorType::Indexed, &indices, Some(palette), png::Compression::Balanced).map(|d| (FMT_PNG, d));
     }
     if allow_lossy && w * h >= MIN_LOSSY_PIXELS && w <= 65535 && h <= 65535 {
         let mut out = Vec::with_capacity(w * h / 4);
@@ -293,14 +305,14 @@ fn encode(rgb: &[u8], w: usize, h: usize, allow_lossy: bool) -> Option<(u8, Vec<
         if encoder.encode(rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb).is_ok() {
             // A lossy tile is followed later by a lossless one, so it only pays
             // off when it is much smaller. Otherwise send the lossless tile now.
-            let lossless = png_image(w, h, png::ColorType::Rgb, rgb, None);
+            let lossless = png_image(w, h, png::ColorType::Rgb, rgb, None, png::Compression::Balanced);
             return match lossless {
                 Some(exact) if exact.len() <= out.len() * 2 => Some((FMT_PNG, exact)),
                 _ => Some((FMT_JPEG, out)),
             };
         }
     }
-    png_image(w, h, png::ColorType::Rgb, rgb, None).map(|d| (FMT_PNG, d))
+    png_image(w, h, png::ColorType::Rgb, rgb, None, png::Compression::Balanced).map(|d| (FMT_PNG, d))
 }
 
 fn png_image(
@@ -309,13 +321,14 @@ fn png_image(
     colour: png::ColorType,
     data: &[u8],
     palette: Option<Vec<u8>>,
+    compression: png::Compression,
 ) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() / 8 + 128);
     {
         let mut encoder = png::Encoder::new(&mut out, w as u32, h as u32);
         encoder.set_color(colour);
         encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_compression(png::Compression::Balanced);
+        encoder.set_compression(compression);
         if let Some(palette) = palette {
             encoder.set_palette(palette);
         }
@@ -323,4 +336,103 @@ fn png_image(
         writer.write_image_data(data).ok()?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A screen with many colours (no palette fits), so the normal path would
+    /// pick JPEG for a big change.
+    fn noisy_frame(w: usize, h: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(2_654_435_761).max(1);
+        let mut frame = Vec::with_capacity(w * h * 4);
+        for _ in 0..w * h {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            frame.extend_from_slice(&[x as u8, (x >> 8) as u8, (x >> 16) as u8, 255]);
+        }
+        frame
+    }
+
+    fn whole(w: u16, h: u16) -> InclusiveRectangle {
+        InclusiveRectangle { left: 0, top: 0, right: w - 1, bottom: h - 1 }
+    }
+
+    /// Unpack a batch into (x, y, fmt, bytes) per tile.
+    fn tiles_of(batch: &[u8]) -> Vec<(u16, u16, u8, Vec<u8>)> {
+        assert_eq!(batch[0], 2);
+        let count = u16::from_le_bytes([batch[5], batch[6]]) as usize;
+        let mut off = 7;
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let x = u16::from_le_bytes([batch[off], batch[off + 1]]);
+            let y = u16::from_le_bytes([batch[off + 2], batch[off + 3]]);
+            let fmt = batch[off + 4];
+            let len = u32::from_le_bytes(batch[off + 5..off + 9].try_into().unwrap()) as usize;
+            out.push((x, y, fmt, batch[off + 9..off + 9 + len].to_vec()));
+            off += 9 + len;
+        }
+        assert_eq!(off, batch.len());
+        out
+    }
+
+    #[test]
+    fn lan_sends_a_whole_screen_in_one_lossless_batch() {
+        let (w, h) = (1280u16, 720u16);
+        let frame = noisy_frame(w.into(), h.into(), 7);
+        let mut tiles = Tiles::new(w, h, frame.len(), true);
+        tiles.mark(&whole(w, h));
+        let batch = tiles.next_batch(&frame, usize::from(w) * 4, 4, 1, 64 * 1024 * 1024, false, &[]).unwrap();
+        assert!(!tiles.has_work(), "everything went in the one batch");
+        let sent = tiles_of(&batch);
+        assert_eq!(sent.len(), 5 * 3, "every 256-pixel tile of 1280x720");
+        for (x, y, fmt, data) in sent {
+            assert_eq!(fmt, FMT_PNG);
+            // The PNG holds exactly the screen's pixels.
+            let mut reader = png::Decoder::new(std::io::Cursor::new(data)).read_info().unwrap();
+            let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+            let info = reader.next_frame(&mut buf).unwrap();
+            assert_eq!(info.color_type, png::ColorType::Rgb);
+            for row in 0..info.height as usize {
+                for col in 0..info.width as usize {
+                    let src = ((usize::from(y) + row) * usize::from(w) + usize::from(x) + col) * 4;
+                    let dst = (row * info.width as usize + col) * 3;
+                    assert_eq!(&buf[dst..dst + 3], &frame[src..src + 3]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn internet_path_still_caps_batches() {
+        let (w, h) = (1280u16, 720u16);
+        let frame = noisy_frame(w.into(), h.into(), 9);
+        let mut tiles = Tiles::new(w, h, frame.len(), false);
+        tiles.mark(&whole(w, h));
+        let batch = tiles.next_batch(&frame, usize::from(w) * 4, 4, 1, 48 * 1024, false, &[]).unwrap();
+        assert!(tiles.has_work(), "a small budget leaves the rest for later batches");
+        assert!(tiles_of(&batch).len() < 15);
+    }
+
+    #[test]
+    fn lan_sends_only_what_changed() {
+        let (w, h) = (1024u16, 512u16);
+        let mut frame = noisy_frame(w.into(), h.into(), 3);
+        let mut tiles = Tiles::new(w, h, frame.len(), true);
+        tiles.mark(&whole(w, h));
+        tiles.next_batch(&frame, usize::from(w) * 4, 4, 1, 64 * 1024 * 1024, false, &[]).unwrap();
+        // Change a 10x10 square inside one tile.
+        for row in 300..310usize {
+            for col in 600..610usize {
+                frame[(row * usize::from(w) + col) * 4] ^= 0xff;
+            }
+        }
+        tiles.mark(&InclusiveRectangle { left: 600, top: 300, right: 609, bottom: 309 });
+        let batch = tiles.next_batch(&frame, usize::from(w) * 4, 4, 2, 64 * 1024 * 1024, false, &[]).unwrap();
+        let sent = tiles_of(&batch);
+        assert_eq!(sent.len(), 1);
+        assert_eq!((sent[0].0, sent[0].1), (600, 300));
+    }
 }

@@ -362,7 +362,7 @@ form{display:inline}
   function gsurface(id, w, h) {
     var c = document.createElement("canvas");
     c.width = w; c.height = h;
-    return { w: w, h: h, canvas: c, ctx: c.getContext("2d", { alpha: false }), mapped: false, x: 0, y: 0, direct: false };
+    return { w: w, h: h, canvas: c, ctx: c.getContext("2d", { alpha: false }), mapped: false, x: 0, y: 0 };
   }
   function gdecoder(sid) {
     var d = gdec[sid];
@@ -390,6 +390,8 @@ form{display:inline}
           c.restore();
         }
         frame.close();
+        // A picture that came after its frame was shown: show it now.
+        if (w && w.late && w.draw) gpresent();
         if (w) w.done();
       },
       error: function (e) {
@@ -426,7 +428,7 @@ form{display:inline}
       return new Promise(function (resolve) {
         var settled = false;
         entry.done = function () { if (!settled) { settled = true; resolve(); } };
-        setTimeout(function () { if (!settled) { gstats.timeouts++; entry.done(); } }, 40);
+        setTimeout(function () { if (!settled) { gstats.timeouts++; entry.late = true; entry.done(); } }, 40);
       });
     });
   }
@@ -437,6 +439,10 @@ form{display:inline}
     gqueue(function () {
       return bmp.then(function (b) { var s = gsurf[sid]; if (s) s.ctx.drawImage(b, x, y); if (b.close) b.close(); });
     });
+  }
+  // Show the finished frame: copy every mapped surface to the visible canvas.
+  function gpresent() {
+    for (var id in gsurf) { var s = gsurf[id]; if (s.mapped) ctx.drawImage(s.canvas, s.x, s.y); }
   }
   function gop(o) {
     var s;
@@ -449,13 +455,10 @@ form{display:inline}
       case "cs": gsurf[o.id] = gsurface(o.id, o.w, o.h); return;
       case "ds": delete gsurf[o.id]; if (gdec[o.id]) { try { gdec[o.id].dec.close(); } catch (e) {} delete gdec[o.id]; } return;
       case "ms":
+        // Surfaces are drawn off screen and shown whole at the end of each frame
+        // (see gpresent), so a half-drawn frame is never on screen.
         s = gsurf[o.id]; if (!s) return;
         s.mapped = true; s.x = o.x; s.y = o.y;
-        if (o.x === 0 && o.y === 0 && s.w === canvas.width && s.h === canvas.height && !s.direct) {
-          // The desktop surface covers the whole output: draw straight on the visible canvas.
-          ctx.drawImage(s.canvas, 0, 0);
-          s.canvas = canvas; s.ctx = ctx; s.direct = true;
-        }
         return;
       case "fill":
         s = gsurf[o.s]; if (!s) return;
@@ -481,8 +484,7 @@ form{display:inline}
         delete gcache[o.slot];
         return;
       case "ef":
-        // Surfaces shown somewhere other than full-screen are composited per frame.
-        for (var id in gsurf) { s = gsurf[id]; if (s.mapped && !s.direct) ctx.drawImage(s.canvas, s.x, s.y); }
+        gpresent();
         send({ t: "fa", id: o.id });
         gstats.frames++; gstats.lastFrameAt = performance.now();
         if (!gotFrame) { gotFrame = true; retries = 0; overlay.classList.add("hidden"); canvas.focus(); }
