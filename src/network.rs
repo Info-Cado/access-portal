@@ -226,6 +226,16 @@ fn generate_cert() -> Result<(String, String)> {
 }
 
 /// The kind of network a browser connects from, if the portal knows it.
+/// Whether `ip` is on the local network (not this computer, not Tailscale).
+pub fn is_lan(ip: IpAddr) -> bool {
+    kind(ip) == Some("lan")
+}
+
+/// Whether `ip` is a Tailscale address.
+pub fn is_tailscale(ip: IpAddr) -> bool {
+    kind(ip) == Some("tailscale")
+}
+
 fn kind(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => {

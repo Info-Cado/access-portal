@@ -25,6 +25,7 @@ use webrtc::peer_connection::{
     PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceGatheringState, RTCIceServer,
     RTCPeerConnectionState, RTCSessionDescription, Registry,
 };
+use webrtc::peer_connection::StatsSelector;
 use webrtc::runtime::{default_runtime, Runtime};
 
 const CHUNK: usize = 15_000;
@@ -99,9 +100,17 @@ pub struct RtcTransport {
     channel: Arc<dyn DataChannel>,
     /// Tells the task that owns the peer connection to shut it down.
     done: Option<oneshot::Sender<()>>,
+    /// The browser is on the local network: the link runs between two local
+    /// addresses, not through a relay or the internet.
+    lan: bool,
 }
 
 impl RtcTransport {
+    /// Whether this link stays inside the local network.
+    pub fn lan(&self) -> bool {
+        self.lan
+    }
+
     async fn send_chunked(&mut self, data: &[u8], text: bool) -> anyhow::Result<()> {
         let base = if text { FLAG_TEXT } else { 0 };
         let mut chunks = data.chunks(CHUNK).peekable();
@@ -157,9 +166,9 @@ pub type OnOpen = Box<dyn FnOnce(RtcTransport) + Send>;
 struct Handler {
     runtime: Arc<dyn Runtime>,
     gathered: mpsc::Sender<()>,
-    /// What to do with the channel once it opens, plus the shutdown signal that
+    /// Where to hand the channel once it opens, plus the shutdown signal that
     /// goes with it. Taken by the first data channel; later ones are ignored.
-    start: std::sync::Mutex<Option<(OnOpen, oneshot::Sender<()>, oneshot::Sender<()>)>>,
+    start: std::sync::Mutex<Option<(oneshot::Sender<RtcTransport>, oneshot::Sender<()>)>>,
 }
 
 #[async_trait]
@@ -175,7 +184,7 @@ impl PeerConnectionEventHandler for Handler {
     }
 
     async fn on_data_channel(&self, channel: Arc<dyn DataChannel>) {
-        let Some((on_open, opened, done)) = self.start.lock().ok().and_then(|mut s| s.take()) else {
+        let Some((opened, done)) = self.start.lock().ok().and_then(|mut s| s.take()) else {
             return;
         };
         // Must not block here: that would stall the connection's event loop.
@@ -189,8 +198,9 @@ impl PeerConnectionEventHandler for Handler {
                 }
             }
             let (tx, rx) = mpsc::unbounded_channel();
-            let _ = opened.send(());
-            on_open(RtcTransport { rx, channel: channel.clone(), done: Some(done) });
+            if opened.send(RtcTransport { rx, channel: channel.clone(), done: Some(done), lan: false }).is_err() {
+                return;
+            }
 
             // Reassemble chunked messages from the browser.
             let mut pending: Vec<u8> = Vec::new();
@@ -253,7 +263,7 @@ pub async fn answer_offer(
         .with_handler(Arc::new(Handler {
             runtime: runtime.clone(),
             gathered: gathered_tx,
-            start: std::sync::Mutex::new(Some((on_open, opened_tx, done_tx))),
+            start: std::sync::Mutex::new(Some((opened_tx, done_tx))),
         }))
         .with_runtime(runtime)
         // One UDP socket per local network interface, on ephemeral ports.
@@ -274,11 +284,45 @@ pub async fn answer_offer(
     // Keep the connection alive for as long as the session uses it.
     tokio::spawn(async move {
         let opened = tokio::time::timeout(std::time::Duration::from_secs(30), opened_rx).await;
-        if matches!(opened, Ok(Ok(()))) {
+        if let Ok(Ok(mut link)) = opened {
+            link.lan = on_local_network(&pc).await;
+            on_open(link);
             let _ = done_rx.await;
         }
         let _ = pc.close().await;
     });
 
     Ok(local)
+}
+
+/// Round trips at or under this count as the local network. Wi-Fi in the same
+/// office measures 2–6 ms; the internet, even within one city, more.
+const LAN_RTT_SECS: f64 = 0.008;
+
+/// Whether the path ICE chose stays inside the local network: a direct path
+/// (not a relay) between two local addresses, or between two Tailscale
+/// addresses with a local-network round trip (both computers also run
+/// Tailscale, and ICE picked that path although they sit side by side). A
+/// browser's own address may be hidden behind an mDNS name (`….local`), which
+/// only resolves on the same network.
+async fn on_local_network(pc: &impl PeerConnection) -> bool {
+    use crate::network::{is_lan, is_tailscale};
+    let Some(sctp) = pc.sctp().await else { return false };
+    let Ok(Some(pair)) = sctp.transport().ice_transport().get_selected_candidate_pair().await else {
+        return false;
+    };
+    let (local, remote) = (&pair.local().address, &pair.remote().address);
+    let rtt = pc
+        .get_stats(std::time::Instant::now(), StatsSelector::None)
+        .await
+        .candidate_pairs()
+        .filter(|p| p.nominated && p.current_round_trip_time > 0.0)
+        .map(|p| p.current_round_trip_time)
+        .fold(None, |best: Option<f64>, r| Some(best.map_or(r, |b| b.min(r))));
+    let close = rtt.is_some_and(|r| r <= LAN_RTT_SECS);
+    let lan = local.parse().is_ok_and(is_lan) && (remote.ends_with(".local") || remote.parse().is_ok_and(is_lan));
+    let tailscale = local.parse().is_ok_and(is_tailscale) && remote.parse().is_ok_and(is_tailscale);
+    let result = lan || (tailscale && close);
+    tracing::debug!("direct link path: {pair}, round trip {rtt:?} s; local network: {result}");
+    result
 }

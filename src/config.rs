@@ -31,6 +31,9 @@ pub struct Config {
     pub video: bool,
     /// Use Windows' graphics pipeline (H.264 from the host) for sessions.
     pub egfx: bool,
+    /// On the local network, send the screen as lossless pictures instead of
+    /// H.264: the link is fast enough that compression costs more than it saves.
+    pub lan_mode: bool,
 
     pub session_ttl_secs: i64,
     pub max_failed: i64,
@@ -73,6 +76,7 @@ impl Config {
             },
             video: var("VIDEO", "on") != "off",
             egfx: var("EGFX", "on") != "off",
+            lan_mode: var("LAN_MODE", "on") != "off",
             session_ttl_secs: var("SESSION_TTL_SECS", "28800").parse().unwrap_or(28800),
             max_failed: var("MAX_FAILED", "5").parse().unwrap_or(5),
             lockout_secs: var("LOCKOUT_SECS", "300").parse().unwrap_or(300),

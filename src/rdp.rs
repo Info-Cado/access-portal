@@ -89,6 +89,9 @@ pub struct Target {
     pub clip_dir: Option<std::path::PathBuf>,
     /// The browser can decode AAC sound (much smaller than PCM).
     pub sound_aac: bool,
+    /// The browser is on the local network: send the screen as lossless
+    /// pictures, whole, instead of H.264 (see `tiles.rs`).
+    pub lan: bool,
 }
 
 /// What a session needs besides the connection itself.
@@ -118,6 +121,10 @@ pub const DRIVE_NAME: &str = "P";
 /// responsive: what is not sent yet stays pending and is superseded by newer
 /// pixels instead of queueing up behind them.
 const BATCH_BYTES: usize = 48 * 1024;
+/// On the local network the link is never the bottleneck: send everything
+/// that changed at once, so the browser paints the whole change in one go
+/// instead of a strip at a time.
+const LAN_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// How many batches may be on their way to the browser at once. With the
 /// unordered direct channel, a lost batch is resent without blocking the others,
 /// so a few in flight keeps a high-latency link busy without bloating it.
@@ -473,9 +480,9 @@ fn config(target: &Target) -> Config {
         autologon: false,
         enable_audio_playback: true,
         enable_audio_capture: true,
-        // With Windows' H.264 the full desktop experience costs little: show window
-        // contents while dragging, animations, smooth fonts and composition.
-        performance_flags: if target.egfx {
+        // With Windows' H.264, or on the local network, the full desktop
+        // experience costs little: smooth fonts and composition.
+        performance_flags: if target.egfx || target.lan {
             PerformanceFlags::ENABLE_FONT_SMOOTHING | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION
         } else {
             PerformanceFlags::default()
@@ -584,6 +591,13 @@ async fn connect(
 /// with what the user was told about why it ended, and whether it failed
 /// (could not be opened or broke) rather than ended normally.
 pub async fn run(mut target: Target, mut io: Box<dyn Transport>) -> (String, Option<String>) {
+    if target.lan {
+        // No H.264 at all: Windows sends its plain lossless bitmaps and the
+        // portal passes each screen change on in one piece.
+        target.egfx = false;
+        target.video_ok = false;
+    }
+    tracing::debug!("session for {}: local network {}", target.username, target.lan);
     let connected = connect(&target).await;
     let connected = connected.map(|(result, framed, clip_rx, gfx, printed, sound, devices)| {
         let extras = Extras {
@@ -603,7 +617,7 @@ pub async fn run(mut target: Target, mut io: Box<dyn Transport>) -> (String, Opt
     });
     let outcome = match connected {
         Ok((result, framed, clip_rx, gfx, extras)) => {
-            session(result, framed, clip_rx, target.resizable, target.video_ok && gfx.is_none(), gfx, extras, io.as_mut()).await
+            session(result, framed, clip_rx, target.resizable, target.video_ok && gfx.is_none(), target.lan, gfx, extras, io.as_mut()).await
         }
         Err(e) => Err(e),
     };
@@ -880,6 +894,7 @@ async fn session(
     clip_rx: std::sync::mpsc::Receiver<ClipEvent>,
     resizable: bool,
     video_ok: bool,
+    lan: bool,
     gfx: Option<crate::gfx::SharedRef>,
     mut extras: Extras,
     io: &mut dyn Transport,
@@ -933,7 +948,9 @@ async fn session(
     send_json(io, json!({"t": "size", "w": image.width(), "h": image.height()})).await?;
 
     let mut input = Database::new();
-    let mut tiles = Tiles::new(image.width(), image.height(), image.data().len());
+    let mut tiles = Tiles::new(image.width(), image.height(), image.data().len(), lan);
+    // A whole screen change goes as one batch on the local network.
+    let batch_bytes = if lan { LAN_BATCH_BYTES } else { BATCH_BYTES };
     tracing::debug!("session start: video_ok={video_ok}");
     let mut video = Video::new(image.width(), image.height(), video_ok);
     // Graphics pipeline: frames Windows sent so far, acknowledged as the browser draws them.
@@ -997,7 +1014,7 @@ async fn session(
                     image.stride(),
                     image.bytes_per_pixel(),
                     sent_seq.wrapping_add(1),
-                    BATCH_BYTES,
+                    batch_bytes,
                     refine,
                     &skip,
                 ) {
@@ -1632,7 +1649,7 @@ async fn session(
                                 );
                                 send_json(io, json!({"t": "size", "w": image.width(), "h": image.height()})).await?;
                                 // New framebuffer, blank on both sides: start over.
-                                tiles = Tiles::new(image.width(), image.height(), image.data().len());
+                                tiles = Tiles::new(image.width(), image.height(), image.data().len(), lan);
                                 video = Video::new(image.width(), image.height(), video_ok);
                                 (sent_seq, acked_seq) = (0, 0);
                                 break;
