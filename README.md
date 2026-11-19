@@ -60,6 +60,8 @@ Windows drew, in order.
   frame in one stream. The browser decodes both and draws the main view, a full
   4:2:0 picture of the screen.
 - Each picture is drawn once, clipped to the areas Windows says changed.
+- Surfaces are drawn off screen and copied to the visible screen when Windows
+  ends the frame, so a half-drawn frame (part new, part old) is never shown.
 - Frames are acknowledged to Windows only after the browser drew them, so a slow
   link gets fewer frames rather than a growing delay.
 - The session loop serves the browser before the host, so input and
@@ -81,6 +83,25 @@ shows: no automatic sign-in, and no account, password or Remote Desktop change.
 
 Browsers that cannot decode H.264 (`?vd=2` is not sent) get the older path
 below, and `EGFX=off` turns the pipeline off.
+
+### Local network mode
+
+On the local network the link is fast, so H.264 costs more than it saves. A
+session whose link stays inside the local network skips H.264 and the motion
+hybrid: Windows sends its plain lossless bitmaps, and the portal sends every
+change as fast-packed lossless PNG tiles in one batch, so the browser paints the
+whole change at once. A link counts as local when it is:
+
+- a direct link between two local-network addresses (the browser's may be an
+  mDNS `….local` name), or
+- a direct link between two Tailscale addresses with a round trip of 8 ms or
+  less (when both computers run Tailscale, the browser often picks that path), or
+- a WebSocket straight from a local-network address (not through the tunnel).
+
+Packing a full 1920x1080 screen takes about 4.5 ms (the normal tile path takes
+about 57 ms for a slightly smaller result). Measured over Wi-Fi on the
+development laptop: 20 Page Downs in one second settle at 1.0 s, against 1.5 s
+with H.264; the portal adds 0.5 ms per change. `LAN_MODE=off` turns it off.
 
 ### Screen updates without H.264 (`src/tiles.rs`)
 
@@ -190,7 +211,8 @@ after an update) use to come back with them, without asking
 - RDP Wrapper, so several people can be connected at once on Windows Home or
   Pro (the official v1.6.2 release, checked against its known checksum, with
   Microsoft Defender exclusions for its folder and for the folder it is
-  downloaded to, `C:\ProgramData\AccessPortaldpwrap-setup`) and its settings for this
+  downloaded to, `C:\ProgramData\AccessPortal
+dpwrap-setup`) and its settings for this
   Windows build, fetched from the portal's update service first and then from
   community sources; after a Windows update breaks it, the same button fixes it;
 - the "Portal RDP Users" group and its permission to sign in over Remote Desktop;
@@ -208,7 +230,8 @@ removed part of it.
 sends the checks, Windows version, Remote Desktop and antivirus details, the
 app's recent admin actions and the end of `portal.log` to the sign-up service,
 and shows the report's number (e.g. `261117-1043-ab12`). Nothing is sent
-otherwise. Read them with `.\scriptseports.ps1 -TokenFile <Cloudflare token>`
+otherwise. Read them with `.\scripts
+eports.ps1 -TokenFile <Cloudflare token>`
 (latest 20) and `-Id <number>` (one in full).
 
 **Releasing an update:** `.\scripts\release.ps1 -Version 0.2.1 -Notes "..."
