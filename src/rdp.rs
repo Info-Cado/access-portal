@@ -995,8 +995,7 @@ async fn session(
     // Batches on their way (number, when sent, size), the link speed measured
     // from them, and when the host last drew something.
     let mut in_flight: std::collections::VecDeque<(u32, std::time::Instant, usize)> = Default::default();
-    let mut link_rate: Option<f64> = None;
-    let mut lossless_link = false;
+    let mut link = LinkMeter::default();
     let mut last_update = std::time::Instant::now();
     let text_format = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
     let image_format = [ClipboardFormat::new(ClipboardFormatId::CF_DIB)];
@@ -1015,9 +1014,7 @@ async fn session(
     // network the screen has been still for a moment and no batch is on its way.
     macro_rules! refine_due {
         () => {
-            !tiles.has_dirty()
-                && tiles.has_lossy()
-                && (!lan || (last_update.elapsed() >= REFINE_AFTER && sent_seq == acked_seq))
+            refine_due(lan, tiles.has_dirty(), tiles.has_lossy(), last_update.elapsed(), sent_seq.wrapping_sub(acked_seq))
         };
     }
     // Whether a batch can go right now.
@@ -1368,17 +1365,12 @@ async fn session(
                             tstat.ack_max = tstat.ack_max.max(ms);
                             // Link speed: a big batch's size over the time it took
                             // to arrive and be unpacked (smoothed).
-                            if lan && bytes >= RATE_SAMPLE_BYTES && secs > 0.0 {
-                                let sample = bytes as f64 / secs;
-                                let rate = link_rate.map_or(sample, |r| r * 0.7 + sample * 0.3);
-                                link_rate = Some(rate);
-                                let fast = if lossless_link { rate >= LOSSLESS_OFF_RATE } else { rate >= LOSSLESS_ON_RATE };
-                                if fast != lossless_link {
-                                    lossless_link = fast;
+                            if lan {
+                                if let Some(fast) = link.sample(bytes, secs) {
                                     tiles.set_lossless_link(fast);
                                     tracing::debug!(
                                         "local link measured at {:.0} Mbit/s: photo areas {}",
-                                        rate * 8.0 / 1e6,
+                                        link.rate.unwrap_or(0.0) * 8.0 / 1e6,
                                         if fast { "lossless at once" } else { "as JPEG first" }
                                     );
                                 }
@@ -1725,7 +1717,7 @@ async fn session(
                                 send_json(io, json!({"t": "size", "w": image.width(), "h": image.height()})).await?;
                                 // New framebuffer, blank on both sides: start over.
                                 tiles = Tiles::new(image.width(), image.height(), image.data().len(), lan);
-                                tiles.set_lossless_link(lossless_link);
+                                tiles.set_lossless_link(link.lossless);
                                 video = Video::new(image.width(), image.height(), video_ok);
                                 (sent_seq, acked_seq) = (0, 0);
                                 // Numbering starts over: batches still on their way are forgotten.
@@ -1754,7 +1746,7 @@ async fn session(
                     tstat.bytes_out / 1024,
                     if tstat.acks > 0 { tstat.ack_ms / tstat.acks as f32 } else { 0.0 },
                     tstat.ack_max,
-                    link_rate.unwrap_or(0.0) * 8.0 / 1e6
+                    link.rate.unwrap_or(0.0) * 8.0 / 1e6
                 );
             }
             tstat = TileStats::default();
@@ -1794,6 +1786,41 @@ async fn session(
             }
         }
     }
+}
+
+/// Local network: the link speed measured from the browser's acknowledgements
+/// of big batches, and whether photo areas may go lossless at once.
+#[derive(Default)]
+struct LinkMeter {
+    /// Bytes a second, smoothed; `None` until a big batch was acknowledged.
+    rate: Option<f64>,
+    lossless: bool,
+}
+
+impl LinkMeter {
+    /// A batch of `bytes` took `secs` from sending to its acknowledgement.
+    /// Returns the new setting when it changes.
+    fn sample(&mut self, bytes: usize, secs: f64) -> Option<bool> {
+        if bytes < RATE_SAMPLE_BYTES || secs <= 0.0 {
+            return None;
+        }
+        let sample = bytes as f64 / secs;
+        let rate = self.rate.map_or(sample, |r| r * 0.7 + sample * 0.3);
+        self.rate = Some(rate);
+        // Two thresholds, so a speed near one of them does not flip it back and forth.
+        let fast = if self.lossless { rate >= LOSSLESS_OFF_RATE } else { rate >= LOSSLESS_ON_RATE };
+        (fast != self.lossless).then(|| {
+            self.lossless = fast;
+            fast
+        })
+    }
+}
+
+/// Whether JPEG areas should be sharpened now: nothing new to send and some
+/// JPEG areas left, and on the local network the screen has been still for a
+/// moment and no batch is on its way.
+fn refine_due(lan: bool, dirty: bool, lossy: bool, still: Duration, in_flight: u32) -> bool {
+    !dirty && lossy && (!lan || (still >= REFINE_AFTER && in_flight == 0))
 }
 
 /// Per-second counters for the tile path (diagnostics only).
@@ -2053,5 +2080,47 @@ fn scancode(code: &str) -> Option<(bool, u8)> {
         "MetaRight" => ext(0x5C),
         "ContextMenu" => ext(0x5D),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_meter_ignores_small_batches() {
+        let mut link = LinkMeter::default();
+        assert_eq!(link.sample(64 * 1024, 0.0001), None);
+        assert_eq!(link.rate, None);
+    }
+
+    #[test]
+    fn link_meter_switches_with_hysteresis() {
+        let mut link = LinkMeter::default();
+        // 1 MB in 10 ms = 100 MB/s: lossless at once.
+        assert_eq!(link.sample(1_000_000, 0.01), Some(true));
+        // Down to about 30 MB/s: between the thresholds, stays lossless.
+        for _ in 0..10 {
+            link.sample(1_000_000, 1.0 / 30.0);
+        }
+        assert!(link.lossless);
+        assert!(link.rate.unwrap() < LOSSLESS_ON_RATE);
+        // Wi-Fi speed (5 MB/s): back to JPEG first, once.
+        let switched: Vec<_> = (0..10).filter_map(|_| link.sample(1_000_000, 0.2)).collect();
+        assert_eq!(switched, vec![false]);
+        assert!(!link.lossless);
+    }
+
+    #[test]
+    fn sharpening_waits_for_stillness_and_an_empty_link_on_the_local_network() {
+        let still = REFINE_AFTER;
+        let moving = Duration::from_millis(10);
+        assert!(refine_due(true, false, true, still, 0));
+        assert!(!refine_due(true, false, true, moving, 0), "screen still changing");
+        assert!(!refine_due(true, false, true, still, 1), "a batch is on its way");
+        assert!(!refine_due(true, true, true, still, 0), "new changes go first");
+        assert!(!refine_due(true, false, false, still, 0), "nothing to sharpen");
+        // Over the internet: as before, as soon as nothing new is waiting.
+        assert!(refine_due(false, false, true, moving, 3));
     }
 }
