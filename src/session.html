@@ -901,6 +901,31 @@ form{display:inline}
     canvas.focus();
     press(e.button, pos(e));
   });
+  // Mouse side buttons (Back, Forward) belong to the session, not the browser.
+  // Their default is stopped, and because some browsers go back before the page
+  // can stop it, a spare history entry takes that step instead: the page stays,
+  // and the entry is put back. Only a side button re-arms it, so the browser's
+  // own Back button still leaves.
+  var sideAt = 0, spare = false;
+  function armSpare() {
+    if (spare || closed) return;
+    try { history.pushState({ portal: "spare" }, ""); spare = true; } catch (e) {}
+  }
+  window.addEventListener("popstate", function () {
+    spare = false;
+    if (performance.now() - sideAt < 1500) armSpare();
+  });
+  ["mousedown", "mouseup", "auxclick"].forEach(function (type) {
+    window.addEventListener(type, function (e) {
+      if (e.button !== 3 && e.button !== 4) return;
+      e.preventDefault();
+      sideAt = performance.now();
+      if (type === "mousedown") armSpare();
+    }, true);
+  });
+  // Armed at the first click or key too, for browsers that go back on the press.
+  canvas.addEventListener("mousedown", armSpare);
+  window.addEventListener("keydown", armSpare, true);
   // Releases are caught on the window so a drag that ends outside the picture still ends,
   // but only for buttons that went down on the picture.
   window.addEventListener("mouseup", function (e) {
