@@ -306,7 +306,6 @@ const LAN_RTT_SECS: f64 = 0.008;
 /// browser's own address may be hidden behind an mDNS name (`….local`), which
 /// only resolves on the same network.
 async fn on_local_network(pc: &impl PeerConnection) -> bool {
-    use crate::network::{is_lan, is_tailscale};
     let Some(sctp) = pc.sctp().await else { return false };
     let Ok(Some(pair)) = sctp.transport().ice_transport().get_selected_candidate_pair().await else {
         return false;
@@ -319,10 +318,50 @@ async fn on_local_network(pc: &impl PeerConnection) -> bool {
         .filter(|p| p.nominated && p.current_round_trip_time > 0.0)
         .map(|p| p.current_round_trip_time)
         .fold(None, |best: Option<f64>, r| Some(best.map_or(r, |b| b.min(r))));
-    let close = rtt.is_some_and(|r| r <= LAN_RTT_SECS);
-    let lan = local.parse().is_ok_and(is_lan) && (remote.ends_with(".local") || remote.parse().is_ok_and(is_lan));
-    let tailscale = local.parse().is_ok_and(is_tailscale) && remote.parse().is_ok_and(is_tailscale);
-    let result = lan || (tailscale && close);
+    let result = local_path(local, remote, rtt);
     tracing::debug!("direct link path: {pair}, round trip {rtt:?} s; local network: {result}");
     result
+}
+
+/// The rule behind `on_local_network`, for the two ends of the chosen path
+/// and its measured round trip in seconds.
+fn local_path(local: &str, remote: &str, rtt: Option<f64>) -> bool {
+    use crate::network::{is_lan, is_tailscale};
+    let lan = local.parse().is_ok_and(is_lan) && (remote.ends_with(".local") || remote.parse().is_ok_and(is_lan));
+    let tailscale = local.parse().is_ok_and(is_tailscale) && remote.parse().is_ok_and(is_tailscale);
+    lan || (tailscale && rtt.is_some_and(|r| r <= LAN_RTT_SECS))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_path;
+
+    #[test]
+    fn local_addresses_are_local_whatever_the_round_trip() {
+        assert!(local_path("192.168.32.55", "192.168.32.226", Some(0.004)));
+        assert!(local_path("10.0.0.2", "10.0.0.9", None));
+        assert!(local_path("192.168.1.5", "172.16.4.2", Some(0.020)));
+        // A browser hiding its address behind an mDNS name is on the same network.
+        assert!(local_path("192.168.1.5", "0b1f6c2e-8a4d-4c1e-9f0a-1a2b3c4d5e6f.local", None));
+    }
+
+    #[test]
+    fn tailscale_counts_only_with_a_local_round_trip() {
+        assert!(local_path("100.82.214.46", "100.74.90.44", Some(0.004)));
+        assert!(local_path("100.82.214.46", "100.74.90.44", Some(0.008)));
+        assert!(!local_path("100.82.214.46", "100.74.90.44", Some(0.030)));
+        assert!(!local_path("100.82.214.46", "100.74.90.44", None));
+    }
+
+    #[test]
+    fn internet_relay_and_mixed_paths_are_not_local() {
+        // A public address (a relay or the other end's router).
+        assert!(!local_path("192.168.1.5", "203.0.113.7", Some(0.002)));
+        assert!(!local_path("203.0.113.7", "192.168.1.5", Some(0.002)));
+        // One end on Tailscale, the other on the local network.
+        assert!(!local_path("100.82.214.46", "192.168.1.5", Some(0.002)));
+        // This computer only, and unparseable names.
+        assert!(!local_path("127.0.0.1", "127.0.0.1", Some(0.0001)));
+        assert!(!local_path("192.168.1.5", "example.com", Some(0.002)));
+    }
 }
