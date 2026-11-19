@@ -287,7 +287,19 @@ form{display:inline}
   askedSize = firstSize;
   var query = "?w=" + firstSize.w + "&h=" + firstSize.h + "&sz=1";
   var link = null;                       // { send(string), kind }
-  function send(obj) { if (link) link.send(JSON.stringify(obj)); }
+  function send(obj) {
+    if (!link) return;
+    // Diagnostics: a key press, click or wheel turn starts a "time to next paint" probe.
+    if ((obj.t === "k" || obj.t === "b") && obj.d || obj.t === "w") { if (!lat.at) lat.at = performance.now(); }
+    link.send(JSON.stringify(obj));
+  }
+  // Input -> next paint on screen, and paints per second (read by tests: window.__lat).
+  var lat = { at: 0, samples: [], paints: 0, decodeMs: 0, batches: 0 };
+  window.__lat = lat;
+  function painted() {
+    lat.paints++;
+    if (lat.at) { lat.samples.push(performance.now() - lat.at); lat.at = 0; }
+  }
 
   // ---- H.264 motion layer: moving areas arrive as video, decoded per block ----
   var VCODEC = "avc1.42E01E";
@@ -443,6 +455,7 @@ form{display:inline}
   // Show the finished frame: copy every mapped surface to the visible canvas.
   function gpresent() {
     for (var id in gsurf) { var s = gsurf[id]; if (s.mapped) ctx.drawImage(s.canvas, s.x, s.y); }
+    painted();
   }
   function gop(o) {
     var s;
@@ -572,9 +585,11 @@ form{display:inline}
       jobs.push({ x: x, y: y, bmp: createImageBitmap(blob) });
       off += 9 + len;
     }
+    var arrived = performance.now();
     draw = draw.then(function () {
       return Promise.all(jobs.map(function (j) { return j.bmp.catch(function () { return null; }); }));
     }).then(function (bitmaps) {
+      lat.decodeMs += performance.now() - arrived; lat.batches++;
       bitmaps.forEach(function (bmp, i) {
         if (!bmp) return;
         var cs = cellsOf(jobs[i].x, jobs[i].y, bmp.width, bmp.height);
@@ -587,6 +602,8 @@ form{display:inline}
         if (bmp.close) bmp.close();
       });
       send({ t: "ack", n: seq });
+      gstats.frames++;
+      painted();
       if (!gotFrame) { gotFrame = true; overlay.classList.add("hidden"); canvas.focus(); }
     }).catch(function () { send({ t: "ack", n: seq }); });
   }

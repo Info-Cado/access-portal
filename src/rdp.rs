@@ -125,6 +125,21 @@ const BATCH_BYTES: usize = 48 * 1024;
 /// that changed at once, so the browser paints the whole change in one go
 /// instead of a strip at a time.
 const LAN_BATCH_BYTES: usize = 64 * 1024 * 1024;
+/// Local network: lossless refreshes of photo areas sent as JPEG go in pieces
+/// of about this size, one at a time, so a new change never waits long behind
+/// one (about 20 ms on Wi-Fi).
+const LAN_REFINE_BYTES: usize = 128 * 1024;
+/// Local network: photo areas are made lossless once the screen has been still
+/// this long (sooner would resend areas that are still moving).
+const REFINE_AFTER: Duration = Duration::from_millis(150);
+/// Local network: measured link speeds (bytes a second, including the
+/// browser's unpacking) at which photo areas go lossless straight away, and
+/// below which they go back to JPEG first. Wired gigabit is well above the
+/// first; Wi-Fi is usually below the second.
+const LOSSLESS_ON_RATE: f64 = 40e6;
+const LOSSLESS_OFF_RATE: f64 = 20e6;
+/// Batches smaller than this say more about the round trip than the speed.
+const RATE_SAMPLE_BYTES: usize = 128 * 1024;
 /// How many batches may be on their way to the browser at once. With the
 /// unordered direct channel, a lost batch is resent without blocking the others,
 /// so a few in flight keeps a high-latency link busy without bloating it.
@@ -975,6 +990,13 @@ async fn session(
     let mut redraw_at: Option<std::time::Instant> = None;
     let (mut host_ms, mut portal_ms): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
     let mut last_cursor = String::new();
+    // Diagnostics for the tile path, reported once a second.
+    let mut tstat = TileStats::default();
+    // Batches on their way (number, when sent, size), the link speed measured
+    // from them, and when the host last drew something.
+    let mut in_flight: std::collections::VecDeque<(u32, std::time::Instant, usize)> = Default::default();
+    let mut link = LinkMeter::default();
+    let mut last_update = std::time::Instant::now();
     let text_format = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
     let image_format = [ClipboardFormat::new(ClipboardFormatId::CF_DIB)];
     // Housekeeping only (shared-drive replies, and a safety net for pending tiles):
@@ -988,6 +1010,20 @@ async fn session(
     // Send what changed. Busy areas go out as H.264 (the video layer); still
     // areas go out as tiles, skipping whatever the video layer is covering.
     // Tiles are held back while the browser is still busy with earlier batches.
+    // Sharpening JPEG areas is due: nothing new to send, and on the local
+    // network the screen has been still for a moment and no batch is on its way.
+    macro_rules! refine_due {
+        () => {
+            refine_due(lan, tiles.has_dirty(), tiles.has_lossy(), last_update.elapsed(), sent_seq.wrapping_sub(acked_seq))
+        };
+    }
+    // Whether a batch can go right now.
+    macro_rules! sendable {
+        () => {
+            sent_seq.wrapping_sub(acked_seq) < MAX_IN_FLIGHT && (tiles.has_dirty() || refine_due!())
+        };
+    }
+
     macro_rules! send_pending {
         () => {{
             for event in video.step(&image) {
@@ -1007,18 +1043,22 @@ async fn session(
                 }
             }
             let skip = video.active_rects();
-            if sent_seq.wrapping_sub(acked_seq) < MAX_IN_FLIGHT && tiles.has_work() {
-                let refine = !tiles.has_dirty();
+            let refine = refine_due!();
+            if sendable!() {
+                let budget = if refine && lan { LAN_REFINE_BYTES } else { batch_bytes };
                 if let Some(batch) = tiles.next_batch(
                     image.data(),
                     image.stride(),
                     image.bytes_per_pixel(),
                     sent_seq.wrapping_add(1),
-                    batch_bytes,
+                    budget,
                     refine,
                     &skip,
                 ) {
                     sent_seq = sent_seq.wrapping_add(1);
+                    tstat.batches += 1;
+                    tstat.bytes_out += batch.len();
+                    in_flight.push_back((sent_seq, std::time::Instant::now(), batch.len()));
                     if let Some(t) = redraw_at.take() {
                         portal_ms.push(t.elapsed().as_secs_f32() * 1000.0);
                     }
@@ -1026,8 +1066,9 @@ async fn session(
                 }
             }
             // More to send (budget reached, or tiles to sharpen) and room for it:
-            // come straight back. Otherwise wait for an acknowledgement or a change.
-            flush_due = tiles.has_work() && sent_seq.wrapping_sub(acked_seq) < MAX_IN_FLIGHT;
+            // come straight back. Otherwise wait for an acknowledgement, a
+            // change, or the ticker (which starts a delayed sharpening pass).
+            flush_due = sendable!();
         }};
     }
 
@@ -1312,11 +1353,34 @@ async fn session(
                         continue;
                     }
                     Some(ClientMsg::Ack { n }) => {
+                        while let Some(&(seq, at, bytes)) = in_flight.front() {
+                            if seq.wrapping_sub(n) as i32 > 0 {
+                                break;
+                            }
+                            in_flight.pop_front();
+                            let secs = at.elapsed().as_secs_f64();
+                            let ms = secs as f32 * 1000.0;
+                            tstat.ack_ms += ms;
+                            tstat.acks += 1;
+                            tstat.ack_max = tstat.ack_max.max(ms);
+                            // Link speed: a big batch's size over the time it took
+                            // to arrive and be unpacked (smoothed).
+                            if lan {
+                                if let Some(fast) = link.sample(bytes, secs) {
+                                    tiles.set_lossless_link(fast);
+                                    tracing::debug!(
+                                        "local link measured at {:.0} Mbit/s: photo areas {}",
+                                        link.rate.unwrap_or(0.0) * 8.0 / 1e6,
+                                        if fast { "lossless at once" } else { "as JPEG first" }
+                                    );
+                                }
+                            }
+                        }
                         if n <= sent_seq && n > acked_seq {
                             acked_seq = n;
                         }
                         // Room for another batch: send what has been waiting.
-                        if tiles.has_work() {
+                        if sendable!() {
                             flush_due = true;
                         }
                         continue;
@@ -1495,6 +1559,7 @@ async fn session(
                 // When the frame arrived: Windows measures the link's bandwidth from
                 // these, and without them it is told nothing arrived and throttles.
                 let received_at = framed.last_read_at();
+                tstat.bytes_in += payload.len();
                 stage
                     .process(&mut image, action, &payload, received_at)
                     .map_err(|e| anyhow!("RDP protocol error: {e:#}"))?
@@ -1579,6 +1644,8 @@ async fn session(
                     framed.write_all(&frame).await.context("writing to the host")?;
                 }
                 ActiveStageOutput::GraphicsUpdate(rect) => {
+                    tstat.updates += 1;
+                    last_update = std::time::Instant::now();
                     tiles.mark(&rect);
                     video.mark(&rect);
                     flush_due = true;
@@ -1650,8 +1717,11 @@ async fn session(
                                 send_json(io, json!({"t": "size", "w": image.width(), "h": image.height()})).await?;
                                 // New framebuffer, blank on both sides: start over.
                                 tiles = Tiles::new(image.width(), image.height(), image.data().len(), lan);
+                                tiles.set_lossless_link(link.lossless);
                                 video = Video::new(image.width(), image.height(), video_ok);
                                 (sent_seq, acked_seq) = (0, 0);
+                                // Numbering starts over: batches still on their way are forgotten.
+                                in_flight.clear();
                                 break;
                             }
                             ConnectionActivationState::Redirected { .. } => {
@@ -1666,6 +1736,21 @@ async fn session(
             }
         }
 
+        if tstat.since.elapsed() >= Duration::from_secs(1) {
+            if tstat.batches > 0 {
+                tracing::debug!(
+                    "tiles: {} updates ({} KB) from Windows, {} batches ({} KB) sent, browser ack {:.1} ms avg {:.1} max, link {:.0} Mbit/s",
+                    tstat.updates,
+                    tstat.bytes_in / 1024,
+                    tstat.batches,
+                    tstat.bytes_out / 1024,
+                    if tstat.acks > 0 { tstat.ack_ms / tstat.acks as f32 } else { 0.0 },
+                    tstat.ack_max,
+                    link.rate.unwrap_or(0.0) * 8.0 / 1e6
+                );
+            }
+            tstat = TileStats::default();
+        }
         // Graphics pipeline: pass what Windows sent on to the browser, in order.
         if let Some(shared) = &gfx {
             let ops = std::mem::take(&mut shared.lock().unwrap().ops);
@@ -1699,6 +1784,68 @@ async fn session(
                 (gfx_in, gfx_acked, gfx_ack_ms, gfx_bytes, moves_in) = (0, 0, 0.0, 0, 0);
                 gfx_report_at = std::time::Instant::now();
             }
+        }
+    }
+}
+
+/// Local network: the link speed measured from the browser's acknowledgements
+/// of big batches, and whether photo areas may go lossless at once.
+#[derive(Default)]
+struct LinkMeter {
+    /// Bytes a second, smoothed; `None` until a big batch was acknowledged.
+    rate: Option<f64>,
+    lossless: bool,
+}
+
+impl LinkMeter {
+    /// A batch of `bytes` took `secs` from sending to its acknowledgement.
+    /// Returns the new setting when it changes.
+    fn sample(&mut self, bytes: usize, secs: f64) -> Option<bool> {
+        if bytes < RATE_SAMPLE_BYTES || secs <= 0.0 {
+            return None;
+        }
+        let sample = bytes as f64 / secs;
+        let rate = self.rate.map_or(sample, |r| r * 0.7 + sample * 0.3);
+        self.rate = Some(rate);
+        // Two thresholds, so a speed near one of them does not flip it back and forth.
+        let fast = if self.lossless { rate >= LOSSLESS_OFF_RATE } else { rate >= LOSSLESS_ON_RATE };
+        (fast != self.lossless).then(|| {
+            self.lossless = fast;
+            fast
+        })
+    }
+}
+
+/// Whether JPEG areas should be sharpened now: nothing new to send and some
+/// JPEG areas left, and on the local network the screen has been still for a
+/// moment and no batch is on its way.
+fn refine_due(lan: bool, dirty: bool, lossy: bool, still: Duration, in_flight: u32) -> bool {
+    !dirty && lossy && (!lan || (still >= REFINE_AFTER && in_flight == 0))
+}
+
+/// Per-second counters for the tile path (diagnostics only).
+struct TileStats {
+    since: std::time::Instant,
+    bytes_in: usize,
+    updates: u32,
+    batches: u32,
+    bytes_out: usize,
+    acks: u32,
+    ack_ms: f32,
+    ack_max: f32,
+}
+
+impl Default for TileStats {
+    fn default() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            bytes_in: 0,
+            updates: 0,
+            batches: 0,
+            bytes_out: 0,
+            acks: 0,
+            ack_ms: 0.0,
+            ack_max: 0.0,
         }
     }
 }
@@ -1933,5 +2080,47 @@ fn scancode(code: &str) -> Option<(bool, u8)> {
         "MetaRight" => ext(0x5C),
         "ContextMenu" => ext(0x5D),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_meter_ignores_small_batches() {
+        let mut link = LinkMeter::default();
+        assert_eq!(link.sample(64 * 1024, 0.0001), None);
+        assert_eq!(link.rate, None);
+    }
+
+    #[test]
+    fn link_meter_switches_with_hysteresis() {
+        let mut link = LinkMeter::default();
+        // 1 MB in 10 ms = 100 MB/s: lossless at once.
+        assert_eq!(link.sample(1_000_000, 0.01), Some(true));
+        // Down to about 30 MB/s: between the thresholds, stays lossless.
+        for _ in 0..10 {
+            link.sample(1_000_000, 1.0 / 30.0);
+        }
+        assert!(link.lossless);
+        assert!(link.rate.unwrap() < LOSSLESS_ON_RATE);
+        // Wi-Fi speed (5 MB/s): back to JPEG first, once.
+        let switched: Vec<_> = (0..10).filter_map(|_| link.sample(1_000_000, 0.2)).collect();
+        assert_eq!(switched, vec![false]);
+        assert!(!link.lossless);
+    }
+
+    #[test]
+    fn sharpening_waits_for_stillness_and_an_empty_link_on_the_local_network() {
+        let still = REFINE_AFTER;
+        let moving = Duration::from_millis(10);
+        assert!(refine_due(true, false, true, still, 0));
+        assert!(!refine_due(true, false, true, moving, 0), "screen still changing");
+        assert!(!refine_due(true, false, true, still, 1), "a batch is on its way");
+        assert!(!refine_due(true, true, true, still, 0), "new changes go first");
+        assert!(!refine_due(true, false, false, still, 0), "nothing to sharpen");
+        // Over the internet: as before, as soon as nothing new is waiting.
+        assert!(refine_due(false, false, true, moving, 3));
     }
 }
