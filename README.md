@@ -211,8 +211,7 @@ after an update) use to come back with them, without asking
 - RDP Wrapper, so several people can be connected at once on Windows Home or
   Pro (the official v1.6.2 release, checked against its known checksum, with
   Microsoft Defender exclusions for its folder and for the folder it is
-  downloaded to, `C:\ProgramData\AccessPortal
-dpwrap-setup`) and its settings for this
+  downloaded to, `C:\ProgramData\AccessPortal\rdpwrap-setup`) and its settings for this
   Windows build, fetched from the portal's update service first and then from
   community sources; after a Windows update breaks it, the same button fixes it;
 - the "Portal RDP Users" group and its permission to sign in over Remote Desktop;
@@ -230,8 +229,7 @@ removed part of it.
 sends the checks, Windows version, Remote Desktop and antivirus details, the
 app's recent admin actions and the end of `portal.log` to the sign-up service,
 and shows the report's number (e.g. `261117-1043-ab12`). Nothing is sent
-otherwise. Read them with `.\scripts
-eports.ps1 -TokenFile <Cloudflare token>`
+otherwise. Read them with `.\scripts\reports.ps1 -TokenFile <Cloudflare token>`
 (latest 20) and `-Id <number>` (one in full).
 
 **Releasing an update:** `.\scripts\release.ps1 -Version 0.2.1 -Notes "..."
