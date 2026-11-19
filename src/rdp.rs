@@ -1728,6 +1728,8 @@ async fn session(
                                 tiles.set_lossless_link(lossless_link);
                                 video = Video::new(image.width(), image.height(), video_ok);
                                 (sent_seq, acked_seq) = (0, 0);
+                                // Numbering starts over: batches still on their way are forgotten.
+                                in_flight.clear();
                                 break;
                             }
                             ConnectionActivationState::Redirected { .. } => {
