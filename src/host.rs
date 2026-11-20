@@ -1173,12 +1173,11 @@ async fn folder_acl(win_username: &str, dir: &str, _action: &str) -> anyhow::Res
     Ok(())
 }
 
-/// Grants or removes one account's exclusive access to one data folder with
-/// `icacls`. Refuses drive roots and the Windows / program / profile regions so
-/// a mistyped folder can never lock the operating system. Returns the folder's
-/// full path.
+/// The full path of a data folder the portal may change the permissions of.
+/// Refuses drive roots and the Windows / program / profile folders so a
+/// mistyped folder can never lock the operating system.
 #[cfg(windows)]
-fn folder_acl_blocking(user: &str, dir: &str, action: &str) -> anyhow::Result<String> {
+fn checked_folder(dir: &str) -> anyhow::Result<String> {
     if dir.trim().is_empty() {
         bail!("No folder was given.");
     }
@@ -1206,6 +1205,16 @@ fn folder_acl_blocking(user: &str, dir: &str, action: &str) -> anyhow::Result<St
             bail!("Refusing to change permissions on a system folder ({full}).");
         }
     }
+    Ok(full)
+}
+
+/// Grants or removes one account's exclusive access to one data folder with
+/// `icacls`. Refuses drive roots and the Windows / program / profile regions so
+/// a mistyped folder can never lock the operating system. Returns the folder's
+/// full path.
+#[cfg(windows)]
+fn folder_acl_blocking(user: &str, dir: &str, action: &str) -> anyhow::Result<String> {
+    let full = checked_folder(dir)?;
     match action {
         "grant" => {
             // Inheritable rights on the folder itself, then stop it inheriting
@@ -1269,18 +1278,18 @@ pub fn keep_admin_folder_access(dirs: Vec<String>) {
     }
     let mut seen = std::collections::HashSet::new();
     for dir in dirs {
-        let path = std::path::Path::new(dir.trim());
-        if !path.is_dir() {
-            continue;
-        }
-        let full = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).display().to_string();
-        let full = full.trim_end_matches('\\').to_string();
+        let Ok(full) = checked_folder(dir.trim()) else { continue };
         if !seen.insert(full.to_lowercase()) {
             continue;
         }
         let Some(access) = crate::win::folder_access(std::path::Path::new(&full)) else { continue };
-        if !access.protected {
-            continue; // never locked by the portal: it already follows its parent
+        // Only folders that look locked by the portal: no inherited permissions,
+        // and the administrators group and SYSTEM already in full control.
+        let locked = access.protected
+            && access.full.iter().any(|s| s == crate::win::ADMINISTRATORS_SID)
+            && access.full.iter().any(|s| s == "S-1-5-18");
+        if !locked {
+            continue;
         }
         let missing: Vec<String> =
             admins.iter().filter(|sid| !access.full.contains(sid)).map(|sid| format!("*{sid}:(OI)(CI)F")).collect();
