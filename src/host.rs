@@ -1213,8 +1213,16 @@ fn folder_acl_blocking(user: &str, dir: &str, action: &str) -> anyhow::Result<St
             // inside inherits from this folder, so it all follows. Only the top
             // folder is changed: doing this to every file (/T) leaves files with
             // no permissions at all.
+            // The administrators group alone is not enough: an administrator's
+            // everyday programs (Explorer, Miracle) run without the group's
+            // rights unless started "as administrator", so each administrator
+            // account is named too, or it is locked out of its own data.
             let account = format!("{user}:(OI)(CI)M");
-            let code = icacls(&[&full, "/grant", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", &account, "/C", "/Q"]);
+            let admins: Vec<String> = admin_accounts().iter().map(|sid| format!("*{sid}:(OI)(CI)F")).collect();
+            let mut args = vec![full.as_str(), "/grant", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"];
+            args.extend(admins.iter().map(String::as_str));
+            args.extend([account.as_str(), "/C", "/Q"]);
+            let code = icacls(&args);
             if code != 0 {
                 bail!("Could not grant {user} access to {full} (icacls {code}).");
             }
@@ -1230,6 +1238,67 @@ fn folder_acl_blocking(user: &str, dir: &str, action: &str) -> anyhow::Result<St
     }
     Ok(full)
 }
+
+/// The administrator accounts that keep full use of every locked data folder:
+/// the members of BUILTIN\Administrators and the account the portal runs as.
+#[cfg(windows)]
+fn admin_accounts() -> Vec<String> {
+    let mut sids: Vec<String> = match crate::win::administrators() {
+        Ok(members) => members.into_iter().map(|(sid, _)| sid).collect(),
+        Err(e) => {
+            tracing::warn!("reading the administrators for folder access: {e:#}");
+            Vec::new()
+        }
+    };
+    sids.extend(crate::win::my_sid().ok());
+    sids.retain(|s| s.starts_with("S-1-") && s != "S-1-5-18");
+    sids.sort();
+    sids.dedup();
+    sids
+}
+
+/// Give every administrator account back full use of the data folders an
+/// earlier version locked to the administrators group only (which locked the
+/// administrator out of everyday use). Only folders that are locked and still
+/// miss an administrator are changed, so this does nothing once they are fixed.
+#[cfg(windows)]
+pub fn keep_admin_folder_access(dirs: Vec<String>) {
+    let admins = admin_accounts();
+    if admins.is_empty() {
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for dir in dirs {
+        let path = std::path::Path::new(dir.trim());
+        if !path.is_dir() {
+            continue;
+        }
+        let full = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).display().to_string();
+        let full = full.trim_end_matches('\\').to_string();
+        if !seen.insert(full.to_lowercase()) {
+            continue;
+        }
+        let Some(access) = crate::win::folder_access(std::path::Path::new(&full)) else { continue };
+        if !access.protected {
+            continue; // never locked by the portal: it already follows its parent
+        }
+        let missing: Vec<String> =
+            admins.iter().filter(|sid| !access.full.contains(sid)).map(|sid| format!("*{sid}:(OI)(CI)F")).collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let mut args = vec![full.as_str(), "/grant"];
+        args.extend(missing.iter().map(String::as_str));
+        args.extend(["/C", "/Q"]);
+        match icacls(&args) {
+            0 => tracing::info!("gave {} administrator account(s) back access to {full}", missing.len()),
+            code => tracing::warn!("could not give the administrators back access to {full} (icacls {code})"),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn keep_admin_folder_access(_dirs: Vec<String>) {}
 
 /// Run a Windows tool with no window; its exit code (-1 if it didn't start).
 #[cfg(windows)]

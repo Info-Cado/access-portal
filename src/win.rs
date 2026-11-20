@@ -821,6 +821,64 @@ pub fn has_empty_dacl(path: &Path) -> Option<bool> {
     Some(empty)
 }
 
+/// A folder's own permission list, as far as the portal cares about it.
+pub struct FolderAccess {
+    /// It no longer takes permissions from its parent folder.
+    pub protected: bool,
+    /// SIDs given full control of the folder and everything inside it by an
+    /// entry set on the folder itself (not inherited).
+    pub full: Vec<String>,
+}
+
+/// Read [`FolderAccess`] for a folder; `None` when its permissions can't be read.
+pub fn folder_access(path: &Path) -> Option<FolderAccess> {
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    let w = wide_path(path);
+    let mut dacl: *mut sec::ACL = null_mut();
+    let mut sd: sec::PSECURITY_DESCRIPTOR = null_mut();
+    let rc = unsafe {
+        GetNamedSecurityInfoW(w.as_ptr(), SE_FILE_OBJECT, sec::DACL_SECURITY_INFORMATION, null_mut(), null_mut(), &mut dacl, null_mut(), &mut sd)
+    };
+    if rc != 0 {
+        return None;
+    }
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    let protected = unsafe { sec::GetSecurityDescriptorControl(sd, &mut control, &mut revision) } != 0
+        && control & sec::SE_DACL_PROTECTED != 0;
+    let mut full = Vec::new();
+    let count = if dacl.is_null() { 0 } else { unsafe { (*dacl).AceCount } };
+    let inherit = (sec::OBJECT_INHERIT_ACE | sec::CONTAINER_INHERIT_ACE) as u8;
+    for i in 0..u32::from(count) {
+        let mut ace: *mut c_void = null_mut();
+        if unsafe { sec::GetAce(dacl, i, &mut ace) } == 0 || ace.is_null() {
+            continue;
+        }
+        let header = unsafe { &*(ace as *const sec::ACE_HEADER) };
+        let flags = header.AceFlags;
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+            || flags & sec::INHERITED_ACE as u8 != 0
+            || flags & sec::INHERIT_ONLY_ACE as u8 != 0
+            || flags & inherit != inherit
+        {
+            continue;
+        }
+        let allowed = unsafe { &*(ace as *const sec::ACCESS_ALLOWED_ACE) };
+        if allowed.Mask & FILE_ALL_ACCESS != FILE_ALL_ACCESS && allowed.Mask & GENERIC_ALL == 0 {
+            continue;
+        }
+        let sid = std::ptr::addr_of!(allowed.SidStart) as sec::PSID;
+        if let Some(text) = unsafe { sid_to_string(sid) } {
+            full.push(text);
+        }
+    }
+    unsafe { LocalFree(sd) };
+    Some(FolderAccess { protected, full })
+}
+
 /// What a shortcut (.lnk) opens: (program, arguments, working folder). Read
 /// with the Windows shell, on a thread of its own (COM needs one set up for it).
 pub fn resolve_shortcut(path: &Path) -> Result<(String, String, String)> {
