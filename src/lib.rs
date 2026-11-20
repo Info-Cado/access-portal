@@ -145,6 +145,19 @@ pub async fn start(data_dir: &Path) -> anyhow::Result<Portal> {
     // Windows-side settings for smooth sessions (GPU encoding, 60 fps).
     tokio::task::spawn_blocking(host::tune_remote_desktop);
 
+    // Administrators keep everyday access to the apps' data folders.
+    match db::list_apps(&pool).await {
+        Ok(apps) => {
+            let dirs = apps
+                .into_iter()
+                .filter(|a| a.program.as_deref().is_some_and(|p| !p.trim().is_empty()))
+                .filter_map(|a| a.work_dir.filter(|d| !d.trim().is_empty()))
+                .collect();
+            tokio::task::spawn_blocking(move || host::keep_admin_folder_access(dirs));
+        }
+        Err(e) => tracing::warn!("listing the apps' data folders: {e:#}"),
+    }
+
     let address = config.bind_addr.clone();
     let network = network::Network::new(address.clone(), settings::reach(&pool).await, data_dir.to_path_buf());
     let state = AppState {
