@@ -5,9 +5,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-/// The admin sign-in until it is changed.
-pub const DEFAULT_ADMIN: (&str, &str) = ("admin", "admin");
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Sessions {
     /// Disconnect a browser session after this many minutes without keyboard or
@@ -143,30 +140,4 @@ pub async fn alerts(pool: &SqlitePool) -> Alerts {
 
 pub async fn set_alerts(pool: &SqlitePool, value: &Alerts) -> Result<()> {
     set(pool, "alerts", &serde_json::to_string(value)?).await
-}
-
-/// The admin username, and whether the password is still the default one.
-pub async fn admin_account(pool: &SqlitePool) -> Result<(String, bool)> {
-    let name = get(pool, "admin_username").await?.unwrap_or_else(|| DEFAULT_ADMIN.0.to_string());
-    let default_password = match get(pool, "admin_password").await? {
-        None => true,
-        Some(hash) => crate::auth::verify_password(DEFAULT_ADMIN.1, &hash),
-    };
-    Ok((name, default_password))
-}
-
-pub async fn check_admin(pool: &SqlitePool, username: &str, password: &str) -> Result<bool> {
-    let name = get(pool, "admin_username").await?.unwrap_or_else(|| DEFAULT_ADMIN.0.to_string());
-    if !name.eq_ignore_ascii_case(username.trim()) {
-        return Ok(false);
-    }
-    Ok(match get(pool, "admin_password").await? {
-        None => password == DEFAULT_ADMIN.1,
-        Some(hash) => crate::auth::verify_password(password, &hash),
-    })
-}
-
-pub async fn set_admin(pool: &SqlitePool, username: &str, password: &str) -> Result<()> {
-    set(pool, "admin_username", username.trim()).await?;
-    set(pool, "admin_password", &crate::auth::hash_password(password)?).await
 }

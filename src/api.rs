@@ -48,8 +48,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/settings/updates", put(set_update_settings))
         .route("/api/admin/settings/network", put(set_network_settings))
         .route("/api/admin/health", get(health))
-        .route("/api/admin/auth/verify", post(verify_admin))
-        .route("/api/admin/auth", put(change_admin))
         .route("/api/admin/windows-accounts", get(windows_accounts))
         .route("/api/admin/windows-accounts/:name", put(update_windows_account).delete(delete_windows_account))
         .route("/api/admin/windows-accounts/:name/desktop", get(account_desktop_mode).put(set_account_desktop_mode))
@@ -148,7 +146,6 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
         .into_iter()
         .map(|a| json!({ "id": a.id, "key": a.key, "name": a.name, "hostname": a.hostname, "port": a.port, "program": a.program, "work_dir": a.work_dir, "profile": a.profile }))
         .collect();
-    let (admin_name, default_password) = settings::admin_account(&state.pool).await?;
     Ok(Json(json!({
         "listen": state.config.bind_addr,
         "users": users,
@@ -159,7 +156,6 @@ async fn state(State(state): State<AppState>, _: Admin) -> ApiResult {
             "topic": settings::alerts(&state.pool).await.topic,
             "server": settings::alerts(&state.pool).await.server(),
         },
-        "admin": { "username": admin_name, "default_password": default_password },
         "owner_user_id": owner_user(&state).await?.map(|u| u.id),
         "network": network_info(&state),
     })))
@@ -1195,48 +1191,6 @@ async fn setup_fix(State(state): State<AppState>, _: Admin, Json(input): Json<Se
     };
     activity::admin(&state.pool, None, &detail).await;
     Ok(Json(json!({ "checks": checks })))
-}
-
-#[derive(Deserialize)]
-struct AdminLogin {
-    username: String,
-    password: String,
-}
-
-/// Check the app's own sign-in (the app's native side asks before unlocking).
-async fn verify_admin(State(state): State<AppState>, _: Admin, Json(input): Json<AdminLogin>) -> ApiResult {
-    if !settings::check_admin(&state.pool, &input.username, &input.password).await? {
-        return Err(fail(StatusCode::UNAUTHORIZED, "Wrong username or password."));
-    }
-    let (_, default_password) = settings::admin_account(&state.pool).await?;
-    Ok(Json(json!({ "ok": true, "default_password": default_password })))
-}
-
-#[derive(Deserialize)]
-struct AdminChange {
-    current_password: String,
-    username: String,
-    password: String,
-}
-
-async fn change_admin(State(state): State<AppState>, _: Admin, Json(input): Json<AdminChange>) -> ApiResult {
-    let (name, _) = settings::admin_account(&state.pool).await?;
-    if !settings::check_admin(&state.pool, &name, &input.current_password).await? {
-        return Err(fail(StatusCode::UNAUTHORIZED, "The current password is wrong."));
-    }
-    let username = input.username.trim();
-    if username.is_empty() || username.chars().count() > 64 {
-        return Err(bad("Choose a username (up to 64 characters)."));
-    }
-    if input.password.chars().count() < 8 {
-        return Err(bad("Use at least 8 characters for the new password."));
-    }
-    if input.password.eq_ignore_ascii_case(settings::DEFAULT_ADMIN.1) {
-        return Err(bad("Choose a password other than the default one."));
-    }
-    settings::set_admin(&state.pool, username, &input.password).await?;
-    activity::admin(&state.pool, None, "Changed the app's admin sign-in").await;
-    Ok(Json(json!({ "username": username })))
 }
 
 /// Sign a user out completely: disconnect their sessions, end their portal

@@ -84,7 +84,6 @@ export type PortalState = {
   users: PortalUser[]
   apps: PortalApp[]
   settings: SessionSettings
-  admin: { username: string; default_password: boolean }
   updates: { auto: boolean }
   alerts: { topic?: string | null; server: string }
   /** The portal user that opens the computer owner's own desktop, if any. */
@@ -146,8 +145,8 @@ export type PublicLink = {
 }
 
 export type ServerStatus =
-  | { running: true; address: string; data_dir: string; public: PublicLink; locked: boolean; elevated: boolean }
-  | { running: false; error: string; data_dir: string; public: PublicLink; locked: boolean; elevated: boolean }
+  | { running: true; address: string; data_dir: string; public: PublicLink; elevated: boolean }
+  | { running: false; error: string; data_dir: string; public: PublicLink; elevated: boolean }
 
 /** Authenticator setup details; the portal hands these out once. */
 export type TotpSetup = { secret: string; uri: string }
@@ -182,22 +181,7 @@ export async function api<T = unknown>(method: string, path: string, body?: unkn
     throw new ApiError(String(e))
   }
   if (res.status >= 200 && res.status < 300) return res.data as T
-  // The app locked itself (closed to the tray, or idle): show the sign-in again.
-  if (res.status === 423) window.dispatchEvent(new Event("portal-locked"))
   throw new ApiError(res.data?.error ?? `The portal refused that (${res.status}).`, res.status)
-}
-
-/** Sign in to the app. */
-export async function unlock(username: string, password: string): Promise<{ default_password: boolean }> {
-  try {
-    return await invoke("unlock", { username, password })
-  } catch (e) {
-    throw new ApiError(String(e))
-  }
-}
-
-export function lockApp(): Promise<void> {
-  return invoke("lock")
 }
 
 export function restartApp(): Promise<void> {

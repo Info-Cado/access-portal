@@ -55,7 +55,6 @@ export function SettingsView({ data, reload, setup }: ViewProps & { setup: Setup
       <AlertsCard data={data} reload={reload} />
       <BackupsCard />
       <UpdatesCard />
-      <AdminCard username={data.admin.username} isDefault={data.admin.default_password} reload={reload} />
     </div>
   )
 }
@@ -267,103 +266,6 @@ function SessionsCard({ settings, reload }: { settings: SessionSettings; reload:
             />
           </Field>
         </FieldGroup>
-      </CardContent>
-    </Card>
-  )
-}
-
-function AdminCard({
-  username,
-  isDefault,
-  reload,
-}: {
-  username: string
-  isDefault: boolean
-  reload: () => Promise<void>
-}) {
-  const [name, setName] = useState(username)
-  const [current, setCurrent] = useState("")
-  const [password, setPassword] = useState("")
-  const [again, setAgain] = useState("")
-  const [busy, setBusy] = useState(false)
-  const mismatch = again.length > 0 && password !== again
-
-  const submit = async (ev: React.FormEvent) => {
-    ev.preventDefault()
-    setBusy(true)
-    try {
-      await api("PUT", "/api/admin/auth", { current_password: current, username: name, password })
-      setCurrent("")
-      setPassword("")
-      setAgain("")
-      await reload()
-      toast.success("Sign-in changed", { description: "Use it the next time the app asks." })
-    } catch (e) {
-      toast.error(errorText(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>App sign-in</CardTitle>
-        <CardDescription>
-          {isDefault
-            ? "Still the default (admin / admin). Choose your own so only you can open this app."
-            : "Asked when the app opens, after it is closed to the tray, and after 15 minutes without use."}
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <form onSubmit={submit} autoComplete="off">
-          <FieldGroup>
-            <Field>
-              <FieldLabel htmlFor="admin-name">Username</FieldLabel>
-              <Input id="admin-name" value={name} onChange={(e) => setName(e.target.value)} spellCheck={false} />
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="admin-current">Current password</FieldLabel>
-              <Input
-                id="admin-current"
-                type="password"
-                autoComplete="current-password"
-                value={current}
-                onChange={(e) => setCurrent(e.target.value)}
-              />
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="admin-new">New password</FieldLabel>
-              <Input
-                id="admin-new"
-                type="password"
-                autoComplete="new-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-              <FieldDescription>At least 8 characters.</FieldDescription>
-            </Field>
-            <Field data-invalid={mismatch ? true : undefined}>
-              <FieldLabel htmlFor="admin-again">New password again</FieldLabel>
-              <Input
-                id="admin-again"
-                type="password"
-                autoComplete="new-password"
-                value={again}
-                aria-invalid={mismatch ? true : undefined}
-                onChange={(e) => setAgain(e.target.value)}
-              />
-              {mismatch && <FieldDescription className="text-destructive">The passwords don't match.</FieldDescription>}
-            </Field>
-            <Button
-              type="submit"
-              className="self-start"
-              disabled={busy || !current || password.length < 8 || password !== again || !name.trim()}
-            >
-              Change sign-in
-            </Button>
-          </FieldGroup>
-        </form>
       </CardContent>
     </Card>
   )

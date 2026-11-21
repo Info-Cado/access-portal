@@ -31,27 +31,6 @@ pub(crate) enum Server {
     Failed(String),
 }
 
-/// The window shows nothing until the admin signs in, and locks again when it
-/// is closed to the tray. Wrong passwords slow down after a few tries.
-#[derive(Default)]
-struct AppLock(Mutex<LockState>);
-
-#[derive(Default)]
-struct LockState {
-    unlocked: bool,
-    failures: u32,
-    wait_until: Option<std::time::Instant>,
-}
-
-impl AppLock {
-    fn is_unlocked(&self) -> bool {
-        self.0.lock().unwrap().unlocked
-    }
-    fn lock(&self) {
-        self.0.lock().unwrap().unlocked = false;
-    }
-}
-
 /// Everything the portal keeps: settings, database, transfer folders, log.
 /// Machine-wide, so it doesn't depend on which Windows account opens the app.
 fn data_dir() -> PathBuf {
@@ -78,55 +57,18 @@ fn start_logging(dir: &std::path::Path) {
 
 /// Whether the portal is running, where, where its files are, and the public link.
 #[tauri::command]
-fn status(server: State<'_, Server>, tunnel: State<'_, Option<tunnel::Tunnel>>, lock: State<'_, AppLock>) -> Value {
+fn status(server: State<'_, Server>, tunnel: State<'_, Option<tunnel::Tunnel>>) -> Value {
     let dir = data_dir().display().to_string();
     let public = tunnel.inner().as_ref().map(|t| t.status().to_json()).unwrap_or(json!({ "state": "unavailable" }));
-    let locked = !lock.is_unlocked();
     match server.inner() {
-        Server::Running(p) => json!({ "running": true, "address": p.address, "data_dir": dir, "public": public, "locked": locked, "elevated": elevation::is_elevated() }),
-        Server::Failed(e) => json!({ "running": false, "error": e, "data_dir": dir, "public": public, "locked": locked, "elevated": elevation::is_elevated() }),
+        Server::Running(p) => json!({ "running": true, "address": p.address, "data_dir": dir, "public": public, "elevated": elevation::is_elevated() }),
+        Server::Failed(e) => json!({ "running": false, "error": e, "data_dir": dir, "public": public, "elevated": elevation::is_elevated() }),
     }
-}
-
-/// Sign in to the app.
-#[tauri::command]
-async fn unlock(server: State<'_, Server>, lock: State<'_, AppLock>, username: String, password: String) -> Result<Value, String> {
-    let portal = match server.inner() {
-        Server::Running(p) => p,
-        Server::Failed(e) => return Err(format!("The portal is not running: {e}")),
-    };
-    if let Some(until) = lock.0.lock().unwrap().wait_until {
-        let now = std::time::Instant::now();
-        if until > now {
-            return Err(format!("Too many wrong passwords. Try again in {} s.", (until - now).as_secs() + 1));
-        }
-    }
-    let (status, data) = portal
-        .admin("POST", "/api/admin/auth/verify", Some(json!({ "username": username, "password": password })))
-        .await;
-    let mut state = lock.0.lock().unwrap();
-    if status == 200 {
-        *state = LockState { unlocked: true, failures: 0, wait_until: None };
-        return Ok(data);
-    }
-    state.failures += 1;
-    if state.failures >= 5 {
-        state.wait_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
-    }
-    Err(data.get("error").and_then(Value::as_str).unwrap_or("Wrong username or password.").to_string())
-}
-
-#[tauri::command]
-fn lock(lock: State<'_, AppLock>) {
-    lock.lock();
 }
 
 /// Send a test phone alert to the topic set in the app.
 #[tauri::command]
-async fn test_alert(app: AppHandle, lock: State<'_, AppLock>, server: String, topic: String) -> Result<(), String> {
-    if !lock.is_unlocked() {
-        return Err("The app is locked.".into());
-    }
+async fn test_alert(app: AppHandle, server: String, topic: String) -> Result<(), String> {
     let name = alerts::install_name(&app);
     tauri::async_runtime::spawn_blocking(move || {
         alerts::send(&server, &topic, &format!("{name}: test alert"), "Alerts from Access Portal will arrive like this.", "bell", false)
@@ -137,10 +79,7 @@ async fn test_alert(app: AppHandle, lock: State<'_, AppLock>, server: String, to
 
 /// Send a problem report (see `report.rs`); answers its number.
 #[tauri::command]
-async fn send_report(app: AppHandle, server: State<'_, Server>, lock: State<'_, AppLock>) -> Result<String, String> {
-    if !lock.is_unlocked() {
-        return Err("The app is locked.".into());
-    }
+async fn send_report(app: AppHandle, server: State<'_, Server>) -> Result<String, String> {
     let portal = match server.inner() {
         Server::Running(p) => Some(p),
         Server::Failed(_) => None,
@@ -151,10 +90,7 @@ async fn send_report(app: AppHandle, server: State<'_, Server>, lock: State<'_, 
 /// Restart the app with administrator rights (asking Windows if needed); this
 /// copy quits once the new one is on its way.
 #[tauri::command]
-fn restart_as_admin(app: AppHandle, lock: State<'_, AppLock>) -> Result<(), String> {
-    if !lock.is_unlocked() {
-        return Err("The app is locked.".into());
-    }
+fn restart_as_admin(app: AppHandle) -> Result<(), String> {
     if elevation::is_elevated() {
         return Err("The app already runs as administrator.".into());
     }
@@ -166,10 +102,7 @@ fn restart_as_admin(app: AppHandle, lock: State<'_, AppLock>) -> Result<(), Stri
 
 /// Restart the app (and the portal in it), e.g. to restore a backup.
 #[tauri::command]
-fn restart_app(app: AppHandle, lock: State<'_, AppLock>) -> Result<(), String> {
-    if !lock.is_unlocked() {
-        return Err("The app is locked.".into());
-    }
+fn restart_app(app: AppHandle) -> Result<(), String> {
     app.restart()
 }
 
@@ -180,19 +113,13 @@ fn update_status(app: AppHandle) -> Value {
 
 /// Check for an update now; with `install`, install it (the app restarts).
 #[tauri::command]
-async fn update_check(app: AppHandle, lock: State<'_, AppLock>, install: bool) -> Result<Value, String> {
-    if !lock.is_unlocked() {
-        return Err("The app is locked.".into());
-    }
+async fn update_check(app: AppHandle, install: bool) -> Result<Value, String> {
     updates::check(&app, install).await
 }
 
 /// Save a file to the Downloads folder and show it in Explorer.
 #[tauri::command]
-fn save_download(lock: State<'_, AppLock>, name: String, contents: String) -> Result<String, String> {
-    if !lock.is_unlocked() {
-        return Err("The app is locked.".into());
-    }
+fn save_download(name: String, contents: String) -> Result<String, String> {
     let safe: String = name
         .chars()
         .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c })
@@ -209,17 +136,13 @@ fn save_download(lock: State<'_, AppLock>, name: String, contents: String) -> Re
 #[tauri::command]
 async fn request(
     server: State<'_, Server>,
-    lock: State<'_, AppLock>,
     method: String,
     path: String,
     body: Option<Value>,
     progress: tauri::ipc::Channel<String>,
 ) -> Result<Value, String> {
-    if !path.starts_with("/api/admin/") || path.starts_with("/api/admin/auth/verify") {
+    if !path.starts_with("/api/admin/") {
         return Err("Only the portal's admin calls can be made.".into());
-    }
-    if !lock.is_unlocked() {
-        return Ok(json!({ "status": 423, "data": { "error": "The app is locked. Sign in again." } }));
     }
     let portal = match server.inner() {
         Server::Running(p) => p,
@@ -374,7 +297,6 @@ pub fn run() {
             };
             app.manage(server);
             app.manage(public);
-            app.manage(AppLock::default());
             app.manage(updates::UpdateState::default());
             alerts::start(app.handle().clone());
             updates::start(app.handle().clone());
@@ -411,16 +333,12 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
-                // Whoever opens it next signs in again.
-                window.app_handle().state::<AppLock>().lock();
                 forget_closed_window(window);
             }
         })
         .invoke_handler(tauri::generate_handler![
             status,
             request,
-            unlock,
-            lock,
             save_download,
             test_alert,
             send_report,

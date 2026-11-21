@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react"
 import {
   AppWindowIcon,
   HistoryIcon,
-  LockIcon,
   MonitorSmartphoneIcon,
   RefreshCwIcon,
   ShieldIcon,
@@ -60,8 +59,7 @@ export function AppShell({
   data,
   status,
   reload,
-  onLock,
-}: ViewProps & { status: { address: string; public: PublicLink; elevated: boolean }; onLock: () => void }) {
+}: ViewProps & { status: { address: string; public: PublicLink; elevated: boolean } }) {
   const [view, setView] = useState<View>("users")
   const [refreshing, setRefreshing] = useState(false)
   // Is this computer fully set up? Checked once when the app is unlocked (this
@@ -180,10 +178,6 @@ export function AppShell({
             <RefreshCwIcon className={refreshing ? "animate-spin" : undefined} />
             Refresh
           </Button>
-          <Button variant="ghost" size="sm" onClick={onLock} title="Lock the app (the portal keeps running)">
-            <LockIcon />
-            Lock
-          </Button>
         </header>
         <div className="flex flex-1 flex-col gap-4 p-4 lg:p-6">
           {!status.elevated && (
@@ -206,17 +200,6 @@ export function AppShell({
               </span>
               <Button size="sm" variant="outline" onClick={() => setView("settings")}>
                 Set it up
-              </Button>
-            </div>
-          )}
-          {data.admin.default_password && view !== "settings" && (
-            <div className="flex items-center gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
-              <TriangleAlertIcon className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
-              <span className="flex-1">
-                The app still uses the default sign-in (admin / admin). Anyone at this computer could open it.
-              </span>
-              <Button size="sm" variant="outline" onClick={() => setView("settings")}>
-                Change it
               </Button>
             </div>
           )}
