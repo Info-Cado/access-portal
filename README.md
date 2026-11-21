@@ -274,12 +274,9 @@ Restart the app (tray icon → Quit, then open it) after changing `portal.env`.
 
 ## Using it
 
-The app asks for its own sign-in when it opens, after it is closed to the tray,
-after 15 minutes without use, and when **Lock** is clicked. It starts as
-**admin / admin**; a banner asks you to change it under **Settings → App
-sign-in**. The portal keeps serving users while the app is locked. (Forgot it?
-Delete the `admin_username` and `admin_password` rows of the `settings` table in
-`portal.db` to go back to admin / admin.)
+The app has no sign-in of its own: it opens straight away. The Windows
+sign-in of this computer's administrator account protects it, so lock Windows
+(Windows key + L) when you leave the computer.
 
 The window has four screens:
 
@@ -317,8 +314,7 @@ The window has four screens:
     second folder (another drive, OneDrive…); **Back up now**; **Restore** puts
     one back and restarts the app (what was there is saved first). Users'
     files aren't included;
-  - *Updates* — the version and **Check now** (updates always install by themselves);
-  - *App sign-in*.
+  - *Updates* — the version and **Check now** (updates always install by themselves).
 
 Each user also has a **Full desktop** switch (`src/host.rs`). It changes the
 user's Windows account on this machine: off, Run, the command prompt,
