@@ -278,7 +278,8 @@ The app has no sign-in of its own: it opens straight away. The Windows
 sign-in of this computer's administrator account protects it, so lock Windows
 (Windows key + L) when you leave the computer.
 
-The window has four screens:
+The window has three screens, and **Settings** opens as a popup from the
+bottom of the left menu:
 
 - **Users** — create a user (portal username and password, the Windows account
   their sessions run as, the apps they may open, optional two-step
@@ -292,8 +293,9 @@ The window has four screens:
   why), print jobs, uploads and downloads, clipboard file transfers, and every
   admin action, newest first; filter by user, search, **Export CSV** (saved to
   Downloads). Kept for 180 days (`src/activity.rs`).
-- **Settings**:
+- **Settings** (popup, one section at a time):
   - *This computer* — what the computer needs, with one-click fixes (above);
+  - *Network* — opening the portal without the internet (below);
   - *Sessions* — disconnect idle sessions after a time without keyboard or
     mouse input (default 1 hour; a one-minute warning first; apps keep
     running); sign out Windows sessions left disconnected (default 8 hours,
@@ -346,7 +348,7 @@ hold immediately. A blocked user can't sign in or open a session until it
 passes; **Unblock** in their panel lifts it early. This block is separate from
 the automatic lockout after wrong passwords.
 
-**Without the internet** (Settings, `src/network.rs`): besides the public link,
+**Without the internet** (Settings → Network, `src/network.rs`): besides the public link,
 people can open the portal at `https://<this computer's address>:8443` from the
 local network and, with Tailscale, from any device on the same tailnet (its
 100.x address or MagicDNS name). Both switches are on by default. Plain HTTP
