@@ -44,7 +44,7 @@ export function AppsView({ data, reload }: ViewProps) {
   return (
     <>
       {data.apps.length === 0 ? (
-        <Empty className="border">
+        <Empty className="flex-none border py-16">
           <EmptyHeader>
             <EmptyMedia variant="icon">
               <AppWindowIcon />
@@ -58,12 +58,7 @@ export function AppsView({ data, reload }: ViewProps) {
         </Empty>
       ) : (
         <>
-          <div className="flex items-center">
-            <p className="text-sm text-muted-foreground">
-              An app is an RDP connection to a host, opened as the user’s Windows account.
-            </p>
-            <div className="ml-auto">{newAppButton}</div>
-          </div>
+          <div className="flex justify-end">{newAppButton}</div>
           <div className="overflow-hidden rounded-lg border">
             <Table>
               <TableHeader className="bg-muted/50">

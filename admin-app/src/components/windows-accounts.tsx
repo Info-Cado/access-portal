@@ -3,7 +3,7 @@
 // owner's own desktop from the portal.
 
 import { useEffect, useState, useSyncExternalStore } from "react"
-import { ChevronRightIcon, MonitorIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react"
+import { ChevronRightIcon, MonitorIcon, Trash2Icon, UserPlusIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import { BusyLabel } from "@/components/busy"
@@ -37,8 +37,9 @@ import { ago, api, errorText, type WindowsAccount, type WindowsAccounts } from "
 
 const path = (name: string) => `/api/admin/windows-accounts/${encodeURIComponent(name)}`
 
-// The list takes about a second to read from Windows, so the last one is kept for
-// the whole time the app is open and read again only after a change or on Refresh.
+// The list takes about a second to read from Windows, so the last one is kept and
+// shown at once; it is read again in the background after a change, each time the
+// Users screen opens, and when the window comes back from the tray.
 type ListState = { list: WindowsAccounts | null; error: string; loading: boolean }
 let listState: ListState = { list: null, error: "", loading: false }
 let loadSeq = 0
@@ -82,12 +83,15 @@ export function WindowsAccountsSection({
   /** Open the new-user dialog to add a portal login for a Windows account. */
   onAddLogin: (winUser: string, accountName: string) => void
 }) {
-  const { list, error, loading } = useWindowsAccounts()
+  const { list, error } = useWindowsAccounts()
   const [selected, setSelected] = useState<string | null>(null)
 
-  // Read once; after that the kept list is shown at once.
+  // The kept list shows at once; a fresh one follows in the background.
   useEffect(() => {
-    if (listState.list === null && !listState.loading) void refreshWindowsAccounts()
+    if (!listState.loading) void refreshWindowsAccounts()
+    const onVisible = () => document.visibilityState === "visible" && void refreshWindowsAccounts()
+    document.addEventListener("visibilitychange", onVisible)
+    return () => document.removeEventListener("visibilitychange", onVisible)
   }, [])
 
   /** Read the list and the portal's data again, in the background. */
@@ -109,24 +113,7 @@ export function WindowsAccountsSection({
 
   return (
     <section className="flex flex-col gap-3">
-      <div className="flex items-center gap-2">
-        <div>
-          <h2 className="text-sm font-medium">Windows accounts on this computer</h2>
-          <p className="text-xs text-muted-foreground">
-            Every local account, including ones the portal didn’t make. Windows’ built-in accounts are hidden.
-          </p>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          className="ml-auto"
-          disabled={loading}
-          onClick={() => void refreshWindowsAccounts()}
-        >
-          <RefreshCwIcon className={loading ? "animate-spin" : undefined} />
-          Refresh
-        </Button>
-      </div>
+      <h2 className="mt-4 text-sm font-medium">Windows accounts</h2>
 
       {error && (
         <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">

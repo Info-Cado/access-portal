@@ -188,7 +188,7 @@ export function ActivityView({ data }: ViewProps) {
       {entries === null ? (
         <Skeleton className="h-64 w-full" />
       ) : shown.length === 0 ? (
-        <Empty className="border">
+        <Empty className="flex-none border py-16">
           <EmptyHeader>
             <EmptyMedia variant="icon">
               <HistoryIcon />

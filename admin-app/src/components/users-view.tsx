@@ -42,17 +42,14 @@ export function UsersView({ data, reload }: ViewProps) {
             spellCheck={false}
           />
         </InputGroup>
+        {connected > 0 && (
+          <Button variant="outline" onClick={() => setMessageTo({ label: `everyone connected (${connected})` })}>
+            <MessageSquareTextIcon />
+            Message everyone
+          </Button>
+        )}
         <Button
-          variant="outline"
           className="ml-auto"
-          disabled={connected === 0}
-          title={connected === 0 ? "Nobody is connected right now" : undefined}
-          onClick={() => setMessageTo({ label: `everyone connected (${connected})` })}
-        >
-          <MessageSquareTextIcon />
-          Message everyone
-        </Button>
-        <Button
           onClick={() => {
             setPreset(null)
             setCreating(true)
@@ -64,7 +61,7 @@ export function UsersView({ data, reload }: ViewProps) {
       </div>
 
       {shown.length === 0 ? (
-        <Empty className="border">
+        <Empty className="flex-none border py-16">
           <EmptyHeader>
             <EmptyMedia variant="icon">
               <UserXIcon />
@@ -108,9 +105,9 @@ export function UsersView({ data, reload }: ViewProps) {
                         )}
                         <span className="font-medium">{u.username}</span>
                         {u.sessions.length > 0 && (
-                          <Badge className="border-emerald-500/30 bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
-                            Connected{u.sessions.length > 1 ? ` ×${u.sessions.length}` : ""}
-                          </Badge>
+                          <span className="text-xs text-muted-foreground">
+                            connected{u.sessions.length > 1 ? ` ×${u.sessions.length}` : ""}
+                          </span>
                         )}
                         {u.id === data.owner_user_id && <Badge>Your desktop</Badge>}
                         {u.totp && <Badge variant="secondary">2-step</Badge>}
